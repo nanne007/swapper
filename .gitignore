@@ -1,0 +1,6 @@
+target/
+.env
+config.local.json
+contracts/out/
+contracts/cache/
+*.log

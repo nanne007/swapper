@@ -1,0 +1,3 @@
+interface:
+  display_name: 'Metamatch Evm Simulation'
+  short_description: 'Preserve fixed-block EVM simulation semantics'

@@ -1,0 +1,3 @@
+interface:
+  display_name: 'Metamatch Contract Safety'
+  short_description: 'Preserve Router and Holder fund invariants'

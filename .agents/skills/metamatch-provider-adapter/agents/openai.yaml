@@ -1,0 +1,3 @@
+interface:
+  display_name: 'Metamatch Provider Adapter'
+  short_description: 'Safely add and verify quote-provider adapters'

@@ -1,0 +1,7 @@
+target
+.git
+.env
+config.local.json
+contracts/out
+contracts/cache
+*.tgz

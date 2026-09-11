@@ -1,0 +1,3 @@
+interface:
+  display_name: 'Metamatch Test Verification'
+  short_description: 'Verify behavior across fixtures and local EVM'
