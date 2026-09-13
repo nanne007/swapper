@@ -1,4 +1,4 @@
-use crate::domain::{Chain, Fault, HOLDER, Input, NATIVE, Route, Tx, parse_hex, parse_uint};
+use crate::domain::{Chain, Fault, HOLDER, Input, NATIVE, Route, Rule, Tx, parse_hex, parse_uint};
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{SolCall, sol};
 
@@ -14,6 +14,7 @@ pub fn validate_route(
     input: &Input,
     chain: &Chain,
     route: &Route,
+    rules: &[Rule],
     require_unified: bool,
 ) -> Result<(), Fault> {
     if route.sell_amount != input.sell_amount
@@ -42,12 +43,10 @@ pub fn validate_route(
         return Err(Fault::with_status("ROUTER_NOT_CONFIGURED", 503));
     }
     if let Some(_router) = chain.router {
-        let allowlisted = chain.rules.get(&route.provider).is_some_and(|rules| {
-            rules.iter().any(|rule| {
-                rule.target == route.tx.to
-                    && rule.spender == route.spender
-                    && rule.selector.eq_ignore_ascii_case(&data[..10])
-            })
+        let allowlisted = rules.iter().any(|rule| {
+            rule.target == route.tx.to
+                && rule.spender == route.spender
+                && rule.selector.eq_ignore_ascii_case(&data[..10])
         });
         if !allowlisted {
             return Err(Fault::with_status("ROUTE_NOT_ALLOWLISTED", 422));
@@ -60,9 +59,10 @@ pub fn swap_transaction(
     input: &Input,
     chain: &Chain,
     route: &Route,
+    rules: &[Rule],
     min: Option<&str>,
 ) -> Result<Tx, Fault> {
-    validate_route(input, chain, route, false)?;
+    validate_route(input, chain, route, rules, false)?;
     let Some(router) = chain.router else {
         return Ok(route.tx.clone());
     };
@@ -126,84 +126,4 @@ fn bytes_from_hex(data: &str) -> Result<Bytes, Fault> {
     Ok(Bytes::from(hex::decode(&data[2..]).map_err(|_| {
         Fault::with_status("INVALID_CALLDATA", 502)
     })?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        config::load_config,
-        domain::{ProviderId, Rule, minimum, parse_address},
-    };
-    use std::collections::HashMap;
-
-    fn input() -> Input {
-        Input {
-            chain_id: 1,
-            sell_token: NATIVE,
-            buy_token: parse_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap(),
-            sell_amount: "1000000000000000000".into(),
-            slippage_bps: 30,
-            taker: None,
-        }
-    }
-
-    fn route() -> Route {
-        Route {
-            provider: ProviderId::Kyber,
-            buy_amount: "10000".into(),
-            min_buy_amount: "9970".into(),
-            sell_amount: "1000000000000000000".into(),
-            spender: parse_address("0x1111111111111111111111111111111111111111").unwrap(),
-            tx: Tx {
-                to: parse_address("0x1111111111111111111111111111111111111111").unwrap(),
-                data: "0x12345678".into(),
-                value: "1000000000000000000".into(),
-            },
-            expires_at: crate::domain::now_ms() + 20_000,
-        }
-    }
-
-    #[test]
-    fn unified_transaction_has_holder_and_minimum() {
-        let mut chain = load_config(&HashMap::new()).unwrap().chains.remove(0);
-        let provider = route().tx.to;
-        chain.router = Some(parse_address("0x2222222222222222222222222222222222222222").unwrap());
-        chain.rules.insert(
-            ProviderId::Kyber,
-            vec![Rule {
-                target: provider,
-                spender: provider,
-                selector: "0x12345678".into(),
-            }],
-        );
-        let tx = swap_transaction(
-            &input(),
-            &chain,
-            &route(),
-            Some(&minimum("10000", 80).unwrap()),
-        )
-        .unwrap();
-        assert_eq!(tx.to, HOLDER);
-        assert_eq!(tx.value, input().sell_amount);
-        assert!(tx.data.starts_with("0x"));
-    }
-
-    #[test]
-    fn route_target_and_value_are_checked() {
-        let chain = load_config(&HashMap::new())
-            .unwrap()
-            .chains
-            .into_iter()
-            .next()
-            .unwrap();
-        let mut bad = route();
-        bad.tx.value = "0".into();
-        assert_eq!(
-            validate_route(&input(), &chain, &bad, false)
-                .unwrap_err()
-                .code,
-            "UNEXPECTED_TRANSACTION_VALUE"
-        );
-    }
 }

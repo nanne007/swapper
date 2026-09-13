@@ -1,6 +1,6 @@
 ---
 name: metamatch-provider-adapter
-description: 'Implement or review a MetaMatch quote-provider adapter for 0x, 1inch Classic, KyberSwap, or a newly approved EVM supplier. Use when changing src/providers.rs, provider schemas, upstream request fields, route normalization, provider timeout behavior, or provider fixture tests.'
+description: 'Implement or review a MetaMatch quote-provider adapter for 0x, 1inch Classic, KyberSwap, or a newly approved EVM supplier. Use when changing src/providers/, provider schemas, upstream request fields, route normalization, provider timeout behavior, or provider fixture tests.'
 ---
 
 # MetaMatch provider adapter
@@ -18,6 +18,6 @@ Read `AGENTS.md`, `docs/SOURCES.md`, and the current provider implementation bef
 
 ## Test
 
-Add or update Rust fixture tests near the provider implementation for URL/query or body, authentication headers without real secrets, amount and recipient fields, response normalization, malformed responses, unexpected execution addresses, rate limits, and oversized/invalid upstream responses. A fixture test is not live-provider validation; state that boundary in the handoff.
+Add or update Rust fixture tests under `tests/` for URL/query or body, authentication headers without real secrets, amount and recipient fields, response normalization, malformed responses, unexpected execution addresses, rate limits, and oversized/invalid upstream responses. Keep production provider modules free of test code. A fixture test is not live-provider validation; state that boundary in the handoff.
 
 Run `cargo fmt`, then `cargo clippy`, and the focused provider tests before the full Cargo and Foundry gates. Do not spend production API quota or broadcast a transaction. Update the Rust serde/domain types and product/technical docs when a public route field or capability changes.

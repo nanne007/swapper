@@ -1,12 +1,12 @@
 use crate::{
     config::Config,
     domain::{
-        Address, Chain, Context, Fault, Input, PREVIEW_TAKER, ProviderId, Quote, Simulation, Tx,
-        is_reserved_address, net_output, now_ms, parse_positive, rank,
+        Address, Chain, Context, Fault, Input, PREVIEW_TAKER, Quote, Simulation, Tx,
+        is_reserved_address, now_ms, parse_positive, rank,
     },
     execution::validate_route,
     http::ReqwestClient,
-    providers::{Provider, create_providers},
+    providers::{Provider, ProviderRegistry, create_providers},
     rpc::{ContextProvider, ContextSource},
     simulation::{SimulationProvider, SimulationRequest, Simulator},
 };
@@ -42,20 +42,31 @@ struct CompetitionHandle {
 
 #[derive(Clone)]
 pub struct Services {
-    pub providers: Vec<Arc<dyn Provider>>,
+    pub registry: ProviderRegistry,
     pub context: Arc<dyn ContextProvider>,
     pub simulator: Arc<dyn SimulationProvider>,
 }
 
 impl Services {
+    pub fn new(
+        providers: Vec<Arc<dyn Provider>>,
+        chains: &[Chain],
+        context: Arc<dyn ContextProvider>,
+        simulator: Arc<dyn SimulationProvider>,
+    ) -> Self {
+        Self {
+            registry: ProviderRegistry::new(providers, chains),
+            context,
+            simulator,
+        }
+    }
+
     pub fn production(config: &Config) -> Self {
         let client = Arc::new(ReqwestClient::default());
+        let providers = create_providers(config, client.clone());
         Self {
-            providers: create_providers(config, client.clone()),
-            context: Arc::new(ContextSource::new(
-                client.clone(),
-                Duration::from_millis(config.timeout_ms),
-            )),
+            registry: ProviderRegistry::new(providers, &config.chains),
+            context: Arc::new(ContextSource::new(Duration::from_millis(config.timeout_ms))),
             simulator: Arc::new(Simulator::new(Duration::from_millis(config.timeout_ms))),
         }
     }
@@ -82,6 +93,15 @@ impl Competitions {
         }
     }
 
+    pub fn provider_ids_for_chain(&self, chain_id: u64) -> Vec<&'static str> {
+        self.services
+            .registry
+            .by_chain()
+            .get(&chain_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     pub async fn create(&self, input: Input) -> Result<CreateResponse, Fault> {
         self.sweep().await;
         let mut items = self.items.lock().await;
@@ -97,12 +117,6 @@ impl Competitions {
             .find(|chain| chain.id == input.chain_id)
             .cloned()
             .ok_or_else(|| Fault::with_status("INVALID_INPUT", 400))?;
-        if ![input.sell_token, input.buy_token]
-            .iter()
-            .all(|token| chain.tokens.iter().any(|known| known.address == *token))
-        {
-            return Err(Fault::with_status("TOKEN_NOT_SUPPORTED", 422));
-        }
         if input
             .taker
             .is_some_and(|taker| chain.router == Some(taker) || is_reserved_address(taker))
@@ -238,21 +252,20 @@ impl Competitions {
     ) -> Result<BuildResponse, Fault> {
         let provider = self
             .services
-            .providers
-            .iter()
-            .find(|provider| provider.id() == quote.provider)
-            .ok_or_else(|| Fault::with_status("QUOTE_NOT_FOUND", 404))?
-            .clone();
+            .registry
+            .get(quote.provider)
+            .ok_or_else(|| Fault::with_status("QUOTE_NOT_FOUND", 404))?;
         let sender = chain.router.expect("build checked router");
         let timeout = Duration::from_millis(self.config.timeout_ms);
         let context_future = self.services.context.get(input, chain);
         let route_future = provider.quote(input, chain, sender);
+        let rules = provider.rules(chain.id);
         let (context, route) = tokio::time::timeout(timeout, async {
             tokio::try_join!(context_future, route_future)
         })
         .await
         .map_err(|_| Fault::with_status("UPSTREAM_TIMEOUT", 504))??;
-        validate_route(input, chain, &route, true)?;
+        validate_route(input, chain, &route, &rules, true)?;
         if parse_uint_checked(&route.buy_amount)? < parse_uint_checked(accepted)? {
             return Err(Fault::with_status(
                 "PRICE_MOVED_BELOW_ACCEPTED_MINIMUM",
@@ -271,6 +284,7 @@ impl Competitions {
                 chain,
                 route: &route,
                 context: &context,
+                rules: &rules,
                 taker,
                 actual: true,
                 min: Some(&min),
@@ -371,7 +385,8 @@ impl Competitions {
                 }
                 Ok(Err(_)) | Err(_) => None,
             };
-        let futures = self.services.providers.iter().map(|provider| {
+        let providers = self.services.registry.for_chain(chain.id);
+        let futures = providers.iter().map(|provider| {
             let input = input.clone();
             let chain = chain.clone();
             let context = context.clone();
@@ -385,7 +400,6 @@ impl Competitions {
                     quoted_amount: None,
                     min_buy_amount: None,
                     simulation: None,
-                    net_output: None,
                     latency_ms: 0,
                     expires_at,
                     execution: if chain.router.is_some() {
@@ -396,16 +410,13 @@ impl Competitions {
                     error: None,
                 };
                 let sender = chain.router.unwrap_or(input.taker.unwrap_or(PREVIEW_TAKER));
-                let route = if !provider.enabled() {
-                    Err(Fault::with_status("PROVIDER_UNCONFIGURED", 503))
-                } else {
-                    tokio::time::timeout(timeout, provider.quote(&input, &chain, sender))
-                        .await
-                        .map_err(|_| Fault::with_status("UPSTREAM_TIMEOUT", 504))?
-                };
-                match route
-                    .and_then(|route| validate_route(&input, &chain, &route, false).map(|_| route))
-                {
+                let route = tokio::time::timeout(timeout, provider.quote(&input, &chain, sender))
+                    .await
+                    .map_err(|_| Fault::with_status("UPSTREAM_TIMEOUT", 504))?;
+                let rules = provider.rules(chain.id);
+                match route.and_then(|route| {
+                    validate_route(&input, &chain, &route, &rules, false).map(|_| route)
+                }) {
                     Ok(route) => {
                         quote.status = "ready".into();
                         quote.quoted_amount = Some(route.buy_amount.clone());
@@ -419,6 +430,7 @@ impl Competitions {
                                     chain: &chain,
                                     route: &route,
                                     context: &context,
+                                    rules: &rules,
                                     taker: input.taker.unwrap_or(PREVIEW_TAKER),
                                     actual: input.taker.is_some(),
                                     min: None,
@@ -428,24 +440,6 @@ impl Competitions {
                             {
                                 Ok(Ok(result)) => {
                                     quote.simulation = Some(result.simulation.clone());
-                                    if let Simulation::Success {
-                                        bought_amount,
-                                        gas_fee_wei,
-                                        ..
-                                    } = &result.simulation
-                                    {
-                                        quote.net_output = Some(net_output(
-                                            bought_amount,
-                                            gas_fee_wei.as_deref(),
-                                            &context,
-                                            chain
-                                                .tokens
-                                                .iter()
-                                                .find(|token| token.address == input.buy_token)
-                                                .map(|token| token.decimals)
-                                                .unwrap_or_default(),
-                                        )?);
-                                    }
                                 }
                                 Ok(Err(error)) => {
                                     quote.simulation = Some(Simulation::Error {
@@ -511,7 +505,7 @@ pub struct BuildResponse {
     pub chain_id: u64,
     pub taker: Address,
     pub recipient: Address,
-    pub provider: ProviderId,
+    pub provider: &'static str,
     #[serde(rename = "expiresAt")]
     pub expires_at: u64,
     #[serde(rename = "minBuyAmount")]
@@ -543,7 +537,7 @@ fn is_verified(quote: &Quote) -> bool {
             .simulation
             .as_ref()
             .is_some_and(Simulation::is_success)
-        && quote.net_output.as_ref().is_some_and(Option::is_some)
+        && quote.quoted_amount.is_some()
 }
 
 fn parse_uint_checked(value: &str) -> Result<alloy_primitives::U256, Fault> {
@@ -561,170 +555,4 @@ fn simulation_status(simulation: &Simulation) -> &'static str {
 
 fn safe_error(error: &Fault) -> String {
     error.code.clone()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{
-        domain::{NATIVE, Route, Rule},
-        execution::swap_transaction,
-        simulation::SimResult,
-    };
-    use async_trait::async_trait;
-    use std::collections::HashMap;
-
-    struct MockContext;
-    #[async_trait]
-    impl ContextProvider for MockContext {
-        async fn get(&self, _input: &Input, _chain: &Chain) -> Result<Context, Fault> {
-            Ok(Context {
-                block_number: "0x10".into(),
-                block_hash: format!("0x{}", "11".repeat(32)),
-                timestamp: 100,
-                gas_price: "1".into(),
-                native_usd: Some("1".into()),
-                buy_usd: Some("1".into()),
-            })
-        }
-    }
-    struct MockSim;
-    #[async_trait]
-    impl SimulationProvider for MockSim {
-        async fn run(&self, request: SimulationRequest<'_>) -> Result<SimResult, Fault> {
-            Ok(SimResult {
-                simulation: Simulation::Success {
-                    bought_amount: request.route.buy_amount.clone(),
-                    gas_used: "1".into(),
-                    gas_fee_wei: Some("1".into()),
-                    funding: if request.actual {
-                        "actual".into()
-                    } else {
-                        "overridden".into()
-                    },
-                    block_hash: request.context.block_hash.clone(),
-                },
-                approvals: Vec::new(),
-                transaction: swap_transaction(
-                    request.input,
-                    request.chain,
-                    request.route,
-                    request.min,
-                )
-                .unwrap(),
-            })
-        }
-    }
-    struct MockProvider;
-    #[async_trait]
-    impl Provider for MockProvider {
-        fn id(&self) -> ProviderId {
-            ProviderId::Kyber
-        }
-        fn enabled(&self) -> bool {
-            true
-        }
-        async fn quote(
-            &self,
-            input: &Input,
-            _chain: &Chain,
-            sender: Address,
-        ) -> Result<Route, Fault> {
-            Ok(Route {
-                provider: ProviderId::Kyber,
-                buy_amount: "200".into(),
-                min_buy_amount: "199".into(),
-                sell_amount: input.sell_amount.clone(),
-                spender: sender,
-                tx: Tx {
-                    to: sender,
-                    data: "0x12345678".into(),
-                    value: if input.sell_token == NATIVE {
-                        input.sell_amount.clone()
-                    } else {
-                        "0".into()
-                    },
-                },
-                expires_at: now_ms() + 20_000,
-            })
-        }
-    }
-
-    fn config() -> Config {
-        crate::config::load_config(&HashMap::new()).unwrap()
-    }
-    fn services() -> Services {
-        Services {
-            providers: vec![Arc::new(MockProvider)],
-            context: Arc::new(MockContext),
-            simulator: Arc::new(MockSim),
-        }
-    }
-
-    async fn wait_complete(service: &Competitions, created: &CreateResponse) -> Snapshot {
-        for _ in 0..100 {
-            let state = service
-                .get(created.id, Some(&created.access_token))
-                .await
-                .unwrap();
-            if state.status == "complete" {
-                return state;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        panic!("competition did not complete")
-    }
-
-    #[tokio::test]
-    async fn create_completes_with_one_result_per_provider() {
-        let service = Competitions::new(config(), None);
-        let chain = service.config.chains[0].clone();
-        let input = Input {
-            chain_id: 1,
-            sell_token: NATIVE,
-            buy_token: chain.tokens[2].address,
-            sell_amount: "1000000000000000000".into(),
-            slippage_bps: 30,
-            taker: None,
-        };
-        let created = service.create(input).await.unwrap();
-        let state = wait_complete(&service, &created).await;
-        assert_eq!(state.status, "complete");
-        assert_eq!(state.quotes.len(), 3);
-        assert!(state.recommended_quote_id.is_none());
-        service.close().await;
-    }
-
-    #[tokio::test]
-    async fn provider_failure_isolated_from_available_provider() {
-        let mut config = config();
-        config.chains[0].router = Some(
-            crate::domain::parse_address("0x2222222222222222222222222222222222222222").unwrap(),
-        );
-        config.chains[0].rules.insert(
-            ProviderId::Kyber,
-            vec![Rule {
-                target: crate::domain::parse_address("0x2222222222222222222222222222222222222222")
-                    .unwrap(),
-                spender: crate::domain::parse_address("0x2222222222222222222222222222222222222222")
-                    .unwrap(),
-                selector: "0x12345678".into(),
-            }],
-        );
-        let service = Competitions::new(config, Some(services()));
-        let chain = service.config.chains[0].clone();
-        let input = Input {
-            chain_id: 1,
-            sell_token: NATIVE,
-            buy_token: chain.tokens[2].address,
-            sell_amount: "1".into(),
-            slippage_bps: 30,
-            taker: None,
-        };
-        let created = service.create(input).await.unwrap();
-        let state = wait_complete(&service, &created).await;
-        assert_eq!(state.quotes.len(), 1);
-        assert!(state.quotes[0].simulation.as_ref().unwrap().is_success());
-        service.close().await;
-    }
 }

@@ -2,7 +2,7 @@
 
 ## Repository intent
 
-MetaMatch is a non-custodial EVM quote competition backend. It compares 0x, 1inch Classic, and KyberSwap routes, simulates them against a fixed block context, ranks only verified net outputs, and returns unsigned transactions for the user's wallet. The service never stores private keys, signs, broadcasts, or silently changes a user's minimum output.
+MetaMatch is a non-custodial multi-chain EVM quote competition backend. It compares the configured-capable subset of 13 provider adapters, simulates them against a fixed block context, ranks only verified quoted amounts, and returns unsigned transactions for the user's wallet. The service never stores private keys, signs, broadcasts, or silently changes a user's minimum output.
 
 The backend runtime is the Rust Cargo crate at the repository root (`Cargo.toml`, `src/*.rs`).
 
@@ -16,7 +16,7 @@ The backend runtime is the Rust Cargo crate at the repository root (`Cargo.toml`
 ## Architecture boundaries
 
 - `src/domain.rs`: validated wire/domain types and `U256` integer arithmetic. Token quantities are decimal strings; never use floating point for amounts, prices, gas, or comparisons.
-- `src/providers.rs`: fixed official provider endpoints only. Normalize provider responses and reject unexpected target, spender, selector, amount, value, or unsupported state overrides.
+- `src/providers/`: one production module per provider; `mod.rs` owns the stable trait, registry, shared DTO/helpers, and route normalization. Fixed official provider endpoints only. Normalize provider responses and reject unexpected target, spender, selector, amount, value, or unsupported state overrides.
 - `src/rpc.rs` and `src/simulation.rs`: server-configured RPC only. Preserve block number/hash, distinguish success/revert/unsupported/error, and use state overrides only after an `eth_call` validation or an explicitly fork-verified slot.
 - `src/execution.rs` and `contracts/src/MetaRouter.sol`: enforce the AllowanceHolder/MetaRouter boundary. Keep exact spend, exact temporary allowance, route tuple allowlist, actual balance-delta minimum, refund-delta isolation, pause, and reentrancy protections.
 - `src/competitions.rs`: isolate provider failures, enforce timeout/TTL/capacity, bind the real taker during build, re-quote and re-simulate, and reject any accepted minimum downgrade.
@@ -56,7 +56,8 @@ Use the smallest matching skill when a task fits one of these domains. For Rust 
 
 - New public fields require updates to Rust serde/domain types, tests, and the relevant product/technical documentation.
 - New provider integrations must have a fixture contract test for URL, headers, body, response normalization, malformed responses, timeout, and unexpected execution addresses. Do not make an unverified provider response executable by default.
-- New chain/token support requires explicit addresses, decimals, fee model, simulation behavior, and tests. Ethereum is the only supported chain in the current product scope.
+- New chain/provider support requires an official capability source, chain ID/slug, RPC and simulation behavior, and tests. v1 derives its 17-chain catalog from the 13-provider matrix; it does not add a token registry.
+- Production code contains no test modules. All Rust tests, fixtures, mocks, and integration harnesses live under `tests/`; `src/` must remain free of `#[cfg(test)]` and test functions.
 - Contract changes require Foundry tests for caller authorization, target/spender/selector allowlist, exact amount/value, token return values, reentrancy, historical balances, minimum output, refunds, and any nested Holder semantics.
 - Test fixtures must stay visibly test-only and non-executable. Missing RPC/key/router/fee support must be `unavailable`, `unsupported`, or an explicit error; never fill it with fabricated quotes or partial fee estimates.
 

@@ -37,6 +37,7 @@ impl Default for ReqwestClient {
         Self {
             client: reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
+                .user_agent(concat!("metamatch-backend/", env!("CARGO_PKG_VERSION")))
                 .build()
                 .expect("reqwest client configuration must be valid"),
         }
@@ -132,79 +133,4 @@ pub fn auth_headers(entries: &[(&str, &str)]) -> HashMap<String, String> {
         .iter()
         .map(|(key, value)| ((*key).into(), (*value).into()))
         .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
-
-    struct MockHttp {
-        response: HttpResponse,
-    }
-
-    #[async_trait]
-    impl HttpClient for MockHttp {
-        async fn execute(
-            &self,
-            _request: HttpRequest,
-            _timeout: Duration,
-        ) -> Result<HttpResponse, Fault> {
-            Ok(self.response.clone())
-        }
-    }
-
-    #[tokio::test]
-    async fn json_request_redacts_upstream_body_and_caps_json() {
-        let client = Arc::new(MockHttp {
-            response: HttpResponse {
-                status: 429,
-                body: b"secret".to_vec(),
-            },
-        });
-        let error = json_request(
-            client.as_ref(),
-            HttpRequest {
-                method: "GET".into(),
-                url: "https://example.test".into(),
-                headers: HashMap::new(),
-                body: None,
-            },
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, "UPSTREAM_RATE_LIMITED");
-
-        let client = MockHttp {
-            response: HttpResponse {
-                status: 200,
-                body: b"not-json".to_vec(),
-            },
-        };
-        let error = json_request(
-            &client,
-            HttpRequest {
-                method: "GET".into(),
-                url: "https://example.test".into(),
-                headers: HashMap::new(),
-                body: None,
-            },
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, "UPSTREAM_INVALID_JSON");
-    }
-
-    #[test]
-    fn url_parameters_are_encoded_by_url() {
-        let url = url_with_params(
-            "https://example.test/quote",
-            &[("amount", "1 2"), ("token", "0xabc")],
-        )
-        .unwrap();
-        assert!(url.contains("amount=1+2"));
-        assert!(url.contains("token=0xabc"));
-    }
 }

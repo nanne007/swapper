@@ -13,11 +13,16 @@ alloy-rpc-types-eth = { version = "2.4", default-features = false, features = ["
 alloy-sol-types = "1.7"
 async-trait = "0.1"
 axum = "0.8"
+axum-extra = { version = "0.12", default-features = false, features = ["typed-header", "with-rejection"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 futures = "0.3"
+hmac = "0.12"
 hex = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "0.10"
 subtle = "2"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

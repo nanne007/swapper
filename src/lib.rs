@@ -1,4 +1,5 @@
 pub mod app;
+pub mod chains;
 pub mod competitions;
 pub mod config;
 pub mod domain;

@@ -12,7 +12,7 @@ use metamatch_backend::{
     app::create_app_with_services,
     competitions::Services,
     config::{Config, load_config},
-    domain::{Context, HOLDER, Input, ProviderId, Route, Rule, Token, Tx, now_ms, parse_address},
+    domain::{Context, HOLDER, Input, Route, Rule, Tx, now_ms, parse_address},
     providers::Provider,
     rpc::ContextProvider,
     simulation::Simulator,
@@ -152,7 +152,7 @@ struct AnvilContext {
 impl ContextProvider for AnvilContext {
     async fn get(
         &self,
-        input: &Input,
+        _input: &Input,
         chain: &metamatch_backend::domain::Chain,
     ) -> Result<Context, metamatch_backend::domain::Fault> {
         if self
@@ -175,23 +175,11 @@ impl ContextProvider for AnvilContext {
             self.rpc.gas_price().await.map_err(|_| {
                 metamatch_backend::domain::Fault::with_status("RPC_CALL_FAILED", 502)
             })?;
-        if !chain
-            .tokens
-            .iter()
-            .any(|token| token.address == input.buy_token)
-        {
-            return Err(metamatch_backend::domain::Fault::with_status(
-                "TOKEN_NOT_SUPPORTED",
-                422,
-            ));
-        }
         Ok(Context {
             block_number: format!("0x{:x}", block.header.inner.number),
             block_hash: format!("{:#x}", block.header.hash),
             timestamp: block.header.inner.timestamp,
             gas_price: gas_price.to_string(),
-            native_usd: Some("3000".into()),
-            buy_usd: Some("1".into()),
         })
     }
 }
@@ -199,16 +187,29 @@ impl ContextProvider for AnvilContext {
 struct FixtureProvider {
     router: Address,
     route: Route,
+    rules: Vec<Rule>,
 }
 
 #[async_trait]
 impl Provider for FixtureProvider {
-    fn id(&self) -> ProviderId {
-        ProviderId::Kyber
+    fn id(&self) -> &'static str {
+        "kyber"
     }
 
-    fn enabled(&self) -> bool {
-        true
+    fn requires_access_key(&self) -> bool {
+        false
+    }
+
+    fn supported_chains(&self) -> Vec<u64> {
+        vec![1]
+    }
+
+    fn rules(&self, chain_id: u64) -> Vec<Rule> {
+        if chain_id == 1 {
+            self.rules.clone()
+        } else {
+            Vec::new()
+        }
     }
 
     async fn quote(
@@ -442,28 +443,6 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         .first_mut()
         .ok_or_else(|| String::from("missing Ethereum chain"))?;
     chain.router = Some(router);
-    chain.tokens.extend([
-        Token {
-            address: sell,
-            symbol: String::from("TESTSELL"),
-            decimals: 0,
-            price_id: String::from("test"),
-        },
-        Token {
-            address: buy,
-            symbol: String::from("TESTBUY"),
-            decimals: 0,
-            price_id: String::from("test"),
-        },
-    ]);
-    chain.rules.insert(
-        ProviderId::Kyber,
-        vec![Rule {
-            target,
-            spender: target,
-            selector: hex_bytes(swap_selector.as_slice()),
-        }],
-    );
     let input = Input {
         chain_id: 1,
         sell_token: sell,
@@ -473,7 +452,7 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         taker: Some(account),
     };
     let route = Route {
-        provider: ProviderId::Kyber,
+        provider: "kyber",
         buy_amount: String::from("200"),
         min_buy_amount: String::from("199"),
         sell_amount: String::from("100"),
@@ -485,11 +464,20 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         },
         expires_at: now_ms() + 20_000,
     };
-    let services = Services {
-        providers: vec![Arc::new(FixtureProvider { router, route })],
-        context: Arc::new(AnvilContext { rpc: rpc.clone() }),
-        simulator: Arc::new(Simulator::new(Duration::from_secs(2))),
-    };
+    let services = Services::new(
+        vec![Arc::new(FixtureProvider {
+            router,
+            route,
+            rules: vec![Rule {
+                target,
+                spender: target,
+                selector: hex_bytes(swap_selector.as_slice()),
+            }],
+        })],
+        &config.chains,
+        Arc::new(AnvilContext { rpc: rpc.clone() }),
+        Arc::new(Simulator::new(Duration::from_secs(2))),
+    );
     let app = create_app_with_services(config, Some(services));
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await

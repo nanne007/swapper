@@ -15,7 +15,7 @@ Read `AGENTS.md`, `docs/TECHNICAL.md`, `docs/VERIFICATION.md`, `src/rpc.rs`, `sr
 - State overrides are assumptions, not facts. Only use a configured token balance slot after validating the overridden `balanceOf` response. Never guess slots, override arbitrary storage, or use overrides to bypass actual build funding checks.
 - Derive bought output from the taker's balance delta. Sum gas from approval and swap calls only. Ethereum fee support may produce a value; unsupported fee models remain explicit errors.
 - Preview may use controlled funding overrides. Build must use the real taker's balance and only return unsigned approval/swap transactions after final re-quote and simulation.
-- Keep provider target, spender, selector, calldata, and value checks in `src/providers.rs`/`src/execution.rs`; do not make simulation a generic arbitrary-call executor.
+- Keep provider target, spender, selector, calldata, and value checks in `src/providers/`/`src/execution.rs`; do not make simulation a generic arbitrary-call executor.
 
 ## Change workflow
 

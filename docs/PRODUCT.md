@@ -1,51 +1,76 @@
-# MetaMatch 产品需求 v0.3
+# MetaMatch 产品需求 v1
 
-日期：2026-09-11。状态：最小核心版本。
+日期：2026-09-13。状态：v1 运行时契约与 13 个 provider adapter 已落库；公开 provider 已执行 live quote，仍缺必需 key、生产 RPC、正式 Router 和主网执行验证。
 
-## 产品目标
+## 1. 产品目标
 
-让调用方对同一笔 Ethereum exact-input 兑换获得多家供应商报价、固定区块仿真结果和排序结果，并返回由用户钱包执行的 unsigned transactions。服务不保管私钥、不签名、不广播，也不替用户降低 minimum output。
+MetaMatch 是一个非托管的 EVM 同链 exact-input swap 报价竞赛服务。用户提交链、卖出 token、买入 token、数量和滑点；服务按照 provider 对链的实际支持能力建立 `chain -> provider list` 反向索引，向该链上能参与的 provider 并发询价，统一校验、仿真、排序，并返回由用户钱包自行签名和广播的 unsigned transaction。
 
-## 核心范围
+服务端不持有私钥，不签名、不广播，不替用户扩大或降低 minimum output。
 
-- 只支持 Ethereum 主网配置（chainId 1）。资产是服务端白名单中的 ETH/WETH/USDC；只支持买入 ERC-20。
-- 并发请求 0x、1inch Classic、KyberSwap，统一成内部 Route 后校验目标、spender、selector、金额和 value。
-- 从同一个 parent block 获取 context，使用 `eth_call` 和 `eth_simulateV1` 验证余额增量、审批返回值、gas 和 minimum output。
-- 只有有效期内、仿真成功且有净到账值的报价才能成为推荐报价。
-- build 时绑定真实 taker，重新报价、重新仿真，并拒绝低于用户已接受底价的结果。
-- Router 与路由白名单未配置时可以做 direct preview，但 build 明确返回配置错误。
+## 2. v1 范围
 
-不在本版本：demo/mock 报价、Base、其他链、跨链、原生币 buy、intent、平台抽成、SSE、OpenAPI endpoint、交易回执代理、数据库和多副本。
+- 只处理同一条 EVM 链上的交换；不做跨链桥、非 EVM、intent、gasless 或交易回执代理。
+- provider 集合固定来自 [Matcha Meta DEX Aggregation](https://0x-docs.gitbook.io/matcha-meta/core-concepts/dex-aggregation) 页面，不由部署配置增删。
+- 链集合是上述 provider 支持链的并集；启动时不配置链 allowlist，也不配置 provider enable/disable 列表。
+- 配置不维护 token 白名单、token 列表或 token metadata。API 收到的 token 地址只做地址格式和交易不变量校验，然后透传给 provider。
+- provider 自己实现 `supported_chains()`。需要 access key 的 provider 在没有对应环境变量时返回空集合；不需要 access key 的 provider 不因缺少 key 被排除。配置了 optional key 时仍传给对应 adapter。其余 provider 一律参与竞赛，失败只影响自身报价。
+- 请求带 `chainId`，服务必须拒绝 catalog 之外的链；`buyToken` 暂不允许使用 native sentinel，保持现有资金模型简单。
+- quote 阶段可因缺少 RPC 或执行 Router 而成为 preview/unavailable；build 必须重新报价和仿真，不把 preview 当作可执行成功。
 
-## 用户流程
+## 3. provider 与链
 
-1. `GET /v1/capabilities` 查询唯一支持的链、资产和供应商配置状态。
-2. `POST /v1/competitions` 提交 `chainId`、`sellToken`、`buyToken`、十进制整数 `sellAmount`、`slippageBps`，可选 taker。
-3. 服务返回 `202`、短期 `accessToken` 和 `competitionId`。调用方带 Bearer token 轮询 `GET /v1/competitions/{id}`，直到 `status=complete`。
-4. 调用方只把 `simulation.status=success` 且 `netOutput` 非空的未过期报价视为可比较结果。
-5. 调用方提交真实 taker 与先前接受的 `acceptedMinBuyAmount` 到 build。服务重新报价和仿真后返回独立 approval 交易和 swap 交易；调用方自行签名、广播，必要审批完成后重新 build。
+provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hyperBloom`、`kyber`、`liquidSwap`、`odos`、`oogaBooga`、`okx`、`openOcean`、`velora`。
 
-## 最小 API
+链 catalog（共 17 个）：Ethereum `1`、Optimism `10`、BNB Smart Chain `56`、Unichain `130`、Polygon `137`、Monad `143`、Sonic `146`、HyperEVM `999`、Mantle `5000`、Base `8453`、Plasma `9745`、Arbitrum One `42161`、Avalanche `43114`、Linea `59144`、Berachain `80094`、Blast `81457`、Scroll `534352`。
 
-- `GET /health`：进程健康状态。
-- `GET /v1/capabilities`：链、资产和供应商配置发现。
-- `POST /v1/competitions`：创建报价竞赛。
-- `GET /v1/competitions/{id}`：带 token 读取快照和排序报价。
-- `POST /v1/competitions/{id}/quotes/{quoteId}/build`：重新报价、仿真并返回 unsigned transactions。
+运行时代码中的 provider-to-chain 矩阵分别位于 [src/providers/](../src/providers/) 的对应 adapter；链名称和上游 path slug 在 [src/chains.rs](../src/chains.rs)。provider 名单来自 Matcha，链矩阵和接入参数按 2026-09-13 各家当前官方 API 重核；细节见 [PROVIDER_INTEGRATION_GUIDE.md](PROVIDER_INTEGRATION_GUIDE.md)。Monad 已从历史 testnet `10143` 更新为主网 `143`。
 
-## 验收条件
+## 4. 用户流程
 
-| 编号 | 验收行为 |
-| --- | --- |
-| P1 | 三个适配器并发询价，一家失败不丢弃其他结果；无凭据不发起该供应商请求。 |
-| P2 | 竞赛异步完成，轮询可读取逐家结果和终态；竞赛数量、请求体、上游响应和 build 并发有界。 |
-| P3 | 金额、gas、费用和比较全部使用整数或定点数，不使用浮点金额。 |
-| P4 | 仿真严格区分 success、reverted、unsupported、error；仿真和报价不能被 mock 标为真实成功。 |
-| P5 | build 校验 taker、有效期、底价、目标白名单，并对最终统一执行 calldata 重新仿真。 |
-| P6 | Router 保持精确花费、临时授权、实际到账 minimum、退款增量、pause、reentrancy 等资金不变量。 |
+1. `GET /v1/capabilities` 返回 catalog 中每条链和本次启动真正能参与的 provider ID。
+2. `POST /v1/competitions` 提交：
 
-## 非功能与证据边界
+   ```json
+   {
+     "chainId": 8453,
+     "sellToken": "0x…",
+     "buyToken": "0x…",
+     "sellAmount": "1000000000000000000",
+     "slippageBps": 30,
+     "taker": "0x…"
+   }
+   ```
 
-服务是单进程、短 TTL、有界内存实现。没有真实供应商 key、生产 simulate RPC、正式 Router/Holder 部署或主网 fork 时，只能声称 fixture、单测和本地 Anvil 已验证；不能将其称为 live end-to-end 或审计完成。
+3. 服务返回 `202`、短期 `accessToken` 和 competition ID；调用方带 Bearer token 轮询结果。
+4. 只有未过期、统一 route 校验通过、仿真成功且有有效 `quotedAmount` 的 quote 才能推荐；同一请求的买入 token 和链一致，因此按整数报价输出排序，不引入 token registry 或固定 decimals。
+5. build 接收真实 taker 和调用方此前接受的 `acceptedMinBuyAmount`，重新 quote、重新仿真，低于底价或 route 改变即拒绝。
+6. 调用方完成 approval（如果需要），重新 build，最后自行签名和广播。
 
-仿真是特定区块和假设下的结果，不保证稍后成交价格；最终 minimum output 由链上 Router 执行。服务端不接受用户提供的 RPC URL、目标地址、calldata、state slot 或 provider endpoint。
+## 5. 最小 API
+
+| 方法 | 路径 | 作用 |
+| --- | --- | --- |
+| GET | `/health` | 进程健康状态 |
+| GET | `/v1/capabilities` | 链与 provider 反向索引发现，不返回 token 列表 |
+| POST | `/v1/competitions` | 创建异步报价竞赛 |
+| GET | `/v1/competitions/{id}` | 读取带鉴权的结果快照 |
+| POST | `/v1/competitions/{id}/quotes/{quoteId}/build` | 重新报价、仿真并生成 unsigned 交易 |
+
+## 6. 配置原则
+
+- 不配置链集合：代码内 catalog 始终存在。
+- 不配置 provider 集合：代码内 provider 注册表始终创建全部 13 个 provider。
+- 不配置 token：没有 token allowlist；未知 token 由 provider 和链上仿真决定是否可交易。
+- RPC 是运行基础设施，不是产品能力开关。按 `RPC_URL_<chainId>` 提供，例如 `RPC_URL_8453`；Ethereum 兼容别名 `ETHEREUM_RPC_URL` 仅为迁移便利保留。
+- provider access key 使用各 provider 原生环境变量，不抽象成 credential trait。需要 key 的 provider 缺少任一必需字段时不进入索引；完整名称见 [src/config.rs](../src/config.rs)。
+
+## 7. 明确不在 v1
+
+数据库、多副本状态、分布式限流、跨链、非 EVM、token registry、价格/decimals 目录、provider 熔断、智能路由重写、平台抽成、用户身份系统、SSE、交易广播和回执存储。
+
+## 8. 当前实现状态
+
+v1 的多链 catalog、13 个字符串 provider ID、`supported_chains` 规则、access-key 过滤、反向索引和 13 家真实 HTTP adapter 已实现。每家 adapter 都把 provider 原生 quote 转为统一 `Route`，并拒绝金额、expiry、target、spender、calldata 或 native value 不一致的响应。当前仍不应宣称真实 key、生产 RPC、正式 Router 或主网执行已经验证。
+
+实现和验证状态以 [VERIFICATION.md](VERIFICATION.md) 和 [RUST_REWRITE_LOG.md](RUST_REWRITE_LOG.md) 为准。
