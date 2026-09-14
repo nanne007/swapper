@@ -7,16 +7,16 @@
 ## 1. 范围和证据规则
 
 - v1 的 13 家 provider 名单来自 [Matcha Meta DEX aggregation](https://0x-docs.gitbook.io/matcha-meta/core-concepts/dex-aggregation)。Matcha 页面用于决定“收录谁”，不继续充当每家 API 参数和当前链支持的唯一依据。
-- 每家能力、认证、endpoint、chain、金额单位、native token 和响应字段优先采用该 provider 当前官方文档、官方 SDK 或官方 GitHub。代码里的链矩阵是 2026-09-13 官方支持链与本项目 17 条 EVM catalog 的交集。
+- 每家能力、认证、endpoint、chain、金额单位、native token 和响应字段优先采用该 provider 当前官方文档、官方 SDK 或官方 GitHub。运行时不维护第二份 chain catalog，而是直接聚合当前 adapter 实例的 `supported_chains()`。
 - provider 官网可能随时变更。`supported_chains()` 是代码快照，不是远端动态发现；上线前和每次升级 adapter 时必须重新核对本文链接并运行 live smoke。
 - “API 返回交易”不等于“可安全成交”。所有响应仍要经过金额、token、taker、spender、target、calldata、native value、expiry 和链上仿真检查。
 - v1 只做同链、EVM、exact-input、自托管交易。跨链、intent/gasless、Solana、平台收费和 provider token registry 不进入核心实现。
 
 ## 2. 总览
 
-链 ID 使用本项目 catalog；逗号列表表示当前 adapter 会返回的静态能力交集。
+逗号列表表示当前 adapter 会返回的静态能力；运行时链集合是所有当前 provider 返回值的并集。
 
-| Provider | v1 API/模式 | 认证与申请 | 当前 catalog 链 | Native 表示 | 主要注意事项 |
+| Provider | v1 API/模式 | 认证与申请 | 当前支持链 | Native 表示 | 主要注意事项 |
 | --- | --- | --- | --- | --- | --- |
 | 0x | Swap API v2 AllowanceHolder firm quote | 必需 `ZERO_EX_API_KEY`，0x Dashboard | 1, 10, 56, 130, 137, 143, 146, 999, 5000, 8453, 9745, 42161, 43114, 59144, 80094, 534352 | `0xeeee…` | approval spender 与 `transaction.to` 是两个字段；绝不能 approve Settler |
 | 1inch | Classic Swap v6.1 | 必需 `ONE_INCH_API_KEY`，1inch Business Portal | 1, 10, 56, 130, 137, 143, 146, 999, 8453, 42161, 43114, 59144 | `0xeeee…` | Bearer；slippage 是百分数；当前使用官方 Router v6 地址 |
@@ -29,7 +29,7 @@
 | Odos | SOR quote v2 → assemble | 官方公开 API 无认证；`ODOS_API_KEY` 仅作为可选透传 | 1, 10, 56, 130, 137, 146, 5000, 8453, 42161, 43114, 59144, 534352 | 零地址 | quote 的 `pathId` 再 assemble；approval target 取组装交易 Router |
 | OogaBooga | Swap API | 必需 `OOGABOOGA_API_KEY`，联系团队 | 999, 80094 | 零地址 | 只支持 `/tokens` 白名单；router/executor 动态返回，不硬编码 |
 | OKX | Classic Swap API v6 | 必需 API key/secret/passphrase；project ID 可选 | 1, 10, 56, 130, 137, 143, 146, 999, 5000, 8453, 9745, 42161, 43114, 59144, 81457, 534352 | `0xeeee…` | HMAC 签名覆盖 path+query；ERC-20 请求 approval data；使用上游 `minReceiveAmount` |
-| OpenOcean | Swap API v4 | Public 无 key，默认 2 RPS | 全部 17 条 catalog 链 | 按链分别为 `eeee`、零地址或 Polygon `…1010` | swap 前读取 gasPrice；403 是 IP/安全策略，不应伪装成缺 key |
+| OpenOcean | Swap API v4 | Public 无 key，默认 2 RPS | 当前并集中的 17 条链 | 按链分别为 `eeee`、零地址或 Polygon `…1010` | swap 前读取 gasPrice；403 是 IP/安全策略，不应伪装成缺 key |
 | Velora | Market API `/swap` v6.2 | Public 无 key | 1, 10, 56, 130, 137, 146, 8453, 9745, 42161, 43114 | `0xeeee…` | `/swap` 低限流、无 RFQ、无 allowance/balance check；必须自行仿真 |
 
 ## 3. 统一接入边界
@@ -111,9 +111,9 @@
 
 - 能力：token swap、zap、position migration 和跨链 route。v1 只接受返回路径全部位于请求链的普通 token route。
 - 前提：Enso Dashboard 申请 `ENSO_API_KEY`，Bearer 认证；官方默认限流需按账户核对。
-- 请求：`POST /api/v1/shortcuts/route` JSON；`tokenIn`、`tokenOut`、`amountIn` 都是数组，金额为 base units，slippage 为 bps。v1 使用适合 EOA/普通 Router 的 `routingStrategy=router`。
+- 请求：`POST /api/v1/shortcuts/route` JSON；`tokenIn`、`tokenOut`、`amountIn` 都是数组，金额为 base units，slippage 为 bps **字符串**（例如 `"30"`，数字 `30` 实测被 400 拒绝）。v1 使用适合 EOA/普通 Router 的 `routingStrategy=router`。
 - 响应：`tx.to` 必须按响应使用，不能硬编码；ERC-20 spender 优先从对应 token 的 `preTransactions` 读取，否则使用 tx target。
-- 注意：官方 API 支持 `destinationChainId`，但产品没有跨链状态机，任何跨链 leg 都返回 `CROSS_CHAIN_ROUTE_UNSUPPORTED`。若未来把 Enso calldata 嵌入 MetaRouter，还需主网 fork 证明 sender/receiver/spender 语义兼容。
+- 注意：官方 API 支持 `destinationChainId`，但产品没有跨链状态机，任何明确异链 leg 都返回 `CROSS_CHAIN_ROUTE_UNSUPPORTED`。2026-09-14 同链实测 leg 不含 `chainId`，因此该字段可省略；一旦提供必须等于请求链，同时继续核对 source/destination chain。若未来把 Enso calldata 嵌入 MetaRouter，还需主网 fork 证明 sender/receiver/spender 语义兼容。
 
 代码：[enso.rs](../src/providers/enso.rs)。
 
@@ -133,8 +133,8 @@
 
 官方入口：[Route Finding](https://docs.liqd.ag/liquidswap-integration/route-finding)。
 
-- 能力：HyperEVM/Robinhood 上聚合多家 DEX；当前 catalog 只交集到 HyperEVM 999。
-- 前提：无认证；但本项目需要该链 RPC 读取 sell token `decimals()`，例如 `RPC_URL_999`。
+- 能力：HyperEVM/Robinhood 上聚合多家 DEX；当前 adapter 仅声明产品已实现的 HyperEVM 999。
+- 前提：无认证；但本项目需要该链 RPC 读取 sell token `decimals()`，例如显式 `RPC_URL_999`，或由 `ALCHEMY_API_KEY` 自动生成的 HyperEVM endpoint。
 - 请求：tokenIn/tokenOut 是合约地址；`amountIn` 是 human-readable 十进制数，不是 base units；slippage 是百分数。
 - 响应：必须 `success=true`，token 地址必须匹配；`execution.details.amountIn/amountOut/minAmountOut` 转回统一 base-unit 金额，`execution.to/calldata` 生成交易。
 - 注意：官方参数要求合约地址，所以 native HYPE 不能用零地址或 `eeee` 冒充 token；调用方应传 WHYPE。adapter 不配置 feeBps/feeRecipient，避免在 v1 引入收费逻辑。
@@ -183,8 +183,8 @@
 
 - 能力：公开 v4 quote/swap；v1 使用 `/swap` 直接获取交易。
 - 前提：Public API 无 key，默认 2 RPS；更高配额或商业 SLA 需单独申请 Pro/Enterprise。
-- 请求：先 `GET /v4/{chain}/gasPrice`，把 `data.standard` 作为 `gasPriceDecimals`；再调用 `/swap`。amountDecimals 是 base units，slippage 是百分数。
-- Native：Ethereum/Optimism/BNB/Unichain/Base/Arbitrum/Linea/Blast/Scroll 用 `0xeeee…`；Polygon 用 `0x000…1010`；当前其余 catalog 链用零地址。该映射必须按官方链表更新，不能全局统一。
+- 请求：先 `GET /v4/{chain}/gasPrice`，读取 scalar `data.standard`，或 EIP-1559 对象的 `data.standard.legacyGasPrice`，作为 wei 单位的 `gasPriceDecimals`；再调用 `/swap`。Ethereum 实测返回后者，不应将整个对象当整数。amountDecimals 是 base units，slippage 是百分数。对象形态也见官方 [Enterprise API 文档](https://docs.openocean.finance/docs/swap-api/enterprise)。
+- Native：Ethereum/Optimism/BNB/Unichain/Base/Arbitrum/Linea/Blast/Scroll 用 `0xeeee…`；Polygon 用 `0x000…1010`；当前该 adapter 的其余链用零地址。该映射必须按官方链表更新，不能全局统一。
 - 响应：使用上游 in/out/min amount、chainId、from、to/data/value；当前 swap target 也作为 spender。
 - 注意：本机实测 gasPrice 为 200、swap 为 403。官方错误表把 401/402 归为 Pro key 问题，403 归为 IP 白名单/安全策略，因此保持免 key 语义并让 live test 失败；需要 OpenOcean 加白或提供正式商业 host，而不是猜 API key。
 
@@ -197,6 +197,7 @@
 - 能力：原 ParaSwap/现 Velora Market API v6.2 聚合路由并返回 `priceRoute + txParams`。
 - 前提：公开 endpoint，无 access key；生产流量和商业支持仍应向 Velora 核对。
 - 请求：`GET https://api.paraswap.io/swap`，SELL side，base-unit amount，native 为 `0xeeee…`，slippage 是 bps。v1 传 `ignoreBadUsdPrice=true`，表示不让上游 USD 价格保护替代本项目仿真。
+- `userAddress` 使用 EIP-55。2026-09-14 实测旧低位 preview 地址 `0x…0a11ce` 被上游 validator 以 HTTP 400 拒绝，转成 checksum 也无效；改用确定性 hash-derived 保留 preview 地址后，同一请求返回报价并仿真成功。这是实测行为，不声称官方文档规定所有低位地址都无效。
 - 响应：校验 network/srcAmount/destAmount；spender 优先 `tokenTransferProxy`，兼容 `contractAddress`；交易取 `txParams`。
 - 注意：官方说明 `/swap` 相比分步 `/prices` + `/transactions` 有更低 rate limit，不做 allowance/balance 检查且不包含 RFQ。当前最小实现接受这些取舍，但绝不能跳过本地余额、授权和成交仿真。
 
@@ -208,7 +209,7 @@
 
 1. endpoint/version/method 是否仍为官方当前版本？
 2. key 是必需、optional 还是完全不支持？缺 key 时 `supported_chains()` 是否正确？
-3. 支持链是当前官方能力与 catalog 的交集吗？测试网是否误混入主网？
+3. `supported_chains()` 是否与当前官方能力一致？测试网是否误混入主网？
 4. amount、slippage、deadline/expiry 的单位是什么？有无浮点精度风险？
 5. native token 是否按该 provider、该链映射，而不是全局猜一个 sentinel？
 6. approval spender、execution target 和临时 executor 是否被正确区分？

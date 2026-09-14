@@ -1,137 +1,67 @@
-use crate::domain::{Chain, Fault};
+use crate::{config::Config, domain::Chain};
+use alloy_chains::{Chain as AlloyChain, NamedChain};
 use std::collections::HashMap;
+use url::Url;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ChainSpec {
-    pub id: u64,
-    pub name: &'static str,
-    pub slug: &'static str,
-}
-
-// This is the union of the EVM networks listed by Matcha Meta's DEX
-// aggregation page. It is capability data, not an enable/disable config.
-pub const CHAIN_CATALOG: &[ChainSpec] = &[
-    ChainSpec {
-        id: 1,
-        name: "Ethereum",
-        slug: "ethereum",
-    },
-    ChainSpec {
-        id: 10,
-        name: "Optimism",
-        slug: "optimism",
-    },
-    ChainSpec {
-        id: 56,
-        name: "BNB Smart Chain",
-        slug: "bsc",
-    },
-    ChainSpec {
-        id: 130,
-        name: "Unichain",
-        slug: "unichain",
-    },
-    ChainSpec {
-        id: 137,
-        name: "Polygon",
-        slug: "polygon",
-    },
-    ChainSpec {
-        id: 146,
-        name: "Sonic",
-        slug: "sonic",
-    },
-    ChainSpec {
-        id: 999,
-        name: "HyperEVM",
-        slug: "hyperevm",
-    },
-    ChainSpec {
-        id: 5000,
-        name: "Mantle",
-        slug: "mantle",
-    },
-    ChainSpec {
-        id: 8453,
-        name: "Base",
-        slug: "base",
-    },
-    ChainSpec {
-        id: 9745,
-        name: "Plasma",
-        slug: "plasma",
-    },
-    ChainSpec {
-        id: 143,
-        name: "Monad",
-        slug: "monad",
-    },
-    ChainSpec {
-        id: 42161,
-        name: "Arbitrum One",
-        slug: "arbitrum",
-    },
-    ChainSpec {
-        id: 43114,
-        name: "Avalanche",
-        slug: "avalanche",
-    },
-    ChainSpec {
-        id: 59144,
-        name: "Linea",
-        slug: "linea",
-    },
-    ChainSpec {
-        id: 80094,
-        name: "Berachain",
-        slug: "berachain",
-    },
-    ChainSpec {
-        id: 81457,
-        name: "Blast",
-        slug: "blast",
-    },
-    ChainSpec {
-        id: 534352,
-        name: "Scroll",
-        slug: "scroll",
-    },
-];
-
-pub fn spec(chain_id: u64) -> Option<&'static ChainSpec> {
-    CHAIN_CATALOG.iter().find(|item| item.id == chain_id)
-}
-
-pub fn configured_chains(env: &HashMap<String, String>) -> Result<Vec<Chain>, Fault> {
-    CHAIN_CATALOG
-        .iter()
-        .map(|item| {
-            let rpc_url = rpc_url(env, item.id);
-            if let Some(url) = &rpc_url
-                && !(url.starts_with("http://") || url.starts_with("https://"))
-            {
-                return Err(Fault::new("INVALID_CONFIG"));
-            }
-            Ok(Chain {
-                id: item.id,
-                name: item.name.into(),
-                slug: item.slug.into(),
-                rpc_url,
-                router: None,
-                balance_slots: HashMap::new(),
-            })
-        })
+/// Builds runtime chain state from the current providers' supported chain IDs.
+pub fn configured_chains(config: &Config, chain_ids: impl IntoIterator<Item = u64>) -> Vec<Chain> {
+    chain_ids
+        .into_iter()
+        .map(|chain_id| configured_chain(config, chain_id))
         .collect()
 }
 
-fn rpc_url(env: &HashMap<String, String>, chain_id: u64) -> Option<String> {
-    env.get(&format!("RPC_URL_{chain_id}"))
-        .cloned()
-        .filter(|value| !value.is_empty())
+/// Builds runtime state for one provider-supported chain ID.
+pub fn configured_chain(config: &Config, chain_id: u64) -> Chain {
+    Chain {
+        id: chain_id,
+        name: AlloyChain::from_id(chain_id).to_string(),
+        rpc_url: rpc_url(config, chain_id),
+        router: None,
+        balance_slots: HashMap::new(),
+    }
+}
+
+/// Returns the Alchemy endpoint prefix for a chain, without an API key.
+pub fn alchemy_rpc_url(chain_id: u64) -> Option<&'static str> {
+    match AlloyChain::from_id(chain_id).named()? {
+        NamedChain::Mainnet => Some("https://eth-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Optimism => Some("https://opt-mainnet.g.alchemy.com/v2/"),
+        NamedChain::BinanceSmartChain => Some("https://bnb-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Unichain => Some("https://unichain-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Polygon => Some("https://polygon-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Monad => Some("https://monad-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Sonic => Some("https://sonic-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Hyperliquid => Some("https://hyperliquid-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Mantle => Some("https://mantle-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Base => Some("https://base-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Plasma => Some("https://plasma-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Arbitrum => Some("https://arb-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Avalanche => Some("https://avax-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Linea => Some("https://linea-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Berachain => Some("https://berachain-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Blast => Some("https://blast-mainnet.g.alchemy.com/v2/"),
+        NamedChain::Scroll => Some("https://scroll-mainnet.g.alchemy.com/v2/"),
+        _ => None,
+    }
+}
+
+/// Resolves an explicit chain RPC first, then the Alchemy fallback.
+pub fn rpc_url(config: &Config, chain_id: u64) -> Option<String> {
+    config
+        .explicit_rpc_url(chain_id)
+        .map(str::to_owned)
         .or_else(|| {
-            (chain_id == 1)
-                .then(|| env.get("ETHEREUM_RPC_URL").cloned())
-                .flatten()
-                .filter(|value| !value.is_empty())
+            let base_url = alchemy_rpc_url(chain_id)?;
+            Some(append_api_key(base_url, config.alchemy_api_key()?))
         })
+}
+
+fn append_api_key(base_url: &str, api_key: &str) -> String {
+    let mut url = Url::parse(base_url).expect("static Alchemy base URL must be valid");
+    url.path_segments_mut()
+        .expect("Alchemy endpoint must be a base URL")
+        .pop_if_empty()
+        .push(api_key);
+    url.into()
 }

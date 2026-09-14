@@ -2,18 +2,13 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct HyperBloomResponse {
-    #[serde(rename = "chainId")]
     chain_id: u64,
-    #[serde(rename = "sellAmount")]
     sell_amount: String,
-    #[serde(rename = "buyAmount")]
     buy_amount: String,
-    #[serde(rename = "sellTokenAddress")]
     sell_token_address: String,
-    #[serde(rename = "buyTokenAddress")]
     buy_token_address: String,
-    #[serde(rename = "allowanceTarget")]
     allowance_target: Option<String>,
     value: Value,
     to: Option<String>,
@@ -42,9 +37,9 @@ impl Provider for HyperBloomProvider {
         chains_if_configured(self.key.is_some(), SUPPORTED_CHAINS)
     }
 
-    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let Some(key) = &self.key else {
-            return Err(Fault::with_status("PROVIDER_UNCONFIGURED", 503));
+            anyhow::bail!(ErrorKind::ProviderUnconfigured);
         };
         let sell_token = address_string(input.sell_token);
         let buy_token = address_string(input.buy_token);
@@ -74,14 +69,10 @@ impl Provider for HyperBloomProvider {
             || parse_address(&response.sell_token_address)? != input.sell_token
             || parse_address(&response.buy_token_address)? != input.buy_token
         {
-            return Err(Fault::with_status("UPSTREAM_CHAIN_OR_TOKEN_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamChainOrTokenMismatch);
         }
-        let to = response
-            .to
-            .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
-        let data = response
-            .data
-            .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
+        let to = response.to.context(ErrorKind::UpstreamInvalidResponse)?;
+        let data = response.data.context(ErrorKind::UpstreamInvalidResponse)?;
         let spender = response
             .allowance_target
             .and_then(|address| (address != format!("{:#x}", Address::ZERO)).then_some(address))

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use metamatch_backend::{
     config::load_config_from_env,
-    domain::{Address, Chain, Fault, Input, NATIVE, parse_address, parse_positive},
+    domain::{Address, Chain, Input, NATIVE, parse_address, parse_positive},
     http::{HttpClient, HttpRequest, HttpResponse, ReqwestClient},
     providers::create_providers,
 };
@@ -42,7 +42,7 @@ impl HttpClient for ObservedReqwestClient {
         &self,
         request: HttpRequest,
         timeout: Duration,
-    ) -> Result<HttpResponse, Fault> {
+    ) -> anyhow::Result<HttpResponse> {
         match self.inner.execute(request, timeout).await {
             Ok(response) => {
                 self.observation
@@ -57,7 +57,7 @@ impl HttpClient for ObservedReqwestClient {
                     .transport_errors
                     .lock()
                     .unwrap()
-                    .push(error.code.clone());
+                    .push(metamatch_backend::error::kind(&error).to_string());
                 Err(error)
             }
         }
@@ -159,12 +159,7 @@ fn live_input(chain_id: u64) -> Option<Input> {
 }
 
 fn chain(config: &metamatch_backend::config::Config, chain_id: u64) -> Chain {
-    let mut chain = config
-        .chains
-        .iter()
-        .find(|chain| chain.id == chain_id)
-        .cloned()
-        .expect("live chain is part of the configured catalog");
+    let mut chain = metamatch_backend::chains::configured_chain(config, chain_id);
     if chain_id == 999 && chain.rpc_url.is_none() {
         chain.rpc_url = Some("https://rpc.hyperliquid.xyz/evm".into());
     }
@@ -227,7 +222,7 @@ async fn exercise(spec: ProviderSpec) {
     let route = result.unwrap_or_else(|error| {
         panic!(
             "{} reached upstream with statuses {statuses:?}, but returned {} instead of a usable quote",
-            spec.id, error.code
+            spec.id, metamatch_backend::error::kind(&error)
         )
     });
     assert_eq!(route.provider, spec.id);

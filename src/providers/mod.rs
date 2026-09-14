@@ -1,11 +1,13 @@
+use crate::error::ErrorKind;
 use crate::{
     config::Config,
     domain::{
-        Address, Chain, Fault, Input, NATIVE, Route, Rule, Tx, format_quantity, minimum,
-        parse_address, parse_hex, parse_positive, parse_uint,
+        Address, Chain, Input, NATIVE, Route, Rule, Tx, minimum, parse_address, parse_hex,
+        parse_positive, parse_uint,
     },
     http::{HttpClient, HttpRequest, auth_headers, json_request_as, url_with_params},
 };
+use anyhow::Context as _;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -47,7 +49,7 @@ pub trait Provider: Send + Sync {
     fn rules(&self, _chain_id: u64) -> Vec<Rule> {
         Vec::new()
     }
-    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> Result<Route, Fault>;
+    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route>;
 }
 
 pub fn create_providers(config: &Config, client: Arc<dyn HttpClient>) -> Vec<Arc<dyn Provider>> {
@@ -144,11 +146,7 @@ pub struct ProviderRegistry {
 }
 
 impl ProviderRegistry {
-    pub fn new(providers: Vec<Arc<dyn Provider>>, chains: &[Chain]) -> Self {
-        let known_chains = chains
-            .iter()
-            .map(|chain| chain.id)
-            .collect::<std::collections::HashSet<_>>();
+    pub fn new(providers: Vec<Arc<dyn Provider>>) -> Self {
         let mut registered = HashMap::with_capacity(providers.len());
         let mut by_chain = HashMap::new();
         for provider in providers {
@@ -158,9 +156,7 @@ impl ProviderRegistry {
                 "duplicate provider id: {id}"
             );
             for chain_id in provider.supported_chains() {
-                if known_chains.contains(&chain_id) {
-                    by_chain.entry(chain_id).or_insert_with(Vec::new).push(id);
-                }
+                by_chain.entry(chain_id).or_insert_with(Vec::new).push(id);
             }
         }
         Self {
@@ -185,6 +181,12 @@ impl ProviderRegistry {
     pub fn by_chain(&self) -> &HashMap<u64, Vec<&'static str>> {
         &self.by_chain
     }
+
+    pub fn chain_ids(&self) -> Vec<u64> {
+        let mut chain_ids = self.by_chain.keys().copied().collect::<Vec<_>>();
+        chain_ids.sort_unstable();
+        chain_ids
+    }
 }
 
 fn address_string(address: Address) -> String {
@@ -200,7 +202,7 @@ struct RawTransaction {
 }
 
 impl RawTransaction {
-    fn into_tx(self, expected_from: Address) -> Result<Tx, Fault> {
+    fn into_tx(self, expected_from: Address) -> anyhow::Result<Tx> {
         if self
             .from
             .as_deref()
@@ -208,7 +210,7 @@ impl RawTransaction {
             .transpose()?
             .is_some_and(|from| from != expected_from)
         {
-            return Err(Fault::with_status("UPSTREAM_TAKER_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamTakerMismatch);
         }
         Ok(Tx {
             to: parse_address(&self.to)?,
@@ -232,36 +234,22 @@ fn normalize_route(
     input: &Input,
     sender: Address,
     candidate: RouteCandidate,
-) -> Result<Route, Fault> {
+) -> anyhow::Result<Route> {
     let sell_amount = positive_string(&candidate.sell_amount)?;
     if sell_amount != input.sell_amount {
-        return Err(Fault::with_status("UPSTREAM_AMOUNT_MISMATCH", 502));
+        anyhow::bail!(ErrorKind::UpstreamAmountMismatch);
     }
     let buy_amount = positive_string(&candidate.buy_amount)?;
     let min_buy_amount = positive_string(&candidate.min_buy_amount)?;
     if parse_uint(&min_buy_amount)? > parse_uint(&buy_amount)? {
-        return Err(Fault::with_status("UPSTREAM_MINIMUM_EXCEEDS_QUOTE", 502));
-    }
-    if candidate.expires_at <= crate::domain::now_ms() {
-        return Err(Fault::with_status("QUOTE_EXPIRED", 409));
+        anyhow::bail!(ErrorKind::UpstreamMinimumExceedsQuote);
     }
     let transaction = candidate.tx.into_tx(sender)?;
-    let expected_value = if input.sell_token == NATIVE {
-        input.sell_amount.clone()
-    } else {
-        String::from("0")
-    };
-    if transaction.value != expected_value {
-        return Err(Fault::with_status("UNEXPECTED_TRANSACTION_VALUE", 502));
-    }
-    let calldata = parse_hex(&transaction.data)?;
-    if calldata.len() < 10 {
-        return Err(Fault::with_status("INVALID_CALLDATA", 502));
-    }
+    crate::execution::validate_transaction(input, &transaction, candidate.expires_at)?;
     if transaction.to == Address::ZERO
         || (input.sell_token != NATIVE && candidate.spender == Address::ZERO)
     {
-        return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+        anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
     }
     Ok(Route {
         provider,
@@ -274,23 +262,23 @@ fn normalize_route(
     })
 }
 
-fn positive_string(value: &str) -> Result<String, Fault> {
-    Ok(format_quantity(parse_positive(value)?))
+fn positive_string(value: &str) -> anyhow::Result<String> {
+    Ok(parse_positive(value)?.to_string())
 }
 
-fn quantity_value(value: &Value) -> Result<String, Fault> {
+fn quantity_value(value: &Value) -> anyhow::Result<String> {
     let value = match value {
         Value::String(value) => value.clone(),
         Value::Number(value) => value
             .as_u64()
             .map(|value| value.to_string())
-            .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?,
-        _ => return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502)),
+            .context(ErrorKind::UpstreamInvalidResponse)?,
+        _ => return Err(anyhow::Error::new(ErrorKind::UpstreamInvalidResponse)),
     };
     if value.starts_with("0x") {
-        return Ok(format_quantity(crate::domain::parse_hex_quantity(&value)?));
+        return Ok(crate::domain::parse_hex_quantity(&value)?.to_string());
     }
-    Ok(format_quantity(parse_uint(&value)?))
+    Ok(parse_uint(&value)?.to_string())
 }
 
 fn percentage_string(bps: u64) -> String {

@@ -15,20 +15,20 @@ MetaMatch 是一个非托管的 EVM 同链 exact-input swap 报价竞赛服务�
 - 链集合是上述 provider 支持链的并集；启动时不配置链 allowlist，也不配置 provider enable/disable 列表。
 - 配置不维护 token 白名单、token 列表或 token metadata。API 收到的 token 地址只做地址格式和交易不变量校验，然后透传给 provider。
 - provider 自己实现 `supported_chains()`。需要 access key 的 provider 在没有对应环境变量时返回空集合；不需要 access key 的 provider 不因缺少 key 被排除。配置了 optional key 时仍传给对应 adapter。其余 provider 一律参与竞赛，失败只影响自身报价。
-- 请求带 `chainId`，服务必须拒绝 catalog 之外的链；`buyToken` 暂不允许使用 native sentinel，保持现有资金模型简单。
+- 请求带 `chainId`，服务必须拒绝当前 provider 实例支持链并集之外的链；`buyToken` 暂不允许使用 native sentinel，保持现有资金模型简单。
 - quote 阶段可因缺少 RPC 或执行 Router 而成为 preview/unavailable；build 必须重新报价和仿真，不把 preview 当作可执行成功。
 
 ## 3. provider 与链
 
 provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hyperBloom`、`kyber`、`liquidSwap`、`odos`、`oogaBooga`、`okx`、`openOcean`、`velora`。
 
-链 catalog（共 17 个）：Ethereum `1`、Optimism `10`、BNB Smart Chain `56`、Unichain `130`、Polygon `137`、Monad `143`、Sonic `146`、HyperEVM `999`、Mantle `5000`、Base `8453`、Plasma `9745`、Arbitrum One `42161`、Avalanche `43114`、Linea `59144`、Berachain `80094`、Blast `81457`、Scroll `534352`。
+当前 13 个 provider adapter 的静态能力矩阵并集共有 17 条链：Ethereum `1`、Optimism `10`、BNB Smart Chain `56`、Unichain `130`、Polygon `137`、Monad `143`、Sonic `146`、HyperEVM `999`、Mantle `5000`、Base `8453`、Plasma `9745`、Arbitrum One `42161`、Avalanche `43114`、Linea `59144`、Berachain `80094`、Blast `81457`、Scroll `534352`。这只是当前代码快照，不是第二份 chain catalog；运行时链集合严格由本次实例的 `supported_chains()` 并集生成，因此会随必需 key 是否存在而变化。
 
-运行时代码中的 provider-to-chain 矩阵分别位于 [src/providers/](../src/providers/) 的对应 adapter；链名称和上游 path slug 在 [src/chains.rs](../src/chains.rs)。provider 名单来自 Matcha，链矩阵和接入参数按 2026-09-13 各家当前官方 API 重核；细节见 [PROVIDER_INTEGRATION_GUIDE.md](PROVIDER_INTEGRATION_GUIDE.md)。Monad 已从历史 testnet `10143` 更新为主网 `143`。
+运行时代码中的 provider-to-chain 矩阵和 provider path slug 分别位于 [src/providers/](../src/providers/) 的对应 adapter；[src/chains.rs](../src/chains.rs) 只按 provider 给出的 chain ID 构造运行时链并解析 RPC。provider 名单来自 Matcha，链矩阵和接入参数按 2026-09-13 各家当前官方 API 重核；细节见 [PROVIDER_INTEGRATION_GUIDE.md](PROVIDER_INTEGRATION_GUIDE.md)。Monad 已从历史 testnet `10143` 更新为主网 `143`。
 
 ## 4. 用户流程
 
-1. `GET /v1/capabilities` 返回 catalog 中每条链和本次启动真正能参与的 provider ID。
+1. `GET /v1/capabilities` 返回本次启动的 provider 支持链并集和每条链真正能参与的 provider ID；不返回 RPC URL。
 2. `POST /v1/competitions` 提交：
 
    ```json
@@ -59,10 +59,10 @@ provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hy
 
 ## 6. 配置原则
 
-- 不配置链集合：代码内 catalog 始终存在。
+- 不配置链集合，也不维护 `CHAIN_CATALOG`：运行时链集合来自当前 provider 实例的 `supported_chains()` 并集。
 - 不配置 provider 集合：代码内 provider 注册表始终创建全部 13 个 provider。
 - 不配置 token：没有 token allowlist；未知 token 由 provider 和链上仿真决定是否可交易。
-- RPC 是运行基础设施，不是产品能力开关。按 `RPC_URL_<chainId>` 提供，例如 `RPC_URL_8453`；Ethereum 兼容别名 `ETHEREUM_RPC_URL` 仅为迁移便利保留。
+- RPC 是运行基础设施，不是产品能力开关。对并集中的每个 chain ID，解析优先级为 `RPC_URL_<chainId>`、Ethereum 旧别名 `ETHEREUM_RPC_URL`、`ALCHEMY_API_KEY` 自动生成的官方链 endpoint。没有任何来源时链仍保留在 capabilities，但不能仿真；capabilities 只返回是否已配置 RPC，不返回 URL。
 - provider access key 使用各 provider 原生环境变量，不抽象成 credential trait。需要 key 的 provider 缺少任一必需字段时不进入索引；完整名称见 [src/config.rs](../src/config.rs)。
 
 ## 7. 明确不在 v1
@@ -71,6 +71,6 @@ provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hy
 
 ## 8. 当前实现状态
 
-v1 的多链 catalog、13 个字符串 provider ID、`supported_chains` 规则、access-key 过滤、反向索引和 13 家真实 HTTP adapter 已实现。每家 adapter 都把 provider 原生 quote 转为统一 `Route`，并拒绝金额、expiry、target、spender、calldata 或 native value 不一致的响应。当前仍不应宣称真实 key、生产 RPC、正式 Router 或主网执行已经验证。
+v1 的 provider 派生链集合、13 个字符串 provider ID、`supported_chains` 规则、access-key 过滤、反向索引和 13 家真实 HTTP adapter 已实现。每家 adapter 都把 provider 原生 quote 转为统一 `Route`，并拒绝金额、expiry、target、spender、calldata 或 native value 不一致的响应。当前仍不应宣称真实 key、生产 RPC、正式 Router 或主网执行已经验证。
 
 实现和验证状态以 [VERIFICATION.md](VERIFICATION.md) 和 [RUST_REWRITE_LOG.md](RUST_REWRITE_LOG.md) 为准。

@@ -2,12 +2,10 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OdosQuoteResponse {
-    #[serde(rename = "pathId")]
     path_id: String,
-    #[serde(rename = "inAmounts")]
     in_amounts: Vec<String>,
-    #[serde(rename = "outAmounts")]
     out_amounts: Vec<String>,
 }
 
@@ -40,7 +38,7 @@ impl Provider for OdosProvider {
         SUPPORTED_CHAINS.to_vec()
     }
 
-    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let body = json!({
             "chainId": input.chain_id,
             "inputTokens": [{
@@ -72,11 +70,11 @@ impl Provider for OdosProvider {
         let sell_amount = quote
             .in_amounts
             .first()
-            .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
+            .context(ErrorKind::UpstreamInvalidResponse)?;
         let buy_amount = quote
             .out_amounts
             .first()
-            .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
+            .context(ErrorKind::UpstreamInvalidResponse)?;
         let assemble: OdosAssembleResponse = json_request_as(
             self.client.as_ref(),
             HttpRequest {

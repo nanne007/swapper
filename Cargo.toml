@@ -7,6 +7,8 @@ description = "Non-custodial EVM quote competition backend"
 license = "UNLICENSED"
 
 [dependencies]
+anyhow = "1"
+alloy-chains = "0.2.38"
 alloy-primitives = { version = "1.7", features = ["serde"] }
 alloy-provider = { version = "2.4", default-features = false, features = ["reqwest", "reqwest-rustls-tls", "rpc-api"] }
 alloy-rpc-types-eth = { version = "2.4", default-features = false, features = ["serde"] }
@@ -16,15 +18,19 @@ axum = "0.8"
 axum-extra = { version = "0.12", default-features = false, features = ["typed-header", "with-rejection"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+dotenvy = "0.15.7"
 futures = "0.3"
 hmac = "0.12"
 hex = "0.4"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1"
 sha2 = "0.10"
 subtle = "2"
 thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }

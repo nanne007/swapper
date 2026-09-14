@@ -2,23 +2,19 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct VeloraResponse {
-    #[serde(rename = "priceRoute")]
     price_route: VeloraPriceRoute,
-    #[serde(rename = "txParams")]
     tx_params: RawTransaction,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct VeloraPriceRoute {
     network: u64,
-    #[serde(rename = "srcAmount")]
     src_amount: String,
-    #[serde(rename = "destAmount")]
     dest_amount: String,
-    #[serde(rename = "contractAddress")]
     contract_address: Option<String>,
-    #[serde(rename = "tokenTransferProxy")]
     token_transfer_proxy: Option<String>,
 }
 
@@ -43,11 +39,11 @@ impl Provider for VeloraProvider {
         SUPPORTED_CHAINS.to_vec()
     }
 
-    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let network = input.chain_id.to_string();
         let sell_token = address_string(input.sell_token);
         let buy_token = address_string(input.buy_token);
-        let sender_text = address_string(sender);
+        let sender_text = sender.to_checksum(None);
         let slippage = input.slippage_bps.to_string();
         let url = url_with_params(
             "https://api.paraswap.io/swap",
@@ -75,13 +71,13 @@ impl Provider for VeloraProvider {
         )
         .await?;
         if response.price_route.network != input.chain_id {
-            return Err(Fault::with_status("UPSTREAM_CHAIN_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamChainMismatch);
         }
         let proxy = response
             .price_route
             .token_transfer_proxy
             .or(response.price_route.contract_address)
-            .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
+            .context(ErrorKind::UpstreamInvalidResponse)?;
         let buy_amount = positive_string(&response.price_route.dest_amount)?;
         normalize_route(
             self.id(),

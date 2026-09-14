@@ -10,10 +10,9 @@ struct LiquidSwapResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LiquidSwapTokens {
-    #[serde(rename = "tokenIn")]
     token_in: LiquidSwapToken,
-    #[serde(rename = "tokenOut")]
     token_out: LiquidSwapToken,
 }
 
@@ -30,12 +29,10 @@ struct LiquidSwapExecution {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct LiquidSwapDetails {
-    #[serde(rename = "amountIn")]
     amount_in: Value,
-    #[serde(rename = "amountOut")]
     amount_out: Value,
-    #[serde(rename = "minAmountOut")]
     min_amount_out: Value,
 }
 
@@ -60,9 +57,9 @@ impl Provider for LiquidSwapProvider {
         SUPPORTED_CHAINS.to_vec()
     }
 
-    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         if input.sell_token == NATIVE {
-            return Err(Fault::with_status("NATIVE_SELL_UNSUPPORTED", 422));
+            anyhow::bail!(ErrorKind::NativeSellUnsupported);
         }
         let decimals = self.token_decimals(chain, input.sell_token).await?;
         let amount_in = raw_to_decimal(&input.sell_amount, decimals)?;
@@ -92,14 +89,14 @@ impl Provider for LiquidSwapProvider {
             || parse_address(&response.tokens.token_in.address)? != input.sell_token
             || parse_address(&response.tokens.token_out.address)? != input.buy_token
         {
-            return Err(Fault::with_status("UPSTREAM_TOKEN_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamTokenMismatch);
         }
         let details = response.execution.details;
         let sell_amount = quantity_value(&details.amount_in)?;
         let buy_amount = positive_value(&details.amount_out)?;
         let min_buy_amount = positive_value(&details.min_amount_out)?;
         if sell_amount != input.sell_amount {
-            return Err(Fault::with_status("UPSTREAM_AMOUNT_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamAmountMismatch);
         }
         let target = parse_address(&response.execution.to)?;
         normalize_route(
@@ -124,9 +121,9 @@ impl Provider for LiquidSwapProvider {
 }
 
 impl LiquidSwapProvider {
-    async fn token_decimals(&self, chain: &Chain, token: Address) -> Result<u8, Fault> {
+    async fn token_decimals(&self, chain: &Chain, token: Address) -> anyhow::Result<u8> {
         let Some(rpc_url) = &chain.rpc_url else {
-            return Err(Fault::with_status("RPC_NOT_CONFIGURED", 503));
+            anyhow::bail!(ErrorKind::RpcNotConfigured);
         };
         let body = json!({
             "jsonrpc": "2.0",
@@ -151,21 +148,21 @@ impl LiquidSwapProvider {
         let result = response
             .get("result")
             .and_then(Value::as_str)
-            .ok_or_else(|| Fault::with_status("RPC_INVALID_RESPONSE", 502))?;
+            .context(ErrorKind::RpcInvalidResponse)?;
         let decimals = crate::domain::parse_hex_quantity(result)?;
         decimals
             .to_string()
             .parse::<u8>()
-            .map_err(|_| Fault::with_status("RPC_INVALID_RESPONSE", 502))
+            .context(ErrorKind::RpcInvalidResponse)
     }
 }
 
-fn positive_value(value: &Value) -> Result<String, Fault> {
+fn positive_value(value: &Value) -> anyhow::Result<String> {
     let quantity = quantity_value(value)?;
     positive_string(&quantity)
 }
 
-fn raw_to_decimal(value: &str, decimals: u8) -> Result<String, Fault> {
+fn raw_to_decimal(value: &str, decimals: u8) -> anyhow::Result<String> {
     let value = parse_positive(value)?;
     if decimals == 0 {
         return Ok(value.to_string());

@@ -1,69 +1,40 @@
+use crate::error::ErrorKind;
 pub use alloy_primitives::Address;
 use alloy_primitives::U256;
+use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
-use thiserror::Error;
 
 pub const NATIVE: Address = Address::new([0xee; 20]);
 pub const HOLDER: Address = Address::new([
     0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x36, 0x84, 0xf2, 0x8c, 0x67, 0x53, 0x8d, 0x4d, 0x07,
     0x2c, 0x22, 0x73, 0x4,
 ]);
-pub const PREVIEW_TAKER: Address = Address::new([
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x0a, 0x11, 0xce,
-]);
-
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
-#[error("{code}")]
-pub struct Fault {
-    pub code: String,
-    pub http_status: u16,
-}
-
-impl Fault {
-    pub fn new(code: impl Into<String>) -> Self {
-        Self {
-            code: code.into(),
-            http_status: 400,
-        }
-    }
-
-    pub fn with_status(code: impl Into<String>, http_status: u16) -> Self {
-        Self {
-            code: code.into(),
-            http_status,
-        }
-    }
-}
+// Low 20 bytes of keccak256("MetaMatch preview account"). Velora rejects 0x...0a11ce.
+// No signing key is held for this reserved account; it is used only with funding overrides.
+pub const PREVIEW_TAKER: Address =
+    alloy_primitives::address!("b6d846be89cacda845610ca2b26d0635f1db90af");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Input {
-    #[serde(rename = "chainId")]
     pub chain_id: u64,
-    #[serde(rename = "sellToken")]
     pub sell_token: Address,
-    #[serde(rename = "buyToken")]
     pub buy_token: Address,
-    #[serde(rename = "sellAmount")]
     pub sell_amount: String,
-    #[serde(rename = "slippageBps")]
     pub slippage_bps: u64,
     pub taker: Option<Address>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct CreateCompetitionRequest {
-    #[serde(rename = "chainId")]
     pub chain_id: u64,
-    #[serde(rename = "sellToken")]
     pub sell_token: String,
-    #[serde(rename = "buyToken")]
     pub buy_token: String,
-    #[serde(rename = "sellAmount")]
     pub sell_amount: String,
-    #[serde(rename = "slippageBps", default = "default_slippage")]
+    #[serde(default = "default_slippage")]
     pub slippage_bps: u64,
     pub taker: Option<String>,
 }
@@ -74,26 +45,20 @@ fn default_slippage() -> u64 {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[serde(rename_all = "camelCase")]
 pub struct BuildRequest {
     pub taker: String,
-    #[serde(rename = "acceptedMinBuyAmount")]
     pub accepted_min_buy_amount: String,
 }
 
-pub fn parse_input(value: serde_json::Value) -> Result<Input, Fault> {
-    let request: CreateCompetitionRequest =
-        serde_json::from_value(value).map_err(|_| Fault::new("INVALID_INPUT"))?;
-    validate_input(request)
-}
-
-pub fn validate_input(request: CreateCompetitionRequest) -> Result<Input, Fault> {
+pub fn validate_input(request: CreateCompetitionRequest) -> anyhow::Result<Input> {
     let sell_token = parse_address(&request.sell_token)?;
     let buy_token = parse_address(&request.buy_token)?;
     if sell_token == buy_token || buy_token == NATIVE {
-        return Err(Fault::new("INVALID_INPUT"));
+        anyhow::bail!(ErrorKind::InvalidInput);
     }
     if !(1..=500).contains(&request.slippage_bps) {
-        return Err(Fault::new("INVALID_INPUT"));
+        anyhow::bail!(ErrorKind::InvalidInput);
     }
     let sell_amount = parse_positive(&request.sell_amount)?.to_string();
     let taker = request
@@ -104,7 +69,7 @@ pub fn validate_input(request: CreateCompetitionRequest) -> Result<Input, Fault>
         is_reserved_address(taker)
             || U256::from_be_slice(taker.as_slice()) <= U256::from(0xffff_u64)
     }) {
-        return Err(Fault::new("INVALID_TAKER"));
+        anyhow::bail!(ErrorKind::InvalidTaker);
     }
     Ok(Input {
         chain_id: request.chain_id,
@@ -116,65 +81,55 @@ pub fn validate_input(request: CreateCompetitionRequest) -> Result<Input, Fault>
     })
 }
 
-pub fn parse_build_request(value: serde_json::Value) -> Result<(Address, String), Fault> {
-    let request: BuildRequest =
-        serde_json::from_value(value).map_err(|_| Fault::new("INVALID_INPUT"))?;
-    validate_build_request(request)
-}
-
-pub fn validate_build_request(request: BuildRequest) -> Result<(Address, String), Fault> {
+pub fn validate_build_request(request: BuildRequest) -> anyhow::Result<(Address, String)> {
     let taker = parse_address(&request.taker)?;
     if U256::from_be_slice(taker.as_slice()) <= U256::from(0xffff_u64) || is_reserved_address(taker)
     {
-        return Err(Fault::new("INVALID_TAKER"));
+        anyhow::bail!(ErrorKind::InvalidTaker);
     }
     let accepted = parse_positive(&request.accepted_min_buy_amount)?.to_string();
     Ok((taker, accepted))
 }
 
-pub fn parse_address(value: &str) -> Result<Address, Fault> {
+pub fn parse_address(value: &str) -> anyhow::Result<Address> {
     if value.len() != 42 || !value.starts_with("0x") {
-        return Err(Fault::new("INVALID_INPUT"));
+        anyhow::bail!(ErrorKind::InvalidInput);
     }
-    Address::from_str(value).map_err(|_| Fault::new("INVALID_INPUT"))
+    Address::from_str(value).context(ErrorKind::InvalidInput)
 }
 
-pub fn parse_hex(value: &str) -> Result<String, Fault> {
+pub fn parse_hex(value: &str) -> anyhow::Result<String> {
     if !value.starts_with("0x") || value.len() < 4 || !value.len().is_multiple_of(2) {
-        return Err(Fault::new("INVALID_INPUT"));
+        anyhow::bail!(ErrorKind::InvalidInput);
     }
-    hex::decode(&value[2..]).map_err(|_| Fault::new("INVALID_INPUT"))?;
+    hex::decode(&value[2..]).context(ErrorKind::InvalidInput)?;
     Ok(value.to_ascii_lowercase())
 }
 
-pub fn parse_hex_quantity(value: &str) -> Result<U256, Fault> {
+pub fn parse_hex_quantity(value: &str) -> anyhow::Result<U256> {
     if !value.starts_with("0x") || value.len() < 3 {
-        return Err(Fault::new("RPC_INVALID_RESPONSE"));
+        anyhow::bail!(ErrorKind::RpcInvalidResponse);
     }
-    U256::from_str_radix(&value[2..], 16).map_err(|_| Fault::new("RPC_INVALID_RESPONSE"))
+    U256::from_str_radix(&value[2..], 16).context(ErrorKind::RpcInvalidResponse)
 }
 
-pub fn parse_uint(value: &str) -> Result<U256, Fault> {
+pub fn parse_uint(value: &str) -> anyhow::Result<U256> {
     if value.is_empty()
         || (value.len() > 1 && value.starts_with('0'))
         || value.len() > 78
         || !value.bytes().all(|byte| byte.is_ascii_digit())
     {
-        return Err(Fault::new("INVALID_INPUT"));
+        anyhow::bail!(ErrorKind::InvalidInput);
     }
-    U256::from_str_radix(value, 10).map_err(|_| Fault::new("INVALID_INPUT"))
+    U256::from_str_radix(value, 10).context(ErrorKind::InvalidInput)
 }
 
-pub fn parse_positive(value: &str) -> Result<U256, Fault> {
+pub fn parse_positive(value: &str) -> anyhow::Result<U256> {
     let parsed = parse_uint(value)?;
     if parsed.is_zero() {
-        return Err(Fault::new("INVALID_INPUT"));
+        anyhow::bail!(ErrorKind::InvalidInput);
     }
     Ok(parsed)
-}
-
-pub fn format_quantity(value: U256) -> String {
-    value.to_string()
 }
 
 pub fn is_reserved_address(value: Address) -> bool {
@@ -192,20 +147,17 @@ pub struct Rule {
 pub struct Chain {
     pub id: u64,
     pub name: String,
-    pub slug: String,
     pub rpc_url: Option<String>,
     pub router: Option<Address>,
     pub balance_slots: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Context {
-    #[serde(rename = "blockNumber")]
     pub block_number: String,
-    #[serde(rename = "blockHash")]
     pub block_hash: String,
     pub timestamp: u64,
-    #[serde(rename = "gasPrice")]
     pub gas_price: String,
 }
 
@@ -228,26 +180,28 @@ pub struct Route {
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(tag = "status")]
+#[serde(
+    tag = "status",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum Simulation {
-    #[serde(rename = "success")]
     Success {
-        #[serde(rename = "boughtAmount")]
         bought_amount: String,
-        #[serde(rename = "gasUsed")]
         gas_used: String,
-        #[serde(rename = "gasFeeWei")]
         gas_fee_wei: Option<String>,
         funding: String,
-        #[serde(rename = "blockHash")]
         block_hash: String,
     },
-    #[serde(rename = "reverted")]
-    Reverted { reason: String },
-    #[serde(rename = "unsupported")]
-    Unsupported { reason: String },
-    #[serde(rename = "error")]
-    Error { reason: String },
+    Reverted {
+        reason: String,
+    },
+    Unsupported {
+        reason: String,
+    },
+    Error {
+        reason: String,
+    },
 }
 
 impl Simulation {
@@ -261,30 +215,27 @@ impl Simulation {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Quote {
     pub id: String,
     pub provider: &'static str,
     pub status: String,
-    #[serde(rename = "quotedAmount", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quoted_amount: Option<String>,
-    #[serde(rename = "minBuyAmount", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_buy_amount: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub simulation: Option<Simulation>,
-    #[serde(rename = "latencyMs")]
     pub latency_ms: u64,
-    #[serde(rename = "expiresAt")]
     pub expires_at: u64,
     pub execution: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
-pub fn minimum(amount: &str, bps: u64) -> Result<String, Fault> {
+pub fn minimum(amount: &str, bps: u64) -> anyhow::Result<String> {
     let amount = parse_uint(amount)?;
-    Ok(format_quantity(
-        amount * U256::from(10_000 - bps) / U256::from(10_000),
-    ))
+    Ok((amount * U256::from(10_000 - bps) / U256::from(10_000)).to_string())
 }
 
 pub fn now_ms() -> u64 {

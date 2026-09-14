@@ -1,24 +1,25 @@
 #![allow(dead_code)]
+use anyhow::Context as _;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_rpc_types_eth::{
-    BlockId, TransactionRequest,
+    TransactionRequest,
     simulate::{SimCallResult, SimulatePayload, SimulatedBlock},
-    state::StateOverride,
 };
 use async_trait::async_trait;
 use metamatch_backend::{
     app::App,
+    chains::configured_chain,
     competitions::{Competitions, Services},
     config::{Config, load_config},
     domain::{
-        Address as DomainAddress, Chain, Context, Fault, Input, NATIVE, PREVIEW_TAKER, Route, Rule,
+        Address as DomainAddress, Chain, Context, Input, NATIVE, PREVIEW_TAKER, Route, Rule,
         Simulation, Tx, now_ms, parse_address,
     },
     execution::swap_transaction,
     http::{HttpClient, HttpRequest, HttpResponse},
     providers::{Provider, ProviderRegistry, create_providers},
-    rpc::{BlockInfo, ContextProvider, EvmRpc, RpcFactory},
+    rpc::{ContextProvider, RpcClients},
     simulation::{SimResult, SimulationProvider, SimulationRequest},
 };
 use serde_json::Value;
@@ -40,13 +41,9 @@ impl HttpClient for MockHttp {
         &self,
         request: HttpRequest,
         _timeout: Duration,
-    ) -> Result<HttpResponse, Fault> {
+    ) -> anyhow::Result<HttpResponse> {
         self.requests.lock().unwrap().push(request);
-        self.responses
-            .lock()
-            .unwrap()
-            .pop()
-            .ok_or_else(|| Fault::new("NO_FIXTURE"))
+        self.responses.lock().unwrap().pop().context("NO_FIXTURE")
     }
 }
 
@@ -80,12 +77,7 @@ pub fn config_with(entries: &[(&str, &str)]) -> Config {
 }
 
 pub fn chain(config: &Config, chain_id: u64) -> Chain {
-    config
-        .chains
-        .iter()
-        .find(|chain| chain.id == chain_id)
-        .cloned()
-        .expect("test chain exists")
+    configured_chain(config, chain_id)
 }
 
 pub fn input(chain_id: u64, sell_token: Address) -> Input {
@@ -111,62 +103,107 @@ pub struct FixtureRpc {
     pub reorg: bool,
     pub false_approval: bool,
     pub unsupported_simulation: bool,
+    pub revert: bool,
 }
 
-#[async_trait]
-impl EvmRpc for FixtureRpc {
-    async fn chain_id(&self) -> Result<u64, Fault> {
-        Ok(1)
+pub struct RpcServer {
+    pub url: String,
+    pub requests: Arc<Mutex<Vec<Value>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for RpcServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+impl FixtureRpc {
+    pub async fn start(self) -> RpcServer {
+        use axum::{Json, Router, routing::post};
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let router = Router::new().route(
+            "/",
+            post(move |Json(request): Json<Value>| {
+                recorded.lock().unwrap().push(request.clone());
+                async move { Json(self.response(&request)) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        RpcServer {
+            url,
+            requests,
+            task,
+        }
     }
 
-    async fn latest_block(&self) -> Result<BlockInfo, Fault> {
-        self.block_by_number(16).await
+    fn response(&self, request: &Value) -> Value {
+        use serde_json::json;
+        let result = match request["method"].as_str().unwrap() {
+            "eth_chainId" => json!("0x1"),
+            "eth_getBlockByNumber" => {
+                let mut block: alloy_rpc_types_eth::Block = Default::default();
+                block.header.inner.number = 16;
+                block.header.inner.timestamp = 100;
+                block.header.hash = B256::from([if self.reorg { 0x22 } else { 0x11 }; 32]);
+                json!(block)
+            }
+            "eth_gasPrice" => json!("0x3b9aca00"),
+            "eth_getCode" => json!("0x6000"),
+            "eth_getBalance" => json!("0x0"),
+            "eth_call" => {
+                let call: TransactionRequest =
+                    serde_json::from_value(request["params"][0].clone()).unwrap();
+                let is_balance = call
+                    .input
+                    .input()
+                    .is_some_and(|data| data.starts_with(&[0x70, 0xa0, 0x82, 0x31]));
+                json!(word_bytes(if is_balance {
+                    U256::from(100)
+                } else {
+                    U256::ZERO
+                }))
+            }
+            "eth_simulateV1" if self.unsupported_simulation => {
+                return json!({
+                    "jsonrpc": "2.0", "id": request["id"],
+                    "error": {"code": -32601, "message": "simulation unsupported"}
+                });
+            }
+            "eth_simulateV1" => {
+                self.simulate(serde_json::from_value(request["params"][0].clone()).unwrap())
+            }
+            method => panic!("unexpected RPC method: {method}"),
+        };
+        json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
     }
 
-    async fn block_by_number(&self, _number: u64) -> Result<BlockInfo, Fault> {
-        Ok(BlockInfo {
-            number: 16,
-            hash: B256::from([if self.reorg { 0x22 } else { 0x11 }; 32]),
-            timestamp: 100,
-        })
-    }
-
-    async fn gas_price(&self) -> Result<u128, Fault> {
-        Ok(1_000_000_000)
-    }
-
-    async fn code_at(&self, _address: Address, _block: BlockId) -> Result<Bytes, Fault> {
-        Ok(Bytes::from_static(b"\x60\x00"))
-    }
-
-    async fn balance_at(&self, _address: Address, _block: BlockId) -> Result<U256, Fault> {
-        Ok(U256::from(10_u64).pow(U256::from(20)))
-    }
-
-    async fn call(
-        &self,
-        request: TransactionRequest,
-        _block: BlockId,
-        _overrides: Option<StateOverride>,
-    ) -> Result<Bytes, Fault> {
-        let is_balance = request
-            .input
-            .input()
-            .is_some_and(|data| data.starts_with(&[0x70, 0xa0, 0x82, 0x31]));
-        Ok(word_bytes(if is_balance {
-            U256::from(100)
-        } else {
-            U256::ZERO
-        }))
-    }
-
-    async fn simulate(
-        &self,
-        payload: SimulatePayload,
-        _block: BlockId,
-    ) -> Result<Vec<SimulatedBlock>, Fault> {
-        if self.unsupported_simulation {
-            return Err(Fault::new("RPC_METHOD_UNSUPPORTED"));
+    fn simulate(&self, payload: SimulatePayload) -> Value {
+        // Model the node's upfront balance check, followed by charging actual gas used.
+        // A rich fixture account used to hide the real preview funding defect.
+        for block in &payload.block_state_calls {
+            let mut balance = block
+                .state_overrides
+                .as_ref()
+                .and_then(|overrides| overrides.get(&PREVIEW_TAKER))
+                .and_then(|account| account.balance)
+                .unwrap_or_default();
+            for call in &block.calls {
+                if call.from != Some(PREVIEW_TAKER) {
+                    continue;
+                }
+                let value = call.value.unwrap_or_default();
+                let gas_price = U256::from(call.gas_price.unwrap_or_default());
+                let upfront = value + U256::from(call.gas.unwrap_or_default()) * gas_price;
+                assert!(
+                    balance >= upfront,
+                    "preview must cover the declared transaction gas limit"
+                );
+                balance -= value + U256::from(21_000) * gas_price;
+            }
         }
         let call_count = payload
             .block_state_calls
@@ -186,24 +223,21 @@ impl EvmRpc for FixtureRpc {
                 logs: Vec::new(),
                 gas_used: 0x5208,
                 max_used_gas: None,
-                status: true,
-                error: None,
+                status: !self.revert || index != 1,
+                error: (self.revert && index == 1).then(|| {
+                    alloy_rpc_types_eth::simulate::SimulateError {
+                        code: 3,
+                        message: "execution reverted fixture-secret".into(),
+                        data: Some(Bytes::from_static(&[0xde, 0xad])),
+                    }
+                }),
             })
             .collect();
-        Ok(vec![SimulatedBlock {
+        let block: SimulatedBlock = SimulatedBlock {
             inner: Default::default(),
             calls,
-        }])
-    }
-}
-
-pub struct FixtureFactory {
-    pub rpc: FixtureRpc,
-}
-
-impl RpcFactory for FixtureFactory {
-    fn connect(&self, _url: &str, _timeout: Duration) -> Result<Arc<dyn EvmRpc>, Fault> {
-        Ok(Arc::new(self.rpc))
+        };
+        serde_json::json!([block])
     }
 }
 
@@ -236,55 +270,39 @@ pub async fn run_simulation(
     reorg: bool,
     false_approval: bool,
     unsupported_simulation: bool,
-) -> SimResult {
+) -> anyhow::Result<SimResult> {
     let config = config();
-    let mut chain = config.chains[0].clone();
-    chain.rpc_url = Some("http://fixture".into());
-    let input = input(1, NATIVE);
-    let route = fixture_route(&input);
-    SimulatorForTest::new(FixtureRpc {
+    let mut chain = chain(&config, 1);
+    let server = FixtureRpc {
         reorg,
         false_approval,
         unsupported_simulation,
-    })
-    .run(SimulationRequest {
-        input: &input,
-        chain: &chain,
-        route: &route,
-        context: &fixture_context(),
-        rules: &[],
-        taker: PREVIEW_TAKER,
-        actual: false,
-        min: None,
-    })
-    .await
-    .unwrap()
-}
-
-struct SimulatorForTest {
-    simulator: metamatch_backend::simulation::Simulator,
-}
-
-impl SimulatorForTest {
-    fn new(rpc: FixtureRpc) -> Self {
-        Self {
-            simulator: metamatch_backend::simulation::Simulator::with_factory(
-                Duration::from_secs(1),
-                Arc::new(FixtureFactory { rpc }),
-            ),
-        }
+        ..Default::default()
     }
-
-    async fn run(&self, request: SimulationRequest<'_>) -> Result<SimResult, Fault> {
-        self.simulator.run(request).await
-    }
+    .start()
+    .await;
+    chain.rpc_url = Some(server.url.clone());
+    let input = input(1, NATIVE);
+    let route = fixture_route(&input);
+    metamatch_backend::simulation::Simulator::new(Arc::new(RpcClients::new(Duration::from_secs(1))))
+        .run(SimulationRequest {
+            input: &input,
+            chain: &chain,
+            route: &route,
+            context: &fixture_context(),
+            rules: &[],
+            taker: PREVIEW_TAKER,
+            actual: false,
+            min: None,
+        })
+        .await
 }
 
 pub struct MockContext;
 
 #[async_trait]
 impl ContextProvider for MockContext {
-    async fn get(&self, _input: &Input, _chain: &Chain) -> Result<Context, Fault> {
+    async fn get(&self, _input: &Input, _chain: &Chain) -> anyhow::Result<Context> {
         Ok(fixture_context())
     }
 }
@@ -293,7 +311,7 @@ pub struct MockSimulation;
 
 #[async_trait]
 impl SimulationProvider for MockSimulation {
-    async fn run(&self, request: SimulationRequest<'_>) -> Result<SimResult, Fault> {
+    async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         Ok(SimResult {
             simulation: Simulation::Success {
                 bought_amount: request.route.buy_amount.clone(),
@@ -344,7 +362,7 @@ impl Provider for MockProvider {
         }
     }
 
-    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         Ok(Route {
             provider: self.id(),
             buy_amount: "200".into(),
@@ -367,21 +385,18 @@ impl Provider for MockProvider {
 
 pub fn competition_services() -> Services {
     let config = config();
-    competition_services_for(&config)
+    competition_services_for(&config, None)
 }
 
-pub fn competition_services_for(config: &Config) -> Services {
-    let router = config
-        .chains
-        .iter()
-        .find(|chain| chain.id == 1)
-        .and_then(|chain| chain.router)
-        .unwrap_or(PREVIEW_TAKER);
+pub fn competition_services_for(config: &Config, configured_router: Option<Address>) -> Services {
+    let router = configured_router.unwrap_or(PREVIEW_TAKER);
+    let mut chain = chain(config, 1);
+    chain.router = configured_router;
     Services::new(
         vec![Arc::new(MockProvider {
             rule: fixture_rule(router),
         })],
-        &config.chains,
+        &[chain],
         Arc::new(MockContext),
         Arc::new(MockSimulation),
     )
@@ -447,8 +462,8 @@ pub fn fixture_rule(target: Address) -> Rule {
     }
 }
 
-pub fn fixture_registry(config: &Config, providers: Vec<Arc<dyn Provider>>) -> ProviderRegistry {
-    ProviderRegistry::new(providers, &config.chains)
+pub fn fixture_registry(_config: &Config, providers: Vec<Arc<dyn Provider>>) -> ProviderRegistry {
+    ProviderRegistry::new(providers)
 }
 
 pub fn fixture_app(config: Config, services: Services) -> App {

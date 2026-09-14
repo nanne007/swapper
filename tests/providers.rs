@@ -169,12 +169,16 @@ async fn enso_rejects_cross_chain_route_legs() {
         .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
         .await
         .unwrap_err();
-    assert_eq!(error.code, "CROSS_CHAIN_ROUTE_UNSUPPORTED");
+    assert_eq!(
+        metamatch_backend::error::kind(&error).to_string(),
+        "CROSS_CHAIN_ROUTE_UNSUPPORTED"
+    );
     let request = &client.requests.lock().unwrap()[0];
     assert_eq!(request.method, "POST");
     let body: serde_json::Value = serde_json::from_str(request.body.as_deref().unwrap()).unwrap();
     assert_eq!(body["tokenIn"], json!([format!("{NATIVE:#x}")]));
     assert_eq!(body["amountIn"], json!([input.sell_amount]));
+    assert_eq!(body["slippage"], "30");
     assert!(body.get("tokenInAmountToTransfer").is_none());
 }
 
@@ -252,7 +256,10 @@ async fn liquid_swap_rejects_undocumented_native_sell_marker() {
         .quote(&input(999, NATIVE), &chain(&config, 999), PREVIEW_TAKER)
         .await
         .unwrap_err();
-    assert_eq!(error.code, "NATIVE_SELL_UNSUPPORTED");
+    assert_eq!(
+        metamatch_backend::error::kind(&error).to_string(),
+        "NATIVE_SELL_UNSUPPORTED"
+    );
 }
 
 #[tokio::test]
@@ -426,12 +433,56 @@ async fn open_ocean_and_velora_normalize_swap_transactions() {
     );
 }
 
+#[tokio::test]
+async fn enso_same_chain_route_can_omit_leg_chain_id() {
+    let config = config_with(&[("ENSO_API_KEY", "fixture-key")]);
+    let input = input(1, NATIVE);
+    let client = client([json!({
+        "amountOut": "200", "minAmountOut": "199",
+        "route": [{"action": "swap", "protocol": "fixture"}],
+        "tx": {"to": "0x3333333333333333333333333333333333333333", "data": "0x12345678", "value": input.sell_amount}
+    })]);
+    let route = provider(&config, "enso", client)
+        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .await
+        .unwrap();
+    assert_eq!(route.buy_amount, "200");
+}
+
+#[tokio::test]
+async fn open_ocean_accepts_eip1559_gas_price_object() {
+    let config = config();
+    let input = input(1, NATIVE);
+    let client = client([
+        json!({"code":200, "data":{"inAmount":input.sell_amount, "outAmount":"200", "minOutAmount":"199",
+            "to":"0x3333333333333333333333333333333333333333", "value":input.sell_amount, "data":"0x12345678"}}),
+        json!({"code":200, "data":{"standard":{"legacyGasPrice":123456789, "maxFeePerGas":200000000, "maxPriorityFeePerGas":10000000}}}),
+    ]);
+    let route = provider(&config, "openOcean", client.clone())
+        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .await
+        .unwrap();
+    assert_eq!(route.buy_amount, "200");
+    assert!(
+        client.requests.lock().unwrap()[1]
+            .url
+            .contains("gasPriceDecimals=123456789")
+    );
+}
+
 #[test]
 fn registry_is_key_aware_and_chain_specific() {
     let config = config_with(&[("ZERO_EX_API_KEY", "test-key")]);
     let providers = create_providers(&config, std::sync::Arc::new(support::MockHttp::default()));
     assert_eq!(providers.len(), 13);
-    let registry = ProviderRegistry::new(providers, &config.chains);
+    let expected_chain_ids = providers
+        .iter()
+        .flat_map(|provider| provider.supported_chains())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let registry = ProviderRegistry::new(providers);
+    assert_eq!(registry.chain_ids(), expected_chain_ids);
     let ethereum = registry.by_chain().get(&1).unwrap();
     assert!(ethereum.contains(&"0x"));
     assert!(!ethereum.contains(&"1inch"));
@@ -464,7 +515,7 @@ fn required_provider_credentials_gate_capability() {
         ("OKX_API_PASSPHRASE", "fixture-passphrase"),
     ]);
     let providers = create_providers(&config, std::sync::Arc::new(support::MockHttp::default()));
-    let registry = ProviderRegistry::new(providers, &config.chains);
+    let registry = ProviderRegistry::new(providers);
     assert!(
         registry
             .for_chain(1)

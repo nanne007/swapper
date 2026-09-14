@@ -2,11 +2,10 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OneInchResponse {
-    #[serde(rename = "dstAmount")]
     dst_amount: String,
     tx: RawTransaction,
-    #[serde(rename = "stateOverrides")]
     state_overrides: Option<Value>,
 }
 
@@ -34,9 +33,9 @@ impl Provider for OneInchProvider {
         chains_if_configured(self.key.is_some(), SUPPORTED_CHAINS)
     }
 
-    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let Some(key) = &self.key else {
-            return Err(Fault::with_status("PROVIDER_UNCONFIGURED", 503));
+            anyhow::bail!(ErrorKind::ProviderUnconfigured);
         };
         let slippage = format!(
             "{}.{:02}",
@@ -72,16 +71,13 @@ impl Provider for OneInchProvider {
             .as_ref()
             .is_some_and(is_nonempty_object)
         {
-            return Err(Fault::with_status(
-                "UPSTREAM_STATE_OVERRIDES_UNSUPPORTED",
-                422,
-            ));
+            anyhow::bail!(ErrorKind::UpstreamStateOverridesUnsupported);
         }
         let buy_amount = positive_string(&response.dst_amount)?;
         let transaction = response.tx.into_tx(sender)?;
         let spender = parse_address("0x111111125421ca6dc452d289314280a0f8842a65")?;
         if transaction.to != spender {
-            return Err(Fault::with_status("UNEXPECTED_1INCH_CONTRACT", 502));
+            anyhow::bail!(ErrorKind::Unexpected1inchContract);
         }
         Ok(Route {
             provider: self.id(),

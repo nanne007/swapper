@@ -1,26 +1,24 @@
 use super::*;
+use alloy_chains::{Chain as AlloyChain, NamedChain};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct BebopResponse {
     status: String,
-    #[serde(rename = "chainId")]
     chain_id: u64,
     expiry: u64,
-    #[serde(rename = "approvalTarget")]
     approval_target: String,
-    #[serde(rename = "buyTokens")]
     buy_tokens: HashMap<String, BebopToken>,
-    #[serde(rename = "sellTokens")]
     sell_tokens: HashMap<String, BebopToken>,
     taker: Option<String>,
     tx: RawTransaction,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct BebopToken {
     amount: String,
-    #[serde(rename = "minimumAmount")]
     minimum_amount: Option<String>,
 }
 
@@ -46,13 +44,14 @@ impl Provider for BebopProvider {
         SUPPORTED_CHAINS.to_vec()
     }
 
-    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route> {
+        let chain_slug = chain_slug(chain.id)?;
         let sell_token = input.sell_token.to_checksum(None);
         let buy_token = input.buy_token.to_checksum(None);
         let amount = input.sell_amount.clone();
         let taker = sender.to_checksum(None);
         let url = url_with_params(
-            &format!("https://api.bebop.xyz/pmm/{}/v3/quote", chain.slug),
+            &format!("https://api.bebop.xyz/pmm/{chain_slug}/v3/quote"),
             &[
                 ("sell_tokens", &sell_token),
                 ("buy_tokens", &buy_token),
@@ -78,7 +77,7 @@ impl Provider for BebopProvider {
         )
         .await?;
         if response.chain_id != input.chain_id || response.status != "SIG_SUCCESS" {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         if response
             .taker
@@ -87,14 +86,14 @@ impl Provider for BebopProvider {
             .transpose()?
             .is_some_and(|value| value != sender)
         {
-            return Err(Fault::with_status("UPSTREAM_TAKER_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamTakerMismatch);
         }
         let sell = token_amount(&response.sell_tokens, input.sell_token)?;
         let buy = token_amount(&response.buy_tokens, input.buy_token)?;
         let min_buy_amount = positive_string(
             buy.minimum_amount
                 .as_deref()
-                .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?,
+                .context(ErrorKind::UpstreamInvalidResponse)?,
         )?;
         normalize_route(
             self.id(),
@@ -112,10 +111,19 @@ impl Provider for BebopProvider {
     }
 }
 
+fn chain_slug(chain_id: u64) -> anyhow::Result<&'static str> {
+    match AlloyChain::from_id(chain_id).named() {
+        Some(NamedChain::Mainnet) => Ok("ethereum"),
+        Some(NamedChain::Hyperliquid) => Ok("hyperevm"),
+        Some(chain) if SUPPORTED_CHAINS.contains(&chain_id) => Ok(chain.as_str()),
+        _ => Err(anyhow::Error::new(ErrorKind::UnsupportedChain)),
+    }
+}
+
 fn token_amount(
     tokens: &HashMap<String, BebopToken>,
     expected: Address,
-) -> Result<&BebopToken, Fault> {
+) -> anyhow::Result<&BebopToken> {
     tokens
         .iter()
         .find_map(|(address, token)| {
@@ -124,5 +132,5 @@ fn token_amount(
                 .filter(|value| *value == expected)
                 .map(|_| token)
         })
-        .ok_or_else(|| Fault::with_status("UPSTREAM_TOKEN_MISMATCH", 502))
+        .context(ErrorKind::UpstreamTokenMismatch)
 }

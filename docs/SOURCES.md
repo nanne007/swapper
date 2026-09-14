@@ -13,8 +13,12 @@
 - [KyberSwap EVM API](https://docs.kyberswap.com/developer-guide/aggregator-api/aggregator-api-specification/evm-swaps)：公开 legacy gateway、routes 和 route/build 两步、短 route 有效期。
 - [Geth eth_simulateV1](https://geth.ethereum.org/docs/interacting-with-geth/rpc/ns-eth)：隔离状态、多调用和虚拟块。
 - [Geth state overrides](https://geth.ethereum.org/docs/interacting-with-geth/rpc/objects)：balance 与 stateDiff。
+- [anyhow Error](https://docs.rs/anyhow/latest/anyhow/struct.Error.html) 与 [Context](https://docs.rs/anyhow/latest/anyhow/trait.Context.html)：内部 source chain、downcast、追加上下文与 `RUST_LIB_BACKTRACE=1`；2026-09-14 错误系统重构采用库能力，不自建堆栈框架。
+- [serde_path_to_error](https://docs.rs/serde_path_to_error/latest/serde_path_to_error/)：DTO 反序列化路径与原始 serde 错误；实现以锁定版本源代码和回归测试为准。
 - [OP Stack fee estimation](https://docs.optimism.io/app-developers/guides/transactions/estimates)：L1 data fee 需另外估算。
-- [Monad developer portal](https://developers.monad.xyz/)：当前 Monad mainnet chain ID `143`；历史 testnet `10143` 不再进入 v1 catalog。
+- [Monad developer portal](https://developers.monad.xyz/)：当前 Monad mainnet chain ID `143`；provider 矩阵不再使用历史 testnet `10143`。
+- [alloy-chains crate](https://docs.rs/alloy-chains/latest/alloy_chains/)：EIP-155 `Chain`/`NamedChain` canonical types；运行时用 `Chain::from_id` 解释 provider 给出的 chain ID。
+- [Alchemy Chain API supported chains](https://www.alchemy.com/docs/reference/node-supported-chains)：当前 provider 并集中 17 条链的官方 HTTPS base URL；用于 `ALCHEMY_API_KEY` RPC 兜底映射。
 - [Enso route guide](https://docs.enso.build/pages/build/get-started/route)：Route API 的 token/amount 数组、slippage、响应和跨链能力。
 - [Enso route API reference](https://docs.enso.build/api-reference/defi-shortcuts/optimal-route-between-two-tokens)：`POST /shortcuts/route` 参数与响应结构。
 - [Enso routing strategies](https://docs.enso.build/pages/build/reference/routing-strategies)：EOA `router`、smart-wallet `delegate` 和动态 `tx.to`。
@@ -24,6 +28,7 @@
 - [Odos SOR quickstart](https://docs.odos.xyz/build/quickstart/sor)：Odos quote/assemble 流程。
 - [Odos official MCP](https://github.com/odos-xyz/odos-mcp)：公开 `api.odos.xyz`、无认证请求和 endpoint/DTO 的官方代码交叉证据。
 - [OpenOcean API v4](https://docs.openocean.finance/docs/swap-api/v4)：OpenOcean v4 swap endpoint、amountDecimals、slippage、minOutAmount 和 transaction 形态。
+- [OpenOcean Enterprise API](https://docs.openocean.finance/docs/swap-api/enterprise)：`gasPrice.standard.legacyGasPrice` 对象形态；2026-09-14 在公开 Ethereum v4 gasPrice 响应中也实测到该结构。
 - [OpenOcean API access](https://docs.openocean.finance/docs/swap-api/api-pricing-and-access)：公开 Swap API 对所有 DeFi builders 开放，默认 2 RPS；Pro/Enterprise 需单独接入。
 - [OpenOcean error codes](https://docs.openocean.finance/docs/developer-resources/errors)：401/402 对应 Pro API key，403 对应 IP 白名单或安全策略。
 - [Velora Market API](https://developers.velora.xyz/api/velora-api/velora-market-api/get-rate-for-a-token-pair-1)：Velora `/swap` 的 priceRoute/txParams 形态。

@@ -2,13 +2,11 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OogaBoogaResponse {
     status: String,
-    #[serde(rename = "amountIn")]
     amount_in: String,
-    #[serde(rename = "amountOut")]
     amount_out: String,
-    #[serde(rename = "minAmountOut")]
     min_amount_out: String,
     value: Value,
     #[serde(rename = "routerAddr")]
@@ -38,9 +36,9 @@ impl Provider for OogaBoogaProvider {
         chains_if_configured(self.key.is_some(), SUPPORTED_CHAINS)
     }
 
-    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let Some(key) = &self.key else {
-            return Err(Fault::with_status("PROVIDER_UNCONFIGURED", 503));
+            anyhow::bail!(ErrorKind::ProviderUnconfigured);
         };
         let base = ooga_host(chain.id)?;
         let sender_text = address_string(sender);
@@ -66,7 +64,7 @@ impl Provider for OogaBoogaProvider {
         )
         .await?;
         if response.status != "Success" {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         let router = parse_address(&response.router_address)?;
         normalize_route(
@@ -98,10 +96,10 @@ fn ooga_token(address: Address) -> String {
     }
 }
 
-fn ooga_host(chain_id: u64) -> Result<&'static str, Fault> {
+fn ooga_host(chain_id: u64) -> anyhow::Result<&'static str> {
     match chain_id {
         80094 => Ok("https://mainnet.api.oogabooga.io"),
         999 => Ok("https://hyperevm.api.oogabooga.io"),
-        _ => Err(Fault::with_status("UNSUPPORTED_CHAIN", 422)),
+        _ => Err(anyhow::Error::new(ErrorKind::UnsupportedChain)),
     }
 }

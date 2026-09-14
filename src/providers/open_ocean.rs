@@ -15,22 +15,29 @@ struct OpenOceanGasResponse {
 
 #[derive(Debug, Deserialize)]
 struct OpenOceanGasData {
-    standard: Value,
+    standard: OpenOceanGasPrice,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OpenOceanGasPrice {
+    Eip1559 {
+        #[serde(rename = "legacyGasPrice")]
+        legacy_gas_price: Value,
+    },
+    Legacy(Value),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OpenOceanData {
-    #[serde(rename = "inAmount")]
     in_amount: String,
-    #[serde(rename = "outAmount")]
     out_amount: String,
-    #[serde(rename = "minOutAmount")]
     min_out_amount: String,
     from: Option<String>,
     to: String,
     value: Value,
     data: String,
-    #[serde(rename = "chainId")]
     chain_id: Option<u64>,
 }
 
@@ -57,7 +64,7 @@ impl Provider for OpenOceanProvider {
         SUPPORTED_CHAINS.to_vec()
     }
 
-    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let chain_id = chain.id.to_string();
         let gas: OpenOceanGasResponse = json_request_as(
             self.client.as_ref(),
@@ -71,9 +78,16 @@ impl Provider for OpenOceanProvider {
         )
         .await?;
         if gas.code != 200 {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
-        let gas_price = positive_string(&quantity_value(&gas.data.standard)?)?;
+        let price = match gas.data.standard {
+            OpenOceanGasPrice::Eip1559 { legacy_gas_price } => legacy_gas_price,
+            OpenOceanGasPrice::Legacy(value) => value,
+        };
+        let gas_price = positive_string(
+            &quantity_value(&price)
+                .map_err(|error| error.context("OpenOcean standard gas price"))?,
+        )?;
         let sell_token = open_ocean_token(chain.id, input.sell_token);
         let buy_token = open_ocean_token(chain.id, input.buy_token);
         let slippage = percentage_string(input.slippage_bps);
@@ -101,14 +115,14 @@ impl Provider for OpenOceanProvider {
         )
         .await?;
         if response.code != 200 {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         if response
             .data
             .chain_id
             .is_some_and(|value| value != input.chain_id)
         {
-            return Err(Fault::with_status("UPSTREAM_CHAIN_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamChainMismatch);
         }
         let tx = RawTransaction {
             to: response.data.to,

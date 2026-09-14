@@ -2,17 +2,13 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ZeroExResponse {
-    #[serde(rename = "liquidityAvailable")]
     liquidity_available: Option<bool>,
-    #[serde(rename = "sellAmount")]
     sell_amount: String,
-    #[serde(rename = "buyAmount")]
     buy_amount: String,
-    #[serde(rename = "minBuyAmount")]
     min_buy_amount: String,
     transaction: RawTransaction,
-    #[serde(rename = "allowanceTarget")]
     allowance_target: Option<String>,
     issues: Option<ZeroExIssues>,
 }
@@ -51,9 +47,9 @@ impl Provider for ZeroExProvider {
         chains_if_configured(self.key.is_some(), SUPPORTED_CHAINS)
     }
 
-    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let Some(key) = &self.key else {
-            return Err(Fault::with_status("PROVIDER_UNCONFIGURED", 503));
+            anyhow::bail!(ErrorKind::ProviderUnconfigured);
         };
         let url = url_with_params(
             "https://api.0x.org/swap/allowance-holder/quote",
@@ -78,7 +74,7 @@ impl Provider for ZeroExProvider {
         )
         .await?;
         if !response.liquidity_available.unwrap_or(false) {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         let tx_to = parse_address(&response.transaction.to)?;
         let allowance_target = response
@@ -92,7 +88,7 @@ impl Provider for ZeroExProvider {
             parse_address(
                 allowance_target
                     .as_deref()
-                    .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?,
+                    .context(ErrorKind::UpstreamInvalidResponse)?,
             )?
         };
         normalize_route(

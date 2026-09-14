@@ -8,8 +8,10 @@ use alloy_provider::{DynProvider, Provider as AlloyProvider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionInput, TransactionRequest};
 use alloy_sol_types::{SolCall, sol};
 use async_trait::async_trait;
+use metamatch_backend::error::ErrorKind;
 use metamatch_backend::{
     app::create_app_with_services,
+    chains::configured_chain,
     competitions::Services,
     config::{Config, load_config},
     domain::{Context, HOLDER, Input, Route, Rule, Tx, now_ms, parse_address},
@@ -154,27 +156,26 @@ impl ContextProvider for AnvilContext {
         &self,
         _input: &Input,
         chain: &metamatch_backend::domain::Chain,
-    ) -> Result<Context, metamatch_backend::domain::Fault> {
+    ) -> anyhow::Result<Context> {
         if self
             .rpc
             .chain_id()
             .await
-            .map_err(|_| metamatch_backend::domain::Fault::with_status("RPC_CALL_FAILED", 502))?
+            .map_err(|_| anyhow::Error::new(ErrorKind::RpcCallFailed))?
             != chain.id
         {
-            return Err(metamatch_backend::domain::Fault::with_status(
-                "RPC_CHAIN_MISMATCH",
-                503,
-            ));
+            return Err(anyhow::Error::new(ErrorKind::RpcChainMismatch));
         }
-        let block =
-            self.rpc.latest_block().await.map_err(|_| {
-                metamatch_backend::domain::Fault::with_status("RPC_CALL_FAILED", 502)
-            })?;
-        let gas_price =
-            self.rpc.gas_price().await.map_err(|_| {
-                metamatch_backend::domain::Fault::with_status("RPC_CALL_FAILED", 502)
-            })?;
+        let block = self
+            .rpc
+            .latest_block()
+            .await
+            .map_err(|_| anyhow::Error::new(ErrorKind::RpcCallFailed))?;
+        let gas_price = self
+            .rpc
+            .gas_price()
+            .await
+            .map_err(|_| anyhow::Error::new(ErrorKind::RpcCallFailed))?;
         Ok(Context {
             block_number: format!("0x{:x}", block.header.inner.number),
             block_hash: format!("{:#x}", block.header.hash),
@@ -217,11 +218,9 @@ impl Provider for FixtureProvider {
         _input: &Input,
         _chain: &metamatch_backend::domain::Chain,
         sender: Address,
-    ) -> Result<Route, metamatch_backend::domain::Fault> {
+    ) -> anyhow::Result<Route> {
         if sender != self.router {
-            return Err(metamatch_backend::domain::Fault::new(
-                "FIXTURE_SENDER_MISMATCH",
-            ));
+            return Err(anyhow::anyhow!("FIXTURE_SENDER_MISMATCH"));
         }
         let mut route = self.route.clone();
         route.expires_at = now_ms() + 20_000;
@@ -433,15 +432,12 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
     )
     .await?;
 
-    let mut config: Config = load_config(&HashMap::from([(
+    let config: Config = load_config(&HashMap::from([(
         String::from("ETHEREUM_RPC_URL"),
         url.to_owned(),
     )]))
     .map_err(|error| error.to_string())?;
-    let chain = config
-        .chains
-        .first_mut()
-        .ok_or_else(|| String::from("missing Ethereum chain"))?;
+    let mut chain = configured_chain(&config, 1);
     chain.router = Some(router);
     let input = Input {
         chain_id: 1,
@@ -474,9 +470,11 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
                 selector: hex_bytes(swap_selector.as_slice()),
             }],
         })],
-        &config.chains,
+        &[chain],
         Arc::new(AnvilContext { rpc: rpc.clone() }),
-        Arc::new(Simulator::new(Duration::from_secs(2))),
+        Arc::new(Simulator::new(Arc::new(
+            metamatch_backend::rpc::RpcClients::new(Duration::from_secs(2)),
+        ))),
     );
     let app = create_app_with_services(config, Some(services));
     let listener = TcpListener::bind(("127.0.0.1", 0))

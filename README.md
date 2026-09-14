@@ -12,7 +12,15 @@
 cargo run
 ```
 
-默认监听 127.0.0.1:3000。修改 Rust 源码后可使用 `cargo run` 重启。服务不会生成 mock 报价，也不会访问缺少必需凭据的 provider。
+启动时会从当前目录或父目录读取可选 `.env`，已有的 shell/部署环境变量优先；文件不存在时继续启动，文件存在但不可读或格式错误时直接失败。默认监听 127.0.0.1:3000。修改 Rust 源码后可使用 `cargo run` 重启。服务不会生成 mock 报价，也不会访问缺少必需凭据的 provider。
+
+排障时可以启用内部 backtrace；日志写入 stderr，默认过滤为 `metamatch_backend=info`：
+
+```sh
+RUST_LOG=metamatch_backend=info RUST_LIB_BACKTRACE=1 cargo run
+```
+
+内部直接使用 `anyhow::Result<T>`，通过 `.context(ErrorKind::…)` 附加分类；原始错误、上下文和 backtrace 交给 anyhow。失败边界直接 `tracing::warn!(error = ?error, "操作失败")`，启动入口返回 `anyhow::Result<()>`，不再封装 `Fault` 或专用日志层。当前不实现日志脱敏，内部日志可能包含上游错误详情；公开 `ApiError` 仍只返回稳定错误码，不包含内部原因链。
 
 ```sh
 curl -s http://127.0.0.1:3000/health
@@ -28,12 +36,15 @@ build 请求：`POST /v1/competitions/{id}/quotes/{quoteId}/build`，同样鉴�
 
 ## Live 配置
 
-Rust 进程读取环境变量；`config.example.json` 为空对象，表示 v1 不使用链/provider/token 业务配置。不要提交真实环境文件。
+Rust 进程读取环境变量和本地 `.env`，配置项见 `.env.example`；v1 不使用链/provider/token 业务配置文件。不要提交真实环境文件。
 
 - 需要 key 的 provider 使用原生环境变量：`ZERO_EX_API_KEY`、`ONE_INCH_API_KEY`、`BARTER_API_KEY`、`ENSO_API_KEY`、`HYPERBLOOM_API_KEY`、`OOGABOOGA_API_KEY`、`OKX_API_KEY`。
 - OKX 还必须配置 `OKX_SECRET_KEY`、`OKX_API_PASSPHRASE`；`OKX_PROJECT_ID` 可选。`BEBOP_API_KEY`、`KYBER_CLIENT_ID` 和 `ODOS_API_KEY` 为 optional，配置后只传给对应 adapter，不改变其参与资格。Kyber 公共 legacy gateway、Odos、LiquidSwap、OpenOcean、Velora 当前可免 key 访问；完整接入差异见 [Provider 官方接入手册](docs/PROVIDER_INTEGRATION_GUIDE.md)。
 - `RPC_URL_<chainId>`：对应链的可信 HTTP RPC，例如 `RPC_URL_8453`；需要支持 `eth_simulateV1`、`eth_call` state override。Ethereum 也兼容 `ETHEREUM_RPC_URL`。
+- `ALCHEMY_API_KEY`：当某条链没有显式 `RPC_URL_<chainId>`（Ethereum 也没有旧别名）时，按官方 Alchemy network endpoint 自动补齐 RPC。显式 RPC 始终优先；key 只在服务端使用，不得写入日志或提交到仓库。
 - 不配置 RPC 时链仍会出现在 capabilities，但仿真会明确返回 unavailable/unsupported。
+
+Alchemy 官方列出 endpoint 不代表每条链都支持本服务依赖的全部仿真方法；`eth_simulateV1` 和 state override 仍由运行时 RPC 检查，方法缺失不会被当成成功。
 
 服务不维护 token 白名单；API 收到的 token 地址经过格式、金额和 route 安全校验后透传给 provider。不得把 provider 返回的任意 target 自动加入 Router allowlist；正式 Router/Holder 仍需按链逐一核对。
 
@@ -53,6 +64,16 @@ METAMATCH_RUN_LIVE_PROVIDER_TESTS=1 \
 需要 access key 的 provider 从进程环境读取已有的原生 key；缺少必需字段时测试明确 `SKIP`，不会发请求。Bebop、Kyber、LiquidSwap、Odos、OpenOcean、Velora 即使没有 key 也会尝试进入测试。Ethereum、Optimism、Base、Arbitrum 使用公开的 WETH/USDC 默认输入；HyperEVM 使用 WHYPE/USDT0，Berachain 使用 native/HONEY。可通过 `METAMATCH_LIVE_BUY_TOKEN_<chainId>`、`METAMATCH_LIVE_SELL_TOKEN_<chainId>` 和 `METAMATCH_LIVE_SELL_AMOUNT_<chainId>` 覆盖输入，但不会把这些测试默认值引入产品 token registry。`METAMATCH_LIVE_CHAIN_ID` 可让所有 provider 使用同一个替代链，但该链必须在对应 provider 的 `supported_chains()` 中。
 
 每个实际发出请求的 live test 都要求全程 HTTP 2xx，并且生产 adapter 必须返回通过安全校验的归一化 `Route`；只有“服务器返回了错误”不算通过。live 结果会受上游限流、IP 策略、实时流动性和服务变更影响，不属于普通 CI 门禁。OpenOcean 官方公开 API 虽免 key，但 403 表示出口 IP 被安全策略拦截，需要联系 OpenOcean 加白，详见验证文档。
+
+### 重放完整 ETH → USDC 竞赛
+
+`tests/replay_live.rs` 使用上面同一个无 taker 的 1 ETH → USDC 请求，经过真实 Axum 路由、生产 provider adapter 和配置的 RPC。它自动将可选 `.env` 解析到局部配置 map，进程环境变量优先，不修改测试进程的全局环境。需要显式启用，运行会消耗上游配额：
+
+```sh
+METAMATCH_RUN_LIVE_REPLAY=1 cargo test --test replay_live -- --ignored --nocapture
+```
+
+测试要求真实 block context 且至少一家仿真成功；这只证明竞赛整体可用，不表示每家 provider 都成功。逐家失败仍输出并记录，单家接入验收使用上面的严格 provider smoke。2026-09-14 重放有 5 家真实 preview 仿真成功，Odos 530、OpenOcean 403；完整原因和瞬时报价见 [验证记录](docs/VERIFICATION.md#真实请求重放与错误系统2026-09-14)。未签名或广播，也不证明真实 taker 余额足够。
 
 ## 测试
 

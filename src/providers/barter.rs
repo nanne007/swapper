@@ -3,11 +3,10 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct BarterRouteResponse {
     status: String,
-    #[serde(rename = "outputAmount")]
     output_amount: String,
-    #[serde(rename = "inputAmount")]
     input_amount: String,
 }
 
@@ -41,12 +40,12 @@ impl Provider for BarterProvider {
         chains_if_configured(self.key.is_some(), SUPPORTED_CHAINS)
     }
 
-    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         if input.sell_token == NATIVE {
-            return Err(Fault::with_status("NATIVE_SELL_UNSUPPORTED", 422));
+            anyhow::bail!(ErrorKind::NativeSellUnsupported);
         }
         let Some(key) = &self.key else {
-            return Err(Fault::with_status("PROVIDER_UNCONFIGURED", 503));
+            anyhow::bail!(ErrorKind::ProviderUnconfigured);
         };
         let host = barter_host(chain.id)?;
         let route_request = json!({
@@ -67,12 +66,12 @@ impl Provider for BarterProvider {
         )
         .await?;
         if route.status != "Normal" {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         let route_input = positive_string(&route.input_amount)?;
         let route_output = positive_string(&route.output_amount)?;
         if route_input != input.sell_amount {
-            return Err(Fault::with_status("UPSTREAM_AMOUNT_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamAmountMismatch);
         }
         // Barter requires minReturn to be at least 98% of the quoted output.
         let min_return = minimum(&route_output, input.slippage_bps.min(200))?;
@@ -98,12 +97,12 @@ impl Provider for BarterProvider {
         )
         .await?;
         if response.route.status != "Normal" {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         let amount_in = positive_string(&response.route.input_amount)?;
         let amount_out = positive_string(&response.route.output_amount)?;
         if amount_in != input.sell_amount || amount_out != route_output {
-            return Err(Fault::with_status("UPSTREAM_AMOUNT_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamAmountMismatch);
         }
         let spender = parse_address(&response.to)?;
         normalize_route(
@@ -127,12 +126,12 @@ impl Provider for BarterProvider {
     }
 }
 
-fn barter_host(chain_id: u64) -> Result<&'static str, Fault> {
+fn barter_host(chain_id: u64) -> anyhow::Result<&'static str> {
     match chain_id {
         1 => Ok("https://api2.eth.barterswap.xyz"),
         8453 => Ok("https://api2.base.barterswap.xyz"),
         42161 => Ok("https://api2.arb.barterswap.xyz"),
-        _ => Err(Fault::with_status("UNSUPPORTED_CHAIN", 422)),
+        _ => Err(anyhow::Error::new(ErrorKind::UnsupportedChain)),
     }
 }
 

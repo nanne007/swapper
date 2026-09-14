@@ -11,7 +11,7 @@
 
 ## v1 最小核心设计
 
-聚合 Matcha Meta 页面列出的 13 个 provider，按各 adapter 基于当前官方 API 维护的 `supported_chains()` 生成 17 条 EVM 链的 catalog 和 `chain -> provider list` 反向索引。配置不包含链/provider 开关和 token 列表；必需 access key 缺失时 provider 返回空集合，其他 provider 默认参与。固定区块仿真、净到账排序、轮询快照和真实 taker build 保留。
+聚合 Matcha Meta 页面列出的 13 个 provider，按各 adapter 基于当前官方 API 维护的 `supported_chains()` 直接生成运行时链并集和 `chain -> provider list` 反向索引，不维护独立 chain catalog。配置不包含链/provider 开关和 token 列表；必需 access key 缺失时 provider 返回空集合，其他 provider 默认参与。固定区块仿真、净到账排序、轮询快照和真实 taker build 保留。
 
 安全边界不减：所有金额仍是十进制字符串与 `U256`；供应商/route 失败不伪造成功；Router 只接受服务端 allowlist；build 重新报价和模拟；服务不持有用户密钥。
 
@@ -39,7 +39,7 @@
 
 ### Slice 4：v1 多链骨架
 
-- [x] 增加 Matcha provider ID、链 catalog、chain slug 和支持矩阵。
+- [x] 增加 Matcha provider ID、provider 自有 chain slug 和支持矩阵；运行时链由矩阵并集派生。
 - [x] 删除 chain/provider/token 业务配置；保留按 chain ID 注入 RPC 的基础设施配置。
 - [x] 增加 key-aware `supported_chains()` 和启动期 `chain -> provider` 反向索引。
 - [x] 竞赛、capabilities、provider quote 调度改为只读取反向索引。

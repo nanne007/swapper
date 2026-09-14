@@ -1,6 +1,8 @@
-use crate::domain::{Chain, Fault, HOLDER, Input, NATIVE, Route, Rule, Tx, parse_hex, parse_uint};
+use crate::domain::{Chain, HOLDER, Input, NATIVE, Route, Rule, Tx, parse_hex, parse_uint};
+use crate::error::ErrorKind;
 use alloy_primitives::{Address, Bytes, U256};
 use alloy_sol_types::{SolCall, sol};
+use anyhow::Context as _;
 
 sol! {
     function approve(address spender, uint256 amount) returns (bool);
@@ -16,43 +18,52 @@ pub fn validate_route(
     route: &Route,
     rules: &[Rule],
     require_unified: bool,
-) -> Result<(), Fault> {
+) -> anyhow::Result<()> {
     if route.sell_amount != input.sell_amount
         || parse_uint(&route.min_buy_amount)?.is_zero()
         || parse_uint(&route.buy_amount)? < parse_uint(&route.min_buy_amount)?
     {
-        return Err(Fault::with_status("INVALID_ROUTE", 502));
+        anyhow::bail!(ErrorKind::InvalidRoute);
     }
-    if route.expires_at <= crate::domain::now_ms() {
-        return Err(Fault::with_status("QUOTE_EXPIRED", 409));
-    }
-    let route_value = parse_uint(&route.tx.value)?;
-    let expected_value = if input.sell_token == NATIVE {
-        parse_uint(&input.sell_amount)?
-    } else {
-        U256::ZERO
-    };
-    if route_value != expected_value {
-        return Err(Fault::with_status("UNEXPECTED_TRANSACTION_VALUE", 502));
-    }
-    let data = parse_hex(&route.tx.data)?;
-    if data.len() < 10 || data.len() > 262_146 {
-        return Err(Fault::with_status("INVALID_CALLDATA", 502));
-    }
+    let data = validate_transaction(input, &route.tx, route.expires_at)?;
     if require_unified && chain.router.is_none() {
-        return Err(Fault::with_status("ROUTER_NOT_CONFIGURED", 503));
+        anyhow::bail!(ErrorKind::RouterNotConfigured);
     }
-    if let Some(_router) = chain.router {
+    if chain.router.is_some() {
         let allowlisted = rules.iter().any(|rule| {
             rule.target == route.tx.to
                 && rule.spender == route.spender
                 && rule.selector.eq_ignore_ascii_case(&data[..10])
         });
         if !allowlisted {
-            return Err(Fault::with_status("ROUTE_NOT_ALLOWLISTED", 422));
+            anyhow::bail!(ErrorKind::RouteNotAllowlisted);
         }
     }
     Ok(())
+}
+
+pub(crate) fn validate_transaction(
+    input: &Input,
+    tx: &Tx,
+    expires_at: u64,
+) -> anyhow::Result<String> {
+    if expires_at <= crate::domain::now_ms() {
+        anyhow::bail!(ErrorKind::QuoteExpired);
+    }
+    let route_value = parse_uint(&tx.value)?;
+    let expected_value = if input.sell_token == NATIVE {
+        parse_uint(&input.sell_amount)?
+    } else {
+        U256::ZERO
+    };
+    if route_value != expected_value {
+        anyhow::bail!(ErrorKind::UnexpectedTransactionValue);
+    }
+    let data = parse_hex(&tx.data)?;
+    if data.len() < 10 || data.len() > 262_146 {
+        anyhow::bail!(ErrorKind::InvalidCalldata);
+    }
+    Ok(data)
 }
 
 pub fn swap_transaction(
@@ -61,7 +72,7 @@ pub fn swap_transaction(
     route: &Route,
     rules: &[Rule],
     min: Option<&str>,
-) -> Result<Tx, Fault> {
+) -> anyhow::Result<Tx> {
     validate_route(input, chain, route, rules, false)?;
     let Some(router) = chain.router else {
         return Ok(route.tx.clone());
@@ -121,9 +132,9 @@ pub fn allowance_data(owner: Address, spender: Address) -> String {
     )
 }
 
-fn bytes_from_hex(data: &str) -> Result<Bytes, Fault> {
+fn bytes_from_hex(data: &str) -> anyhow::Result<Bytes> {
     let data = parse_hex(data)?;
-    Ok(Bytes::from(hex::decode(&data[2..]).map_err(|_| {
-        Fault::with_status("INVALID_CALLDATA", 502)
-    })?))
+    Ok(Bytes::from(
+        hex::decode(&data[2..]).context(ErrorKind::InvalidCalldata)?,
+    ))
 }

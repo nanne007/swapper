@@ -1,8 +1,10 @@
+pub mod api_error;
 pub mod app;
 pub mod chains;
 pub mod competitions;
 pub mod config;
 pub mod domain;
+pub mod error;
 pub mod execution;
 pub mod http;
 pub mod providers;

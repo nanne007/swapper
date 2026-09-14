@@ -1,4 +1,5 @@
 use super::*;
+use alloy_chains::{Chain as AlloyChain, NamedChain};
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -8,20 +9,17 @@ struct KyberResponse<T> {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct KyberRouteData {
-    #[serde(rename = "routerAddress")]
     router_address: String,
-    #[serde(rename = "routeSummary")]
     route_summary: Value,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct KyberBuildData {
-    #[serde(rename = "routerAddress")]
     router_address: String,
-    #[serde(rename = "amountOut")]
     amount_out: String,
-    #[serde(rename = "transactionValue")]
     transaction_value: Option<Option<String>>,
     data: String,
 }
@@ -50,8 +48,9 @@ impl Provider for KyberProvider {
         SUPPORTED_CHAINS.to_vec()
     }
 
-    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> Result<Route, Fault> {
-        let base = format!("https://aggregator-api.kyberswap.com/{}/api/v1", chain.slug);
+    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route> {
+        let chain_slug = chain_slug(chain.id)?;
+        let base = format!("https://aggregator-api.kyberswap.com/{chain_slug}/api/v1");
         let mut headers = auth_headers(&[("Content-Type", "application/json")]);
         if let Some(client_id) = &self.client_id {
             headers.insert("x-client-id".into(), client_id.clone());
@@ -76,13 +75,13 @@ impl Provider for KyberProvider {
         )
         .await?;
         if route_response.code != 0 {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         let router_address = parse_address(&route_response.data.router_address)?;
         let summary = route_response.data.route_summary;
         let amount_in = positive_value_field(&summary, "amountIn")?;
         if amount_in != input.sell_amount {
-            return Err(Fault::with_status("UPSTREAM_AMOUNT_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamAmountMismatch);
         }
         let build_body = json!({
             "routeSummary": summary,
@@ -104,17 +103,17 @@ impl Provider for KyberProvider {
         )
         .await?;
         if built.code != 0 {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         let data = built.data;
         let built_router = parse_address(&data.router_address)?;
         if built_router != router_address {
-            return Err(Fault::with_status("UPSTREAM_ROUTER_CHANGED", 502));
+            anyhow::bail!(ErrorKind::UpstreamRouterChanged);
         }
-        let amount_out = format_quantity(parse_positive(&data.amount_out)?);
+        let amount_out = parse_positive(&data.amount_out)?.to_string();
         let transaction_value = match data.transaction_value {
             Some(Some(value)) => quantity_string(&value)?,
-            Some(None) => return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502)),
+            Some(None) => return Err(anyhow::Error::new(ErrorKind::UpstreamInvalidResponse)),
             None if input.sell_token == NATIVE => input.sell_amount.clone(),
             None => String::from("0"),
         };
@@ -134,14 +133,23 @@ impl Provider for KyberProvider {
     }
 }
 
-fn positive_value_field(value: &Value, key: &str) -> Result<String, Fault> {
+fn chain_slug(chain_id: u64) -> anyhow::Result<&'static str> {
+    match AlloyChain::from_id(chain_id).named() {
+        Some(NamedChain::Mainnet) => Ok("ethereum"),
+        Some(NamedChain::Hyperliquid) => Ok("hyperevm"),
+        Some(chain) if SUPPORTED_CHAINS.contains(&chain_id) => Ok(chain.as_str()),
+        _ => Err(anyhow::Error::new(ErrorKind::UnsupportedChain)),
+    }
+}
+
+fn positive_value_field(value: &Value, key: &str) -> anyhow::Result<String> {
     let value = value
         .get(key)
         .and_then(Value::as_str)
-        .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
+        .context(ErrorKind::UpstreamInvalidResponse)?;
     positive_string(value)
 }
 
-fn quantity_string(value: &str) -> Result<String, Fault> {
+fn quantity_string(value: &str) -> anyhow::Result<String> {
     quantity_value(&Value::String(value.into()))
 }

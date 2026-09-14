@@ -2,25 +2,22 @@ use super::*;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EnsoResponse {
-    #[serde(rename = "amountOut")]
     amount_out: String,
-    #[serde(rename = "minAmountOut")]
     min_amount_out: String,
     tx: RawTransaction,
     #[serde(default)]
     route: Vec<EnsoLeg>,
-    #[serde(rename = "preTransactions", default)]
+    #[serde(default)]
     pre_transactions: Vec<EnsoPreTransaction>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EnsoLeg {
-    #[serde(rename = "chainId")]
-    chain_id: u64,
-    #[serde(rename = "sourceChainId")]
+    chain_id: Option<u64>,
     source_chain_id: Option<u64>,
-    #[serde(rename = "destinationChainId")]
     destination_chain_id: Option<u64>,
 }
 
@@ -54,9 +51,9 @@ impl Provider for EnsoProvider {
         chains_if_configured(self.key.is_some(), SUPPORTED_CHAINS)
     }
 
-    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let Some(key) = &self.key else {
-            return Err(Fault::with_status("PROVIDER_UNCONFIGURED", 503));
+            anyhow::bail!(ErrorKind::ProviderUnconfigured);
         };
         let sender_text = address_string(sender);
         let body = json!({
@@ -67,7 +64,7 @@ impl Provider for EnsoProvider {
             "tokenIn": [address_string(input.sell_token)],
             "tokenOut": [address_string(input.buy_token)],
             "amountIn": [input.sell_amount],
-            "slippage": input.slippage_bps,
+            "slippage": input.slippage_bps.to_string(),
         });
         let response: EnsoResponse = json_request_as(
             self.client.as_ref(),
@@ -84,11 +81,11 @@ impl Provider for EnsoProvider {
         )
         .await?;
         if response.route.iter().any(|leg| {
-            leg.chain_id != chain.id
+            leg.chain_id.is_some_and(|id| id != chain.id)
                 || leg.source_chain_id.is_some_and(|id| id != chain.id)
                 || leg.destination_chain_id.is_some_and(|id| id != chain.id)
         }) {
-            return Err(Fault::with_status("CROSS_CHAIN_ROUTE_UNSUPPORTED", 422));
+            anyhow::bail!(ErrorKind::CrossChainRouteUnsupported);
         }
         let tx_to = parse_address(&response.tx.to)?;
         let spender = response

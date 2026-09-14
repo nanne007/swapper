@@ -1,22 +1,23 @@
+use metamatch_backend::error::ErrorKind;
 mod support;
 
 use axum::http::StatusCode;
 use metamatch_backend::{
     app::create_app,
-    chains::{CHAIN_CATALOG, configured_chains, spec},
+    chains::{alchemy_rpc_url, configured_chain, configured_chains},
     competitions::{Competitions, Services},
     config::load_config,
     domain::{
         Input, NATIVE, PREVIEW_TAKER, Route, Rule, Simulation, Tx, minimum, now_ms, parse_address,
-        parse_input, parse_positive, parse_uint,
+        parse_positive, parse_uint, validate_input,
     },
     execution::{swap_transaction, validate_route},
     http::{HttpClient, HttpRequest, HttpResponse, json_request, url_with_params},
-    rpc::{ContextProvider, ContextSource},
+    rpc::{ContextProvider, ContextSource, RpcClients},
 };
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use support::{FixtureFactory, chain, config, fixture_context, input, request, run_simulation};
+use support::{FixtureRpc, chain, config, fixture_context, input, request, run_simulation};
 
 #[test]
 fn integer_math_never_uses_floating_point() {
@@ -41,6 +42,9 @@ fn integer_math_never_uses_floating_point() {
 
 #[test]
 fn input_rejects_unknown_fields_and_reserved_takers() {
+    fn parse_input(value: Value) -> anyhow::Result<Input> {
+        validate_input(serde_json::from_value(value)?)
+    }
     let base = json!({
         "chainId": 1,
         "sellToken": format!("{NATIVE:#x}"),
@@ -62,17 +66,76 @@ fn input_rejects_unknown_fields_and_reserved_takers() {
 }
 
 #[test]
-fn catalog_is_generated_without_chain_configuration() {
-    let chains = configured_chains(&HashMap::new()).unwrap();
-    assert_eq!(chains.len(), CHAIN_CATALOG.len());
-    assert_eq!(spec(143).unwrap().name, "Monad");
+fn chains_are_built_from_provider_chain_ids() {
+    let config = config();
+    let chains = configured_chains(&config, [143, 1]);
+    assert_eq!(
+        chains.iter().map(|chain| chain.id).collect::<Vec<_>>(),
+        [143, 1]
+    );
+    assert_eq!(chains[0].name, "monad");
     assert!(chains.iter().all(|chain| chain.router.is_none()));
+    assert!(chains.iter().all(|chain| chain.rpc_url.is_none()));
 }
 
 #[test]
 fn rpc_is_selected_by_chain_id() {
     let env = HashMap::from([(String::from("RPC_URL_8453"), String::from("http://base"))]);
-    let chains = configured_chains(&env).unwrap();
+    let config = load_config(&env).unwrap();
+    assert_eq!(
+        configured_chain(&config, 8453).rpc_url.as_deref(),
+        Some("http://base")
+    );
+}
+
+#[test]
+fn alchemy_base_urls_are_keyless_and_fill_provider_chains() {
+    let env = HashMap::from([(String::from("ALCHEMY_API_KEY"), String::from("fixture/key"))]);
+    let config = load_config(&env).unwrap();
+    let expected = HashMap::from([
+        (1, "https://eth-mainnet.g.alchemy.com/v2/"),
+        (10, "https://opt-mainnet.g.alchemy.com/v2/"),
+        (56, "https://bnb-mainnet.g.alchemy.com/v2/"),
+        (130, "https://unichain-mainnet.g.alchemy.com/v2/"),
+        (137, "https://polygon-mainnet.g.alchemy.com/v2/"),
+        (143, "https://monad-mainnet.g.alchemy.com/v2/"),
+        (146, "https://sonic-mainnet.g.alchemy.com/v2/"),
+        (999, "https://hyperliquid-mainnet.g.alchemy.com/v2/"),
+        (5000, "https://mantle-mainnet.g.alchemy.com/v2/"),
+        (8453, "https://base-mainnet.g.alchemy.com/v2/"),
+        (9745, "https://plasma-mainnet.g.alchemy.com/v2/"),
+        (42161, "https://arb-mainnet.g.alchemy.com/v2/"),
+        (43114, "https://avax-mainnet.g.alchemy.com/v2/"),
+        (59144, "https://linea-mainnet.g.alchemy.com/v2/"),
+        (80094, "https://berachain-mainnet.g.alchemy.com/v2/"),
+        (81457, "https://blast-mainnet.g.alchemy.com/v2/"),
+        (534352, "https://scroll-mainnet.g.alchemy.com/v2/"),
+    ]);
+    let chains = configured_chains(&config, expected.keys().copied());
+
+    for chain in &chains {
+        let base_url = expected.get(&chain.id).unwrap();
+        assert_eq!(alchemy_rpc_url(chain.id), Some(*base_url));
+        let full_url = format!("{base_url}fixture%2Fkey");
+        assert_eq!(chain.rpc_url.as_deref(), Some(full_url.as_str()));
+    }
+    assert_eq!(alchemy_rpc_url(999_999), None);
+}
+
+#[test]
+fn explicit_rpc_url_wins_over_alchemy() {
+    let env = HashMap::from([
+        (String::from("ALCHEMY_API_KEY"), String::from("fixture-key")),
+        (String::from("RPC_URL_8453"), String::from("http://base")),
+        (String::from("RPC_URL_1"), String::from("http://ethereum")),
+        (
+            String::from("ETHEREUM_RPC_URL"),
+            String::from("http://legacy-ethereum"),
+        ),
+    ]);
+    let config = load_config(&env).unwrap();
+    let chains = configured_chains(&config, [8453, 1]);
+
     assert_eq!(
         chains
             .iter()
@@ -82,13 +145,32 @@ fn rpc_is_selected_by_chain_id() {
             .as_deref(),
         Some("http://base")
     );
+    assert_eq!(
+        chains
+            .iter()
+            .find(|chain| chain.id == 1)
+            .unwrap()
+            .rpc_url
+            .as_deref(),
+        Some("http://ethereum")
+    );
+
+    let legacy_env = HashMap::from([
+        (String::from("ALCHEMY_API_KEY"), String::from("fixture-key")),
+        (
+            String::from("ETHEREUM_RPC_URL"),
+            String::from("http://legacy-ethereum"),
+        ),
+    ]);
+    let legacy_config = load_config(&legacy_env).unwrap();
+    let ethereum = configured_chain(&legacy_config, 1);
+    assert_eq!(ethereum.rpc_url.as_deref(), Some("http://legacy-ethereum"));
 }
 
 #[test]
-fn defaults_to_the_catalog_without_chain_or_provider_configuration() {
+fn defaults_do_not_contain_chain_or_provider_selection() {
     let config = config();
     assert_eq!(config.port, 3000);
-    assert!(config.chains.len() > 1);
     assert!(config.provider_keys.is_empty());
 }
 
@@ -117,13 +199,13 @@ impl HttpClient for HttpFixture {
         &self,
         _request: HttpRequest,
         _timeout: Duration,
-    ) -> Result<HttpResponse, metamatch_backend::domain::Fault> {
+    ) -> anyhow::Result<HttpResponse> {
         Ok(self.response.clone())
     }
 }
 
 #[tokio::test]
-async fn json_request_redacts_upstream_body_and_caps_json() {
+async fn json_request_classifies_http_and_json_failures() {
     let client = HttpFixture {
         response: HttpResponse {
             status: 429,
@@ -142,7 +224,10 @@ async fn json_request_redacts_upstream_body_and_caps_json() {
     )
     .await
     .unwrap_err();
-    assert_eq!(error.code, "UPSTREAM_RATE_LIMITED");
+    assert_eq!(
+        metamatch_backend::error::kind(&error).to_string(),
+        "UPSTREAM_RATE_LIMITED"
+    );
 
     let client = HttpFixture {
         response: HttpResponse {
@@ -162,7 +247,10 @@ async fn json_request_redacts_upstream_body_and_caps_json() {
     )
     .await
     .unwrap_err();
-    assert_eq!(error.code, "UPSTREAM_INVALID_JSON");
+    assert_eq!(
+        metamatch_backend::error::kind(&error).to_string(),
+        "UPSTREAM_INVALID_JSON"
+    );
 }
 
 #[test]
@@ -205,7 +293,7 @@ fn execution_route() -> Route {
 
 #[test]
 fn unified_transaction_has_holder_and_minimum() {
-    let mut chain = config().chains.remove(0);
+    let mut chain = configured_chain(&config(), 1);
     let route = execution_route();
     let provider = route.tx.to;
     chain.router = Some(parse_address("0x2222222222222222222222222222222222222222").unwrap());
@@ -229,28 +317,26 @@ fn unified_transaction_has_holder_and_minimum() {
 
 #[test]
 fn route_target_and_value_are_checked() {
-    let chain = config().chains.into_iter().next().unwrap();
+    let chain = configured_chain(&config(), 1);
     let mut bad = execution_route();
     bad.tx.value = "0".into();
     assert_eq!(
         validate_route(&execution_input(), &chain, &bad, &[], false)
             .unwrap_err()
-            .code,
+            .downcast_ref::<ErrorKind>()
+            .unwrap()
+            .to_string(),
         "UNEXPECTED_TRANSACTION_VALUE"
     );
 }
 
 #[tokio::test]
 async fn typed_rpc_provider_supplies_block_context() {
-    let source = ContextSource::with_factory(
-        Duration::from_secs(1),
-        Arc::new(FixtureFactory {
-            rpc: Default::default(),
-        }),
-    );
+    let server = FixtureRpc::default().start().await;
+    let source = ContextSource::new(Arc::new(RpcClients::new(Duration::from_secs(1))));
     let config = config();
     let mut chain = chain(&config, 1);
-    chain.rpc_url = Some("http://fixture".into());
+    chain.rpc_url = Some(server.url.clone());
     let context = source.get(&input(1, NATIVE), &chain).await.unwrap();
     assert_eq!(context.block_number, fixture_context().block_number);
     assert_eq!(context.block_hash, fixture_context().block_hash);
@@ -259,7 +345,7 @@ async fn typed_rpc_provider_supplies_block_context() {
 
 #[tokio::test]
 async fn derives_balance_delta_and_gas_from_sequential_calls() {
-    let result = run_simulation(false, false, false).await;
+    let result = run_simulation(false, false, false).await.unwrap();
     match result.simulation {
         Simulation::Success {
             bought_amount,
@@ -277,44 +363,60 @@ async fn derives_balance_delta_and_gas_from_sequential_calls() {
 
 #[tokio::test]
 async fn reorg_is_not_success() {
-    let result = run_simulation(true, false, false).await;
-    assert!(matches!(result.simulation, Simulation::Error { .. }));
+    let error = run_simulation(true, false, false).await.unwrap_err();
+    let failure = *error
+        .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
+        .unwrap();
+    assert!(matches!(
+        Simulation::from(failure),
+        Simulation::Error { .. }
+    ));
 }
 
 #[tokio::test]
 async fn unsupported_simulation_method_is_not_reported_as_transport_failure() {
-    let result = run_simulation(false, false, true).await;
-    assert!(matches!(result.simulation, Simulation::Unsupported { .. }));
+    let error = run_simulation(false, false, true).await.unwrap_err();
+    let failure = *error
+        .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
+        .unwrap();
+    assert!(matches!(
+        Simulation::from(failure),
+        Simulation::Unsupported { .. }
+    ));
+    assert_eq!(
+        metamatch_backend::error::kind(&error).to_string(),
+        "RPC_METHOD_UNSUPPORTED"
+    );
 }
 
 #[tokio::test]
-async fn create_completes_without_configured_providers() {
+async fn create_rejects_a_chain_not_supported_by_current_providers() {
     let config = config();
     let service = Competitions::new(
         config.clone(),
         Some(Services::new(
             Vec::new(),
-            &config.chains,
+            &[configured_chain(&config, 1)],
             Arc::new(support::MockContext),
             Arc::new(support::MockSimulation),
         )),
     );
-    let created = service.create(input(1, NATIVE)).await.unwrap();
-    let state = support::wait_complete(&service, &created).await;
-    assert_eq!(state.status, "complete");
-    assert!(state.quotes.is_empty());
-    assert!(state.recommended_quote_id.is_none());
+    let error = service.create(input(1, NATIVE)).await.unwrap_err();
+    assert_eq!(
+        metamatch_backend::error::kind(&error).to_string(),
+        "INVALID_INPUT"
+    );
+    assert!(service.chains().is_empty());
     service.close().await;
 }
 
 #[tokio::test]
 async fn provider_failure_isolated_from_available_provider() {
-    let mut config = config();
+    let config = config();
     let router = parse_address("0x2222222222222222222222222222222222222222").unwrap();
-    config.chains[0].router = Some(router);
     let service = Competitions::new(
         config.clone(),
-        Some(support::competition_services_for(&config)),
+        Some(support::competition_services_for(&config, Some(router))),
     );
     let created = service
         .create(Input {
@@ -334,7 +436,7 @@ async fn provider_failure_isolated_from_available_provider() {
 }
 
 #[tokio::test]
-async fn create_rejects_chain_outside_catalog() {
+async fn create_rejects_chain_outside_current_provider_union() {
     let service = Competitions::new(config(), Some(support::competition_services()));
     let error = service
         .create(Input {
@@ -347,7 +449,10 @@ async fn create_rejects_chain_outside_catalog() {
         })
         .await
         .unwrap_err();
-    assert_eq!(error.code, "INVALID_INPUT");
+    assert_eq!(
+        metamatch_backend::error::kind(&error).to_string(),
+        "INVALID_INPUT"
+    );
     service.close().await;
 }
 

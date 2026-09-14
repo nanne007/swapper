@@ -12,37 +12,35 @@ struct OkxResponse {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OkxSwapData {
-    #[serde(rename = "routerResult")]
     router_result: OkxRouterResult,
     tx: OkxTransaction,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OkxRouterResult {
-    #[serde(rename = "chainIndex")]
     chain_index: Option<String>,
-    #[serde(rename = "fromTokenAmount")]
     from_token_amount: String,
-    #[serde(rename = "toTokenAmount")]
     to_token_amount: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OkxTransaction {
     to: String,
     data: String,
     value: Value,
     from: Option<String>,
-    #[serde(rename = "minReceiveAmount")]
     min_receive_amount: String,
-    #[serde(rename = "signatureData", default)]
+    #[serde(default)]
     signature_data: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct OkxApproval {
-    #[serde(rename = "approveContract")]
     approve_contract: String,
 }
 
@@ -76,11 +74,11 @@ impl Provider for OkxProvider {
         )
     }
 
-    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> Result<Route, Fault> {
+    async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let (Some(api_key), Some(secret_key), Some(passphrase)) =
             (&self.api_key, &self.secret_key, &self.passphrase)
         else {
-            return Err(Fault::with_status("PROVIDER_UNCONFIGURED", 503));
+            anyhow::bail!(ErrorKind::ProviderUnconfigured);
         };
         let mut params = vec![
             ("chainIndex", input.chain_id.to_string()),
@@ -103,13 +101,12 @@ impl Provider for OkxProvider {
             "https://web3.okx.com/api/v6/dex/aggregator/swap",
             &param_refs,
         )?;
-        let parsed =
-            url::Url::parse(&url).map_err(|_| Fault::with_status("UPSTREAM_HTTP_ERROR", 502))?;
+        let parsed = url::Url::parse(&url).context(ErrorKind::UpstreamHttpError)?;
         let query = parsed.query().unwrap_or_default();
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let signing = format!("{timestamp}GET/api/v6/dex/aggregator/swap?{query}");
         let mut mac = Hmac::<Sha256>::new_from_slice(secret_key.as_bytes())
-            .map_err(|_| Fault::with_status("UPSTREAM_AUTH_ERROR", 502))?;
+            .context(ErrorKind::UpstreamAuthError)?;
         mac.update(signing.as_bytes());
         let signature =
             base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
@@ -134,20 +131,20 @@ impl Provider for OkxProvider {
         )
         .await?;
         if response.code != "0" {
-            return Err(Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502));
+            anyhow::bail!(ErrorKind::UpstreamInvalidResponse);
         }
         let data = response
             .data
             .into_iter()
             .next()
-            .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
+            .context(ErrorKind::UpstreamInvalidResponse)?;
         if data
             .router_result
             .chain_index
             .as_deref()
             .is_some_and(|chain_id| chain_id != input.chain_id.to_string())
         {
-            return Err(Fault::with_status("UPSTREAM_CHAIN_MISMATCH", 502));
+            anyhow::bail!(ErrorKind::UpstreamChainMismatch);
         }
         let buy_amount = positive_string(&data.router_result.to_token_amount)?;
         let sell_amount = positive_string(&data.router_result.from_token_amount)?;
@@ -159,9 +156,9 @@ impl Provider for OkxProvider {
                 .tx
                 .signature_data
                 .first()
-                .ok_or_else(|| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
-            let approval: OkxApproval = serde_json::from_str(approval)
-                .map_err(|_| Fault::with_status("UPSTREAM_INVALID_RESPONSE", 502))?;
+                .context(ErrorKind::UpstreamInvalidResponse)?;
+            let approval: OkxApproval =
+                serde_json::from_str(approval).context(ErrorKind::UpstreamInvalidResponse)?;
             parse_address(&approval.approve_contract)?
         };
         normalize_route(

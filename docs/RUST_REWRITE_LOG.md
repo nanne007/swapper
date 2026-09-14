@@ -380,3 +380,164 @@
 - Odos 530 body 为 Cloudflare error 1033；OpenOcean 403 仍与官方定义的 IP/安全策略一致。两者都不是缺 access key，不修改 `requires_access_key=false`，严格 live 门禁保持失败。
 - 所有 live 调用均未签名、未广播、未写链；quote 数字只是 2026-09-13 的瞬时证据。
 - 设置 User-Agent 后最终完整重跑 live suite：11 个测试进程通过、Odos/OpenOcean 2 个失败；Kyber 在 full suite 中继续保持 HTTP `[200, 200]`。最新瞬时 quote 记录在 `docs/VERIFICATION.md`。
+
+## 2026-09-14：alloy-chains catalog 与 Alchemy RPC fallback
+
+### 处理内容
+
+- 将 `alloy-chains 0.2.38` 提升为直接依赖；`ChainSpec` 不再存手写数字 ID，改为保存 `alloy_chains::Chain`，并通过 `NamedChain` 常量构建当前 17 条链。为保持 capabilities API 稳定，产品展示名和 provider path slug 继续保留。
+- 根据 Alchemy 官方 Chain API supported chains 表逐条核对 Ethereum、Optimism、BSC、Unichain、Polygon、Monad、Sonic、HyperEVM、Mantle、Base、Plasma、Arbitrum、Avalanche、Linea、Berachain、Blast、Scroll 的 mainnet endpoint slug。
+- 新增 `ALCHEMY_API_KEY` fallback。解析顺序固定为 `RPC_URL_<chainId>`、Ethereum `ETHEREUM_RPC_URL`、Alchemy；因此用户显式 RPC 永远不会被通用 key 覆盖。
+- 使用 `url::Url` 解析所有 RPC 并要求 HTTP(S) host；Alchemy key 作为 path segment 编码。首轮测试发现尾斜杠会产生空 path segment，修正为 `pop_if_empty()` 后再追加 key，避免双斜杠 URL。
+- 新增 catalog 全链 Alchemy endpoint、key path 编码、无 key 行为和显式 RPC precedence 测试。测试位于 `tests/core.rs`，生产 `src/` 没有新增测试模块。
+- 同步更新 `.env.example`、README、产品、技术、架构、ADR、provider 接入手册、来源与验证记录；没有写入真实 key。
+
+### 验证
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --all-targets --all-features -- -D warnings`：通过，无 warning。
+- `cargo test --all`：API 3/3、core 20/20、provider 15/15 通过；生产 lib/main 0 个测试，1 个 Anvil E2E 和 13 个 live provider test 默认 ignored。
+- `cargo build --release`：通过。
+- `forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过；合约 27/27。
+- `cargo test --test e2e_local -- --ignored --nocapture`：1/1 通过，仅访问隔离本地 Anvil。
+- 未运行真实 Alchemy RPC：本轮没有读取、打印或消耗用户 key；Alchemy 账户权限、配额和每条链的仿真方法兼容性仍是部署环境 gate。
+
+## 2026-09-14：删除 chain catalog，改为 provider 派生运行时链
+
+### 用户纠偏与设计调整
+
+- 用户指出不应维护 `CHAIN_CATALOG`；链 ID 列表应直接来自当前 provider 实例的 `supported_chains()`，RPC 再按 chain ID 注入。
+- 删除 `ChainSpec` 和 `CHAIN_CATALOG`。`ProviderRegistry::new` 不再接收已知链列表或做 catalog 交集，而是直接建立 `chain -> provider IDs`，`chain_ids()` 对索引 key 去重排序。
+- `Services::production` 只创建一次 provider 集合：先构建 registry，再把其 chain ID 并集交给 `configured_chains`。`Config` 不再保存或生成链集合，只保存服务参数、provider credential、显式 RPC map 和 Alchemy key。
+- 公共 `Chain` 删除 provider path slug。Bebop、Kyber 的 chain path 映射移入各自 adapter，符合 provider-specific 属性由 provider 所有的既有边界。
+- `alchemy_rpc_url(chain_id)` 现在公开返回不含 key 的静态 base URL；最终 RPC 解析再用 `url::Url` 把 API key 编码追加。没有官方 Alchemy 映射的新 provider 链仍可通过 `RPC_URL_<chainId>` 工作。
+- capabilities 继续只返回 `rpcConfigured` 布尔值，不返回 RPC URL；新增响应测试明确拒绝出现 Alchemy host、fixture key 或 `rpcUrl` 字段。
+
+### 回归范围
+
+- 重写 chain/config/provider registry 测试，使链集合断言以当前 provider 返回值并集为准，不再复制第二份 17-chain catalog。
+- 自定义 `Services` 同样过滤掉当前 provider 不支持的链；零 provider 时链集合为空，对任意交易 chain ID 返回 `INVALID_INPUT`。
+- 同步更新产品、技术、架构、ADR、provider 接入手册、来源、计划与验证文档，历史处理记录保留以说明纠偏过程。
+
+### 验证
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --all-targets --all-features -- -D warnings`：通过，无 warning。
+- `cargo test --all`：API 3/3、core 20/20、provider 15/15 通过；生产 lib/main 0 个测试，1 个 Anvil E2E 和 13 个 live provider test 默认 ignored。
+- `cargo build --release`：通过。
+- `forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过；合约 27/27。
+- `cargo test --test e2e_local -- --ignored --nocapture`：1/1 通过，仅访问隔离本地 Anvil。
+- `git diff --check`：通过。未执行真实 Alchemy/provider 请求、签名、广播、commit、push 或部署。
+
+## 2026-09-14：`cargo run` 加载可选 `.env`
+
+### 根因与实现
+
+- Cargo 只继承进程环境，不会自行解析仓库根目录的 `.env`；原入口直接调用 `load_config_from_env()`，因此本地文件中的 RPC 和 provider key 不可见。
+- 增加稳定版 `dotenvy 0.15.7`，在读取配置前搜索当前目录及父目录中的 `.env`。已有 shell/部署变量保持优先，不使用 override。
+- 只忽略 `NotFound`；文件存在但不可读或格式错误时启动失败，避免 `.ok()` 静默吞掉配置错误。
+- dotenv 加载发生在 Tokio 多线程 runtime 创建之前；加载完成后才进入原有异步服务启动流程。生产环境仍可只注入进程变量而不提供 `.env`。
+- `.env` 继续由 `.gitignore` 排除。本次没有读取、打印、复制或提交其中的 key。
+
+### 验证
+
+- `cargo check --all-targets`：通过，并将 `dotenvy 0.15.7` 写入 lockfile。
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --all-targets --all-features -- -D warnings`：通过，无 warning。
+- `cargo test --all`：API 3/3、core 20/20、provider 15/15 通过；1 个 Anvil E2E 和 13 个 live provider test 默认 ignored。
+- `cargo build --release`：通过。
+- `PORT=39117 cargo run`：成功监听并通过 Ctrl-C 正常退出；已有 shell 变量覆盖 `.env`。默认端口 3000 当时被其他本地进程占用，未终止或修改该进程。
+- 在独立临时目录创建只含 `HOST=127.0.0.1`、`PORT=39119` 的测试 `.env` 后启动 release binary：成功监听 `39119`，证明文件值已加载；临时文件和目录随后删除。
+- 在另一个无 `.env` 的独立临时目录以 `PORT=39118` 启动 release binary：成功监听并正常退出，证明生产环境不提供文件时仍可只使用进程变量。
+- 使用含未闭合引号的临时 `.env` 启动 release binary：以 `LineParse` 非零退出，证明格式错误不会被吞掉；临时文件和目录随后删除。
+- `forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过；合约 27/27。
+- `cargo test --test e2e_local -- --ignored --nocapture`：1/1 通过，仅使用隔离本地 Anvil。
+- `git diff --check`：通过。未运行 live provider、真实 RPC、签名、广播、commit、push 或部署。
+
+## 2026-09-14：真实 ETH → USDC 重放与双层错误系统
+
+### 授权与处理顺序
+
+用户明确要求重放真实请求、查上游根因，并将 API error 与内部 error 分开。本轮保留已有 staged 修改，在其上修改；使用本地配置的 provider/RPC key，仅查询报价与调用隔离状态仿真，不签名、不广播、不部署、不 commit/push。未改动 `.env`，不记录其内容或 access token。
+
+1. 首先沿 `HTTP/RPC → provider → simulation → competition → API` 检查错误传播。旧 `Fault` 只有 code/status，底层 `map_err` 丢弃原始 cause，仿真又将失败压成字符串，无法从 `RPC_CALL_FAILED` 确定链路。
+2. 先增加安全诊断，再以用户原始无 taker 请求重放；初次 0 家仿真成功，确认 RPC `-38014 insufficient_funds`，以及 Enso/Velora 400、OpenOcean schema 错误、Odos 530。
+3. 对照官方 Enso、OpenOcean、Velora、Geth 文档和实际响应，修复有证据的请求/schema 与 preview funding 问题，不增加万能 fallback、自动重试或外部服务绕过。
+4. 修复后完整重放：0x/Bebop/Enso/Kyber/Velora 5 家真实报价和仿真成功，推荐 Kyber；Odos 530/1033 与 OpenOcean 403 保留为 provider 局部错误。时间、parent block、quote/simulated amounts 和竞赛 ID 落在 `VERIFICATION.md`。
+5. 加确定性回归检查，补全架构/接入/运行文档，再跑完整项目门禁；遵循项目验证技能区分 fixture、本地 Anvil 与生产 direct-preview。
+
+### 实现取舍
+
+- 新增 `src/error.rs` 内部 `Fault`，复用 `anyhow` source/context/backtrace；原始库 error 和上游诊断留在 report，常规 Display/Debug/log 不输出私密内容。
+- 新增 `src/api_error.rs` 公开 `ApiError`，集中封闭 code/status 映射和 Axum rejection；原 `AppError` 删除，业务/provider 不再决定 HTTP status，未知 code 返回 `INTERNAL_ERROR`。不创建自研堆栈系统或 error registry。
+- 复用 `serde_path_to_error` 保留 DTO 字段路径，`thiserror` 包装 HTTP status 和 Alloy 逐笔 simulate call result，`tracing`/`tracing-subscriber` 记录 competition/provider span、安全原因与按需 backtrace。默认不将原始 response/message/data 写日志。
+- `SimResult` 携带内部 diagnostic，build 包装错误时保留 cause；provider timeout 进入普通失败分支并产生 quote，不再因早退从结果消失。
+- preview 根据实际 payload 的 value + gas-limit 预算注资，而非固定 2M gas；余额 probe gasPrice=0。真实 taker 仍不覆盖资金，minimum/reorg/allowlist 不放松。
+- Enso slippage 为字符串，同链 leg chainId 允许省略但明确异链仍拒绝；OpenOcean 从 EIP-1559 `standard.legacyGasPrice` 取 wei；Velora EIP-55，统一保留 preview 地址改用确定性 hash 低 20 bytes。
+- `tests/replay_live.rs` 自动将可选 `.env` 解析到局部 map，进程变量优先；显式开关与 ignored 双保险，至少一家真实仿真成功才通过。单家严格 live smoke 仍用于判断各 adapter，不把整体成功解释为两家失败已解决。
+
+### 最终验证
+
+- Rust fmt、Clippy `--all-targets --all-features -- -D warnings`、release build 通过。
+- `RUST_LIB_BACKTRACE=1 cargo test --all`：API 3/3、core 20/20、provider 17/17、errors 5/5，共 45 项通过；验证 source/downcast、实际 backtrace 捕获、HTTP/JSON/RPC/revert 脱敏与超时 quote。测试全部位于 `tests/`，生产 src 0 个测试。
+- Foundry fmt/build/test 通过，27/27；本地 Anvil E2E 1/1 通过。
+- 显式真实 replay 1/1 通过，5 家 preview 成功、2 家外部失败，详见 `VERIFICATION.md`；没有真实用户钱包执行证据。
+
+## 2026-09-14：删除 Fault，直接使用 anyhow
+
+### 原因与边界
+
+用户指出 `Fault` 在 anyhow 之外重复包装；只读 review 后确认 source/context/backtrace 均可交给库。此次按用户批准方案实施：保留原有 API 行为、typed 分类和脱敏边界，删除通用容器。已有 staged/unstaged 工作全部保留，不调用生产上游、不读取或修改 `.env`、不提交或部署。
+
+### 处理过程
+
+1. 检查现有 Fault、API 映射、仿真/build 传播、日志、main 与测试；先明确 source 保留、API code/status、失败 quote 和无秘密输出等不变量。遵循代码简化技能的行为保持要求与项目质量门。
+2. 对遍布 domain/config/provider/RPC 的签名与重复 map_err 进行机械迁移，并逐项检查编译结果：直接 `anyhow::Result<T>`，使用 `context`/`with_context`、Option context 和 `bail!`；没有新建 Error/Result 别名或 extension trait。
+3. 删除 `Fault` 的 code/report/diagnostic 容器、自定义 Display/Debug/source/context/log 实现；新增仅分类的 `ErrorKind`，通过 anyhow typed context 和 downcast 实现程序判断。build 的外层分类覆盖不再构造嵌套 Fault，原始 cause/backtrace 保持可访问。
+4. `ApiError` 只接收 anyhow 并做封闭映射，52 对公开 code/status 与重构前逐项一致；原始错误文本不参与分类。`simulation` 改为内部类型判断，不再依赖 HTTP/API 类型；`SimResult.diagnostic` 直接持有 anyhow error。
+5. 将安全日志独立为 `diagnostics::log_error`：只读取已知 typed error/metadata 的安全字段，保留原始 HTTP/RPC/revert 详情但不打印任意 context 或原始 report。删除无错误出口的竞赛 worker Result/join 错误分支，timeout 仍产生失败 quote。
+6. main 显式返回 ExitCode，dotenv 加载失败也经过安全 logger。补充真实日志捕获与隔离启动子进程测试；调整的是内部表示断言，没有放松 API/资金/脱敏行为断言。
+7. 更新 README、架构与技术文档、验证记录。旧 Fault/live 记录保留为历史留痕，以本条和技术文档第 9 节为当前设计。
+
+### 验证
+
+- `cargo check --all-targets`、Rust fmt、Clippy `--all-targets --all-features -- -D warnings` 通过。
+- `RUST_LIB_BACKTRACE=1 cargo test --all`：46/46，覆盖 typed context/source/backtrace、外层分类优先、未知字符串拒绝、日志/API/启动脱敏和 timeout quote。
+- `cargo build --release` 通过；Foundry fmt/build/test 通过（27/27）；`cargo test --test e2e_local -- --ignored --nocapture` 本地 Anvil 1/1。
+- `git diff --check` 通过；src/tests 无 Fault 或兼容包装，simulation 无 api_error 依赖；未增加依赖或执行 live 重放。
+
+## 2026-09-14：进一步简化内部日志
+
+用户明确要求暂不考虑安全日志、避免过多复杂度。本条替代上一条的内部日志脱敏设计；公开 API 错误契约不变。
+
+1. 按代码简化技能检查日志调用、错误类型和测试，将改动限定在诊断表示与输出，不改 provider 请求、报价、仿真资金规则或配置。
+2. 删除 `diagnostics` 专用模块、字段白名单、`upstream_reason` 文本分类器、`RpcMethod` 元数据类型和自定义脱敏 Debug。失败边界直接 `tracing::warn!(error = ?error, "操作失败")`，沿用 competition/provider span。
+3. HTTP 错误仅保留 status/body，RPC 方法使用普通 anyhow context；原始 Alloy/revert/serde cause 继续保留。沿用已有 HTTP 响应大小上限，不增加日志框架、配置项或依赖。
+4. `main` 返回 `anyhow::Result<()>`，保留 dotenv 在线程创建前加载和非 NotFound 错误失败退出。内部日志现在允许包含上游详情；不新增请求 header、配置或认证信息日志。
+5. 移除自制日志捕获工具，测试直接检查 anyhow 原因链、typed downcast、backtrace、API 详情隔离和启动失败上下文；所有测试仍在 `tests/`。更新 README、架构和技术方案，保留旧记录作为历史。
+
+验证结果见 [VERIFICATION.md](VERIFICATION.md) 的“简化内部日志”条目。本轮不读取或修改开发者 `.env`，不运行生产 provider/RPC 重放，不提交或部署。
+
+## 2026-09-14：落实 review 第 3 节 A–D，不减少产品能力
+
+### 范围与基线
+
+用户批准的是代码精简，不是删产品功能。保留全部 13 个 provider、provider 派生多链、异步竞赛/polling/access token、重新 build、Router/Holder、balance-slot override、现有排序和费用字段。未实施 review 中需要削减产品能力的其他选项。
+
+修改前将当前 `src/`、`tests/` 复制为临时基线，比较的是本轮开始时的工作区，不把之前的 staged/unstaged 重构计入成果。使用代码简化、工程实施和项目领域/仿真/验证技能：先固定行为边界，再用针对性回归证明修改，最后运行完整质量门；不新增依赖、日志框架、配置层或自动重试。
+
+### 处理过程
+
+1. **A — 生命周期交给 Tokio。** 先添加可控暂停的 build 回归：旧实现 abort 后仍占用唯一名额，后续 build 得到 `BUILD_CAPACITY_EXCEEDED`，测试失败。将竞赛与 build 的原子计数改成独立 Semaphore permit 后，同一测试通过；后续补充普通失败后释放名额的断言。删除只抑制状态更新、并不真正取消请求的 cancel flag；close/TTL 明确只清理快照，进行中的上游请求仍受已有 timeout 约束。
+2. **B — 仿真只走一条失败通道。** 删除 `SimResult.diagnostic`、`Ok(failure(...))` 和失败时复制 approvals/transaction 的代码。失败统一返回 anyhow；用小型 `SimulationFailure` typed context 保留公开的 reverted/unsupported/error 及 reason，原始 Alloy/逐笔 revert cause 继续可 downcast。build 在同一错误链上追加公开分类，不重建错误容器。
+3. **C — 直接复用 Alloy。** 删除 `RpcFactory`、`EvmRpc`、`AlloyRpcFactory`、`AlloyRpc` 和 `BlockInfo` 转发表示。context 与 simulator 共用 `RpcClients` 的 reqwest 连接池和按 URL 复用的 `DynProvider`，直接调用 Alloy typed RPC。保留 ContextProvider/SimulationProvider 业务测试边界；旧 RPC trait fixture 改成本地 JSON-RPC HTTP 服务，让测试实际经过 Alloy 请求编码和响应解码。
+4. **D — 只合并相同知识。** provider 归一化与执行校验共用 expiry/native value/calldata 检查；保留正数解析、provider 金额错误和执行 allowlist 等不同职责。归一化提前应用执行端已有 calldata 长度上限；若同一响应同时存在多个非法字段，首个错误可能随校验顺序改变，合法请求和保护条件不变。删除 `parse_uint_checked`、`format_quantity`、未使用的 `parse_build_request`，将仅测试使用的 Value 解码 helper 移入测试。camelCase 字段交给 Serde，保留特殊 `routerAddr`、默认值、unknown-field 与 Option 规则。
+5. 删除只有 `{}` 的 `config.example.json`，更新 README 和当前架构/技术说明；可由 Git 恢复，不涉及真实配置或数据。旧迁移和 live 记录继续作为历史，不改写为本轮验证。
+
+### 结果与验证口径
+
+生产 Rust 源码由 **4,690 行降到 4,387 行，净减少 303 行（约 6.5%）**；统计包含空行和注释，不包括测试、文档和合约。主要减少来自 RPC（224 → 116 行）、simulation（508 → 415 行）与 competitions（592 → 559 行）。并未为了行数压缩资金逻辑或移除测试。
+
+新增 `tests/concurrency.rs` 与 `tests/simplification.rs`，覆盖取消/失败释放容量、公开 build 分类与原始 cause、真实 Alloy 本地编解码、固定 block/零 gas probe/资金 override 边界、ERC-20 资金/approval 拒绝、共享交易校验与公开 JSON 字段。所有 Rust 测试仍放在 `tests/`。
+
+完整命令与计数见 [VERIFICATION.md](VERIFICATION.md)“不减功能精简 A–D”。本轮没有读取开发者 `.env`、访问生产 provider/RPC、提交、push 或部署；本地 Anvil 证据不代表主网执行或最新供应商可用性。

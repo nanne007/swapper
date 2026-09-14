@@ -3,7 +3,7 @@ mod support;
 use axum::http::{StatusCode, header};
 use metamatch_backend::app::create_app;
 use serde_json::json;
-use support::{config, request};
+use support::{config, config_with, request};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -68,9 +68,12 @@ async fn path_auth_and_router_rejections_are_consistent() {
 
 #[tokio::test]
 async fn api_responses_are_not_cached() {
-    let app = create_app(config());
-    let (status, headers, _) = request(&app.router, "GET", "/v1/capabilities", None, None).await;
+    let app = create_app(config_with(&[("ALCHEMY_API_KEY", "fixture-secret-key")]));
+    let (status, headers, body) = request(&app.router, "GET", "/v1/capabilities", None, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers[header::CACHE_CONTROL], "no-store");
+    assert!(!body.contains("fixture-secret-key"));
+    assert!(!body.contains("alchemy.com"));
+    assert!(!body.contains("rpcUrl"));
     app.close().await;
 }
