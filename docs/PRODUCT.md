@@ -14,7 +14,7 @@ MetaMatch 是一个非托管的 EVM 同链 exact-input swap 报价竞赛服务�
 - provider 集合固定来自 [Matcha Meta DEX Aggregation](https://0x-docs.gitbook.io/matcha-meta/core-concepts/dex-aggregation) 页面，不由部署配置增删。
 - 链集合是上述 provider 支持链的并集；启动时不配置链 allowlist，也不配置 provider enable/disable 列表。
 - 配置不维护 token 白名单、token 列表或 token metadata。API 收到的 token 地址只做地址格式和交易不变量校验，然后透传给 provider。
-- provider 自己实现 `supported_chains()`。需要 access key 的 provider 在没有对应环境变量时返回空集合；不需要 access key 的 provider 不因缺少 key 被排除。配置了 optional key 时仍传给对应 adapter。其余 provider 一律参与竞赛，失败只影响自身报价。
+- provider 自己实现 `supported_chains()`。需要 access key 的 provider 在没有对应 JSON 凭据时返回空集合；不需要 access key 的 provider 不因缺少 key 被排除。配置了 optional key 时仍传给对应 adapter。其余 provider 一律参与竞赛，失败只影响自身报价。
 - 请求带 `chainId`，服务必须拒绝当前 provider 实例支持链并集之外的链；`buyToken` 暂不允许使用 native sentinel，保持现有资金模型简单。
 - `taker` 必填并绑定收款人与返回交易。竞赛仿真始终覆盖本次卖出资产和 native gas 资金，不读取真实钱包余额；缺少 RPC 或执行 Router 返回明确失败。
 
@@ -42,7 +42,7 @@ provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hy
    }
    ```
 
-3. 服务在 `COMPETITION_TIMEOUT_MS` 总预算内完成竞赛并返回 `200`。先并发获取并校验全部 provider route；route 阶段全部结算后获取一次公共 block context，再基于该 context 并发 simulation 所有有效 route。总预算不会按阶段重置；route 阶段若耗尽预算，本轮无法继续完成 context 或 simulation。
+3. 服务在 `competitionTimeoutMs` 总预算内完成竞赛并返回 `200`。先并发获取并校验全部 provider route；route 阶段全部结算后获取一次公共 block context，再基于该 context 并发 simulation 所有有效 route。总预算不会按阶段重置；route 阶段若耗尽预算，本轮无法继续完成 context 或 simulation。
 4. 仿真先覆盖 taker 的卖出资产和 native gas 资金，再执行完整的「买入 token 余额查询 → 必要 approvals → swap → 余额查询」。仅 route 与完整仿真都成功的结果成为 `Quote`，按模拟余额增量 `simulation.boughtAmount` 降序排序；金额相同按 provider ID 排序。Gas 单独展示，未支持的费用保持 `null`，不做伪造价格换算。
 5. 成功结果包含该次仿真对应的 `approvals[]` 和 `transaction`，`simulation.funding` 固定为 `overridden`。用户选择一条并依序执行；发送前自行确认真实余额足够。失败 provider 的诊断信息单独放入 `failures`，不能执行。
 6. API 不返回 `expiresAt`，不维护报价 TTL。每条成功 simulation 返回基础区块 `blockContext.number/hash/timestamp` 和 `simulatedTimestamp`。调用方决定是否重做 simulation 或重新竞赛；后者可能产生新的最低到账，需调用方重新确认，不会自动替换用户已接受的交易。
@@ -66,23 +66,21 @@ provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hy
 
 ## 6. 配置原则
 
-- `COMPETITION_TIMEOUT_MS` 是一次请求的总工作预算（默认 6000，范围 100–30000）；移除旧 `PROVIDER_TIMEOUT_MS`、`QUOTE_TTL_MS`。并发请求容量保留，完成/失败/取消后自动释放，不存储竞赛快照。
+- 应用只读取一个 JSON 文件，默认 `config.json`，可用单个 CLI 参数指定路径；不加载或合并环境变量、`.env`。字段、默认值和迁移表见 [CONFIGURATION.md](CONFIGURATION.md)。
+- `competitionTimeoutMs` 是一次请求总预算，默认 6000，范围 100–30000；`maxActive` 默认 20，结束/失败/取消释放容量。
+- `chains.<id>` 配置 RPC 与部署 Router，不选择链集合；运行时仍取当前 provider 实例支持链的并集。显式 RPC 优先于 `alchemyApiKey` fallback。
+- Router 配置必须在 HTTP 监听前验证成功，包括 RPC chain ID、Router 代码、从 `allowanceHolder()` 读取的 Holder 地址及代码。Holder 不可手工覆盖。没有 Router 的链可启动但不能返回可执行 quote。
+- provider 集合固定，凭据用 `providerKeys` 和 OKX 补充字段；缺失必需字段时不参与，optional key 不改变能力。
+- 可选 `balanceSlots` 保存 chain/token 的 mapping base，不是 token 白名单；缺失时沿用独立 resolver 的只读 access-list 探测。
+- Serde 拒绝未知配置/API 字段和错误类型；范围、token 组合、保留 taker、动态 Router/Holder 与链能力继续显式验证。公开错误不暴露内部解析或 RPC 原因。
 
-- 不配置链集合，也不维护 `CHAIN_CATALOG`：运行时链集合来自当前 provider 实例的 `supported_chains()` 并集。
-- 不配置 provider 集合：代码内 provider 注册表始终创建全部 13 个 provider。
-- 没有 token allowlist；未知 token 由 provider 和链上仿真决定是否可交易。可选 `BALANCE_SLOTS` 提供余额 mapping 基础槽位，独立 resolver 在配置和按 chain/token 建立的进程缓存缺失时，对两个固定假地址并行调用 `eth_createAccessList`。所有 simulation 消费 base 并直接覆盖本次卖出余额；它不读取真实余额，也不改变 provider 参与资格。
-- RPC 是运行基础设施，不是产品能力开关。对并集中的每个 chain ID，解析优先级为 `RPC_URL_<chainId>`、Ethereum 旧别名 `ETHEREUM_RPC_URL`、`ALCHEMY_API_KEY` 自动生成的官方链 endpoint。没有任何来源时链仍保留在 capabilities，但不能仿真；capabilities 只返回是否已配置 RPC，不返回 URL。
-- provider access key 使用各 provider 原生环境变量，不抽象成 credential trait。需要 key 的 provider 缺少任一必需字段时不进入索引；完整名称见 [src/config.rs](../src/config.rs)。
+## 7. MetaRouter 执行边界
 
-## 7. MetaRouter 路由与管理权限
+当前合约没有 admin/owner、pause、白名单、recover 或管理员转移。它通过 Holder 执行并保护本次卖出资产、买入到账 minimum、输入退款和重入边界；无关暂存 token 不属于保护承诺，不可将 Router 当作资产保管地址。精确行为见 [合约文档](../contracts/README.md)。
 
-- Router 维护管理员登记的 target/spender/selector 白名单，默认拒绝。Rust provider rules 预检与链上登记均须通过，不得因上游返回某个目标而自动加白；provider 原生响应校验、完整仿真和金额/到账保护继续执行。白名单只约束外层元组，嵌套 Holder 的内层身份不因此得到验证。
-- 为保护历史暂存资产，Router 拒绝把 ERC20 合约直接作为路由目标，保留目标代码、禁止自调用、Holder 调用形状等结构检查。带 `balanceOf` 接口的 vault/其他入口也可能被拒绝，具体判定见合约文档。
-- 管理员使用现有 `owner` 名称。`recoverToken(token, recipient, amount)` 可提取 Router 持有的 ERC20/native 指定数量，在暂停期间可用；只有当前 owner 有权限，且不能在 swap/recover 回调中重入资金操作。
-- 管理员转移需要两步：原 owner 提名、新 pendingOwner 接受。接受前原 owner 继续负责 pause/recover/白名单管理，接受后权限转交，旧 owner 失权。
-- 管理员可以提取历史余额及误转资产，但 recover 不会从用户钱包拉款。Router 不作为存款保管地址；管理操作由管理员账户直接调用合约，HTTP 后端不新增管理员接口或签名能力。
+Router 地址可按链配置，Holder 在启动时读取。Rust ABI 与当前 receiver/参数顺序同步，API 保持 taker 同时作为 sender/receiver。Rust 同样采用 permissionless 策略，删除 `Rule`、`Provider::rules()` 和 `ROUTE_NOT_ALLOWLISTED`，不增加路由登记配置。provider 原生协议约束、route 不变量与完整仿真仍必须通过，不开放客户端任意 calldata/target 输入。
 
-接口、事件、错误和迁移说明见 [contracts/README.md](../contracts/README.md)。生产运行时的 Router 地址接入、provider 的经审核 rules 与链上登记仍待完成；恢复白名单不代表已完成正式部署。
+公共 context 取得后，每轮只准备一次 parent hash、Router code、Holder allowance 与卖出 token mapping base；准备失败分发给本轮有效 routes，不跨竞赛缓存失败。各 route 的模拟状态和模拟后 hash 检查独立，所有阶段仍受同一个总 deadline 约束。
 
 ## 8. 明确不在 v1
 

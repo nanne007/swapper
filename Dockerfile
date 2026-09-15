@@ -6,7 +6,6 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 WORKDIR /app
-ENV HOST=0.0.0.0 PORT=3000
 RUN apt-get update \
     && apt-get install --no-install-recommends --yes ca-certificates \
     && rm -rf /var/lib/apt/lists/*

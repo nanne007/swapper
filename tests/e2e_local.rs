@@ -3,6 +3,8 @@
 //! Run with `forge build --root contracts` first, then:
 //! `cargo test --test e2e_local -- --ignored --nocapture`.
 
+mod support;
+
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider as AlloyProvider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionInput, TransactionRequest};
@@ -11,18 +13,17 @@ use async_trait::async_trait;
 use metamatch_backend::error::ErrorKind;
 use metamatch_backend::{
     app::create_app_with_services,
-    chains::configured_chain,
+    chains::bootstrap_chains,
     competitions::Services,
     config::{Config, load_config},
-    domain::{Context, HOLDER, Input, Route, Rule, Tx, parse_address},
+    domain::{Context, Input, Route, Tx, parse_address},
     providers::Provider,
-    rpc::ContextProvider,
+    rpc::{ContextProvider, RpcClients},
     simulation::Simulator,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::{
     borrow::Cow,
-    collections::HashMap,
     path::Path,
     process::{Child, Command, Stdio},
     sync::Arc,
@@ -34,7 +35,6 @@ sol! {
     function mint(address to, uint256 amount);
     function approve(address spender, uint256 amount) returns (bool);
     function swap(address sell, address buy, uint256 spend, uint256 output, address recipient, uint256 refund);
-    function setAllowed(address target, address spender, bytes4 selector, bool enabled);
     function balanceOf(address owner) view returns (uint256);
     function allowance(address owner, address spender) view returns (uint256);
 }
@@ -92,18 +92,6 @@ impl AnvilRpc {
             .latest()
             .await
             .map_err(|error| format!("rpc eth_call: {error}"))
-    }
-
-    async fn set_code(&self, address: Address, code: String) -> Result<(), String> {
-        let _: Value = self
-            .provider
-            .raw_request(
-                Cow::Borrowed("anvil_setCode"),
-                (format!("{address:#x}"), code),
-            )
-            .await
-            .map_err(|error| format!("rpc anvil_setCode: {error}"))?;
-        Ok(())
     }
 
     async fn send_transaction(
@@ -188,7 +176,6 @@ impl ContextProvider for AnvilContext {
 struct FixtureProvider {
     router: Address,
     route: Route,
-    rules: Vec<Rule>,
 }
 
 #[async_trait]
@@ -203,14 +190,6 @@ impl Provider for FixtureProvider {
 
     fn supported_chains(&self) -> Vec<u64> {
         vec![1]
-    }
-
-    fn rules(&self, chain_id: u64) -> Vec<Rule> {
-        if chain_id == 1 {
-            self.rules.clone()
-        } else {
-            Vec::new()
-        }
     }
 
     async fn quote(
@@ -354,11 +333,16 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         .into_iter()
         .next()
         .ok_or_else(|| String::from("anvil returned no account"))?;
-    let holder_code = artifact(
-        "MetaRouter.t.sol/MockAllowanceHolder.json",
-        "/deployedBytecode/object",
-    )?;
-    rpc.set_code(HOLDER, holder_code).await?;
+    let holder = deploy(
+        rpc,
+        account,
+        artifact(
+            "MetaRouter.t.sol/MockAllowanceHolder.json",
+            "/bytecode/object",
+        )?,
+        String::new(),
+    )
+    .await?;
     let sell = deploy(
         rpc,
         account,
@@ -384,29 +368,9 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         rpc,
         account,
         artifact("MetaRouter.sol/MetaRouter.json", "/bytecode/object")?,
-        format!("{}{}", address_word(account), address_word(HOLDER)),
+        address_word(holder),
     )
     .await?;
-    send_call(
-        rpc,
-        account,
-        router,
-        hex_bytes(
-            setAllowedCall {
-                target,
-                spender: target,
-                selector: swapCall::SELECTOR.into(),
-                enabled: true,
-            }
-            .abi_encode(),
-        ),
-    )
-    .await?;
-    let rules = vec![Rule {
-        target,
-        spender: target,
-        selector: hex_bytes(swapCall::SELECTOR),
-    }];
     let swap_data = hex_bytes(
         swapCall {
             sell,
@@ -432,13 +396,15 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
     )
     .await?;
 
-    let config: Config = load_config(&HashMap::from([(
-        String::from("ETHEREUM_RPC_URL"),
-        url.to_owned(),
-    )]))
-    .map_err(|error| error.to_string())?;
-    let mut chain = configured_chain(&config, 1);
-    chain.router = Some(router);
+    let config: Config =
+        load_config(&json!({"chains":{"1":{"rpcUrl":url,"router":router}}}).to_string())
+            .map_err(|error| error.to_string())?;
+    let clients = RpcClients::new(Duration::from_millis(config.timeout_ms));
+    let chain = bootstrap_chains(&config, [1], &clients)
+        .await
+        .map_err(|error| format!("{error:#}"))?
+        .remove(0);
+    assert_eq!(chain.router.unwrap().holder, holder);
     let input = Input {
         chain_id: 1,
         sell_token: sell,
@@ -455,7 +421,7 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         spender: target,
         tx: Tx {
             to: target,
-            data: swap_data,
+            data: swap_data.parse().unwrap(),
             value: String::from("0"),
         },
         deadline: None,
@@ -487,16 +453,7 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         .map_err(|error| format!("standalone balance mapping detection: {error:#}"))?;
     for owner in [Address::repeat_byte(0x77), Address::repeat_byte(0x88)] {
         preview_input.taker = owner;
-        let result = simulator
-            .run(metamatch_backend::simulation::SimulationRequest {
-                input: &preview_input,
-                chain: &chain,
-                route: &route,
-                context: &context,
-                rules: &rules,
-                taker: preview_input.taker,
-                min: None,
-            })
+        let result = support::simulate(&simulator, &preview_input, &chain, &route, &context)
             .await
             .map_err(|error| format!("preview discovery: {error:#}"))?;
         if result.simulation.bought_amount != "200" || result.simulation.funding != "overridden" {
@@ -519,11 +476,7 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         }
     }
     let services = Services::new(
-        vec![Arc::new(FixtureProvider {
-            router,
-            route,
-            rules,
-        })],
+        vec![Arc::new(FixtureProvider { router, route })],
         &[chain],
         Arc::new(AnvilContext { rpc: rpc.clone() }),
         Arc::new(Simulator::new(
@@ -535,15 +488,14 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
             )),
         )),
     );
-    let app = create_app_with_services(config, Some(services));
+    let app = create_app_with_services(config, services);
     let listener = TcpListener::bind(("127.0.0.1", 0))
         .await
         .map_err(|error| error.to_string())?;
     let address = listener.local_addr().map_err(|error| error.to_string())?;
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let axum_router = app.router.clone();
     let server = tokio::spawn(async move {
-        axum::serve(listener, axum_router)
+        axum::serve(listener, app)
             .with_graceful_shutdown(async {
                 let _ = shutdown_rx.await;
             })
@@ -578,6 +530,14 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         if quote["approvals"].as_array().map_or(0, Vec::len) != 1 {
             return Err(format!("expected one approval: {quote}"));
         }
+        let approval_data = quote["approvals"][0]["data"]
+            .as_str()
+            .ok_or("approval data missing")?;
+        let approval =
+            approveCall::abi_decode(&hex::decode(&approval_data[2..]).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        assert_eq!(approval.spender, holder);
+        assert_eq!(quote["transaction"]["to"], json!(holder));
         // Execute exactly the payload returned by the first request. No rebuild.
         send_tx(rpc, account, &quote["approvals"][0]).await?;
         send_tx(rpc, account, &quote["transaction"]).await?;

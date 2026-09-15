@@ -9,9 +9,9 @@ Read `AGENTS.md`, `docs/SOURCES.md`, and the current provider implementation bef
 
 ## Implement
 
-1. Keep the `Provider` interface and `Route` model stable. Normalize all amounts as decimal strings and validate with Rust serde/domain checks before any route reaches simulation or build.
+1. Keep the `Provider` interface and `Route` model stable. Normalize all amounts as decimal strings and validate with Rust serde/domain checks before any route reaches simulation or transaction encoding.
 2. Use only fixed, server-configured official URLs. Never accept a user URL, provider target, spender, selector, recipient, or RPC endpoint as configuration at request time.
-3. Send the real taker/recipient required by the stage: preview uses the fixed non-zero preview account; unified live routes use the configured MetaRouter as the provider sender; build re-queries with the real taker binding.
+3. The API requires a real taker. Production competition passes the configured MetaRouter as provider sender; preserve each adapter's recipient binding and simulate the full Holder/Router path with taker as sender/receiver. There is no preview account, direct-provider fallback or second build/requote stage. Fixed fixture addresses belong only in tests.
 4. Enforce sell amount equality, buy amount positivity, native/ERC20 value rules, transaction `to` and calldata shape, expected spender, and any upstream-native deadline. Do not invent a route TTL; preserve provider-specific request/calldata deadlines. Reject unexpected target/spender changes with a safe typed error.
 5. Treat provider state overrides as untrusted off-chain assumptions. Reject non-empty override payloads unless the project has a separately reviewed, fork-verified implementation for that provider and token.
 6. Do not turn missing credentials, rate limits, malformed JSON, timeouts, or unsupported fields into fabricated quotes. Return `unavailable`, `error`, or `unsupported` while allowing other providers to finish.

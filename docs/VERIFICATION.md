@@ -2,7 +2,90 @@
 
 本记录描述当前 Rust runtime、本地验证和未验证生产边界，不表示服务已经过主网审计或可以直接投入真实资金。
 
-本文件按日期保留历史结果；旧章节中的无白名单、不可转移 owner 和无 recover 的状态不代表当前实现。2026-09-15 的合约变更见本文件后续对应章节及 [合约说明](../contracts/README.md)。
+本文件按日期保留历史结果；旧章节中的环境变量、poll/build、管理员或白名单状态不代表当前实现。最近的维护成本清理见下节，Rust 优化与配置迁移记录保留在其后；当前合约以 [合约说明](../contracts/README.md) 为准。
+
+## 非核心维护成本清理（2026-09-15）
+
+本轮仅精简重复模型、应用组装、无调用辅助代码和开发流程；竞赛调度、报价归一化、整数计算、完整仿真及 Solidity 没有改动。没有新增依赖。
+
+| 维护负担 | 已实施处理 |
+| --- | --- |
+| CreateCompetitionRequest 与 Input 重复六个字段，增加字段必须同步转换 | 合并为 Input 的 Serialize/Deserialize；Serde 保留结构与字段范围检查，显式 Input::validate 保留 token/taker 业务错误分类；不再逐字段转换 |
+| App/AppState 各只包一个字段，调用方绕经 app.router/state.competitions | 应用构造直接返回 Axum Router，State 直接共享 Arc<Competitions>；保留 create_app_with_services 测试注入入口 |
+| 旧 preview 常量和转发 helper 残留在生产接口或测试支持代码 | 地址移至 tests/support 的 FIXTURE_TAKER；删除仅供测试调用的 json_request 包装，测试直接使用 json_request_as；删除无调用的 ProviderRegistry::get、fixture_registry、parse_fixture_address，以及纯转发的 fixture_app |
+| 本地、CI、README 和技能分别复制完整质量门，容易漏掉步骤 | scripts/check.sh 成为完整命令序列的唯一来源，CI 与文档共用，包含全部八项检查并遇错停止 |
+| 合约技能仍要求管理员/白名单/recover，provider 技能仍要求 preview/build | 同步当前 permissionless、sender/receiver、净 sold、无关资产边界和单请求流程；修正 README 的二次重建描述，历史证据不删除 |
+
+保留有实际职责的边界：ConfigDocument → Config 承载启动前完整校验；13 个 provider adapter 对应不同上游协议；内部 anyhow/ErrorKind 与公开 ApiError 保持独立。未为减少文件或行数强行合并这些职责。Provider trait、配置格式、HTTP JSON 字段和公开错误码保持不变；Rust 库调用点已迁移到 Input/Router，旧 App/CreateCompetitionRequest/helper 接口不再提供兼容别名。
+
+新增 `input_wire_contract_preserves_defaults_ranges_and_error_kinds`，先在合并前实现上通过，再迁移到 Input 并补 round-trip 断言。覆盖默认滑点、u64/U256 最大值、非法类型/零/非规范金额/未知字段，以及 INVALID_INPUT 与 INVALID_TAKER 的区别。既有测试仅迁移类型、路径和测试常量名，不放宽原有断言。
+
+验证：`CARGO_NET_OFFLINE=true sh scripts/check.sh` 完整通过：Rust fmt/Clippy、**98 个默认 Rust 测试**、release build、Foundry fmt/build/**50 项测试**、显式本地 Anvil **1/1**。默认 Rust 套件仍有 15 项 ignored，其中 Anvil 在最后一步另行运行，13 个 provider live 和 1 个生产 replay 不开启。Foundry nightly 与旧 flag 提示仍存在，未降低警告门禁。另检查 shell 语法与 staged/unstaged 空白差异。
+
+相对本轮开始的暂存基线，生产 Rust 为 **4,334 → 4,294 行，净减少 40 行**（含注释/空行）；维护收益主要是减少字段同步、空包装和过时入口，不声称生产吞吐或延迟提升。执行期间检测到部分 Rust 修改被外部暂存，保留该状态；本 agent 没有 stage/commit，也未读取或修改开发者配置、访问生产 provider/RPC、部署或广播真实网络交易。GitHub 托管 Ubuntu CI、Docker、正式 Holder/provider fork 和生产执行仍未重新验证。
+
+## Rust 精简、共享准备与 permissionless 路由（2026-09-15）
+
+用户确认采用 permissionless 后，删除 Rust `Rule`、`Provider::rules()`、三元组白名单预检及 `ROUTE_NOT_ALLOWLISTED` 分类/映射。没有新增路由登记配置，也未修改 Solidity。完整 Holder/Router 仿真、provider 原生地址/状态覆盖限制、最低到账、固定区块、真实 taker 和单个总 deadline 保留。
+
+- 同一轮在所有 routes 结算、公共 context 获取后，只进行一次模拟前 hash、Router code、Holder allowance 与卖出 token mapping base 准备；独立的准备读取并行进行。不可变准备数据供各 route 消费，每条 route 新建 state overrides/payload，模拟后分别检查 hash。准备错误分发给该轮有效 routes，不进行每 route 重试、不跨轮缓存失败。取消释放 future 与竞赛容量；成功项 latencyMs 仍计入自己的 quote、共享准备和 simulation 耗时，不把准备移出指标。
+- Axum state 改为 Arc，共享 registry/chains；health 不提取 state。HTTP 成功路径直接解码 typed DTO，不构造整棵 Value；保留 HTTP status/body、Serde 路径、语法与结构错误分类及尾随 JSON 拒绝。重复的已知 DTO 字段现在被拒绝，不再经 Value 合并后取最后一个。
+- `Tx.data`/ABI helper 使用 Bytes，provider hex 只解码一次；公开 JSON 的 data 仍是 hex 字符串。RPC 仅发送 input，不再同时复制 data。金额 JSON 仍是规范十进制字符串。
+- 编码只接受不可变 `ValidatedRoute` 和明确的 RouterDeployment，删除 direct-provider fallback、可选 minimum、重复 taker 和 require_unified；编码时保留随时间变化的 deadline 重查。Kyber、1inch 也统一经过 normalize_route，同时保留原生 target/router/from/value 和 state override 约束。
+- minimum 用商/余数分解消除 U256 中间乘法溢出；先以 2^255 和越界 bps 测试复现旧实现输出 0/panic，再修复并用 U512 作测试 oracle。LiquidSwap 用字符串定位/补零消除 10^decimals 溢出，测试 decimals 0/4/6/78/255。
+
+确定性性能证据（`tests/optimization.rs`，不是生产延迟 benchmark）：
+
+| 场景 | 优化前 | 优化后 |
+| --- | --- | --- |
+| 已配置或缓存 mapping base，N 条有效 ERC20 route 的逻辑 RPC | 3 + 5N | 6 + 2N |
+| 上述 N=5 | 28 次 | 16 次 |
+| 一份本地 fixture 的 eth_simulateV1 JSON 请求体，恢复重复 data 字段作对照 | 4,202 bytes | 2,650 bytes |
+
+RPC 计数由实际本地 HTTP JSON-RPC 请求记录断言：1 次 chainId、1 次 gasPrice、1 次 code、1 次 allowance、7 次 block 查询（context、共享 pre-check、5 次独立 post-check）、5 次 simulation。冷 mapping 探测额外增加至多 2 次 access-list 请求。fixture 还覆盖 native、零/不足/充足 allowance 的 approve/reset 序列、每 route 独立 calldata/state overrides、共享准备失败与下一轮重试、模拟后 reorg、Serde 错误隔离和大整数边界。减少请求/字节不等于已经测得生产 p95 或吞吐提升。
+
+最终验证：
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --all-targets --all-features --offline -- -D warnings` | 通过 |
+| `cargo test --all --offline` | 97 个通过，15 个默认 ignored；含 7 个 optimization、20 个 provider、8 个 competition 测试 |
+| `cargo build --release --offline` | 通过 |
+| `forge fmt --root contracts --check` | 通过 |
+| `forge build --root contracts --deny-warnings` | 通过；nightly/旧 flag 提示为工具提示 |
+| `forge test --root contracts` | 50/50 通过 |
+| `cargo test --test e2e_local --offline -- --ignored --nocapture` | 1/1 通过，无路由登记步骤；同一返回 approval/swap 在隔离 Anvil 执行成功 |
+| `git diff --check` / `git diff --cached --check` | 通过 |
+
+相对本轮开始的暂存版本，生产 Rust 源码为 4,295 → 4,334 行（净增 39 行，包含注释/空行）；增加主要来自共享准备边界、不可变 route 类型与严格错误分类。精简收益来自删除旧策略/分支、减少重复校验与序列化，以及上述可计数 RPC/请求体成本，不声称总源码行数减少。
+
+本轮没有新增依赖，没有读取或修改开发者配置，没有访问生产 provider/RPC、部署或广播真实网络交易；本地 Anvil 使用 mock Holder。原有 staged 修改保留，新增工作没有 stage/commit。正式 Holder fork、生产 RPC 对单 input 字段和 eth_simulateV1 的兼容性、实际延迟/吞吐及主网执行仍需独立验收。
+
+## JSON 配置、Router bootstrap 与 API 校验（2026-09-15）
+
+- 应用改为读取当前目录 `config.json` 或单个 CLI 路径参数。移除 dotenvy 和应用环境变量读取；保留诊断及 ignored live 测试开关。模板改为 `config.example.json`，Git/Docker 忽略真实配置，未读取、修改或删除已有 `.env`。
+- Serde typed 配置使用 camelCase、未知字段拒绝、默认值与 try_from 校验；API 使用 NonZeroU64、Address 和正整数金额/滑点反序列化校验。结构/范围/跨字段错误沿用稳定 API envelope，内部原因不进入响应。
+- 配置每链 RPC/Router；启动时验证 chain ID，在同一区块高度验证 Router code、`allowanceHolder()` 与 Holder code。空/短/脏 ABI 返回、revert、保留/自身/无代码地址、错误链、缺 RPC、无支持链和超时均测试失败路径。正式 app 测试确认 bootstrap 完成后 capabilities 才显示已配置 Router，响应不含 RPC URL。
+- Holder 不再硬编码；approval 与 outer exec 使用动态部署。Rust execute ABI 同步当前 receiver/参数顺序，API taker 映射为 sender/receiver。Solidity 源码和 Foundry 测试未改动。
+- 本地 Anvil 部署独立 mock Holder 和当前无管理员 Router（单参数 constructor），从 getter 发现 Holder，完成 HTTP → 固定块仿真 → 返回 approval → 实际本地 swap。断言 approval spender 与 transaction.to 均等于发现的 Holder、到账 200 且 Router allowance 清零。
+- Rust 独立 provider rules 策略未变；生产默认规则仍为空，配置 Router 不会绕过 `ROUTE_NOT_ALLOWLISTED`。是否移除该策略待用户单独确认。
+
+验证命令（离线依赖缓存，RPC 仅限本地 fixture/Anvil）：
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --all-targets --all-features --offline -- -D warnings` | 通过 |
+| `cargo test --all --offline` | 87 个测试通过，15 个默认 ignored（本地 E2E 另行运行）；包含拒绝地址数组和无 0x 前缀的 API 回归 |
+| `cargo build --release --offline` | 通过 |
+| `forge fmt --root contracts --check` | 通过 |
+| `forge build --root contracts --deny-warnings` | 通过；工具提示 nightly 和旧 flag deprecation，不影响结果 |
+| `forge test --root contracts` | 50/50 通过，含 fuzz |
+| `cargo test --test e2e_local --offline -- --ignored --nocapture` | 本地 Anvil 1/1 通过 |
+| `git diff --check` | 通过 |
+
+未运行生产 provider/RPC、真实 Holder fork、主网签名/广播、部署或 Docker 镜像构建。代码存在/getter 正确不等于实现可信或具备全部 simulation 方法；生产部署与路由策略仍需独立验收。迁移操作见 [CONFIGURATION.md](CONFIGURATION.md)。
 
 ## Rust 最小核心验收（2026-09-12）
 
@@ -379,7 +462,7 @@ RPC transport/method 错误继续通过 `map_rpc_error("eth_createAccessList", .
 1. Provider live smoke 已落库，但真实报价、费用、地址和执行可用性仍取决于运行时提供的 key、链专用 token、上游限流和生产 simulate RPC；live smoke 不广播交易，也不等价于主网 fork 或正式执行验证。
 2. 本地 E2E 的 Holder 是测试 mock 写入固定地址，不是从主网读取的正式字节码；正式 Holder 与嵌套路由必须补 fork 验证。
 3. Router 未部署、未外部审计；服务不签署、不广播真实网络交易。本次唯一广播发生在测试进程创建的隔离本地 Anvil，测试完成即关闭。
-4. 真实 provider endpoint 的访问路径已有可显式运行的 smoke test，但每个 key 的权限、实时流动性、生产 RPC、正式 Router 和主网执行仍需逐环境验证；生产 `Chain.router` 仍为 None，正式地址接入未实现；生产 provider 默认 rules 为空，经审核的规则和链上登记仍未完成。不能把 fixture 或 reachability 通过当作 live E2E。
+4. 真实 provider endpoint 的访问路径已有可显式运行的 smoke test，但每个 key 的权限、实时流动性、生产 RPC、正式 Router 和主网执行仍需逐环境验证。Router 已可在 JSON 中配置，Holder 在 bootstrap 读取；Rust 与 Solidity 均 permissionless，不再要求 rules 或链上登记。不能把 fixture、代码/getter 检查或 reachability 通过当作 live E2E。
 5. 跨链、非 EVM、原生币 buy、intent、平台抽成和公网身份系统不属于当前最小核心。
 6. Redis/Postgres、多副本、分布式限流、业务审计库、供应商熔断和 RPC 容灾未实现；当前是有界单进程版本。
 7. Dockerfile 已提供，但 Docker daemon 不可用，镜像 build/run 未验证。
@@ -391,4 +474,4 @@ RPC transport/method 错误继续通过 `map_rpc_error("eth_createAccessList", .
 
 ## 上线前顺序
 
-申请并核对供应商服务权限 → 配置专用 simulate RPC → 正式 Holder/Router/provider fork 测试 → 外部合约审计 → 多签部署、Router 地址接入与两步管理员管理 → 完整监控/访问控制 → 小额人工验收。上线前必须补齐经审核的 provider rules，并由管理员登记匹配的链上三元组；对嵌套 Holder 等通用入口单独核对内层权限。其他链要另立产品范围并补齐费用模型、route 验证和测试。
+申请并核对供应商服务权限 → 配置专用 simulate RPC → 正式 Holder/Router/provider fork 测试 → 外部合约审计 → Router 部署与 JSON 地址接入/Holder bootstrap → 完整监控/访问控制 → 小额人工验收。当前 Router 无管理员，Rust/合约无路由白名单；仍需核对嵌套 Holder 与真实 provider 路径的执行语义，不能靠配置成功代替执行验收。其他链应补齐对应费用模型、RPC 兼容性和 route 测试。

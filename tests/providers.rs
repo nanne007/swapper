@@ -1,15 +1,15 @@
 mod support;
 
 use metamatch_backend::{
-    domain::{NATIVE, PREVIEW_TAKER, parse_address},
+    domain::{NATIVE, parse_address},
     providers::{ProviderRegistry, create_providers},
 };
 use serde_json::json;
-use support::{chain, client, config, config_with, input, provider};
+use support::{FIXTURE_TAKER, chain, client, config, config_with, input, provider};
 
 #[tokio::test]
 async fn zero_ex_uses_response_transaction_target_for_native_sell() {
-    let config = config_with(&[("ZERO_EX_API_KEY", "fixture-key")]);
+    let config = config_with(serde_json::json!({"providerKeys":{"0x":"fixture-key"}}));
     let input = input(1, NATIVE);
     let client = client([json!({
         "liquidityAvailable": true,
@@ -24,7 +24,7 @@ async fn zero_ex_uses_response_transaction_target_for_native_sell() {
     })]);
     let quote_provider = provider(&config, "0x", client.clone());
     let route = quote_provider
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.tx.value, input.sell_amount);
@@ -32,13 +32,119 @@ async fn zero_ex_uses_response_transaction_target_for_native_sell() {
     assert!(
         client.requests.lock().unwrap()[0]
             .url
-            .contains(&format!("taker={PREVIEW_TAKER:#x}"))
+            .contains(&format!("taker={FIXTURE_TAKER:#x}"))
     );
 }
 
 #[tokio::test]
+async fn one_inch_uses_shared_normalization_without_losing_native_constraints() {
+    let config = config_with(json!({"providerKeys":{"1inch":"fixture-key"}}));
+    let input = input(1, NATIVE);
+    let router = "0x111111125421ca6dc452d289314280a0f8842a65";
+    for (target, data, value, overrides, expected) in [
+        (
+            router,
+            "0x12345678",
+            input.sell_amount.as_str(),
+            json!({}),
+            None,
+        ),
+        (
+            router,
+            "0x1234",
+            input.sell_amount.as_str(),
+            json!({}),
+            Some("INVALID_CALLDATA"),
+        ),
+        (
+            router,
+            "0x12345678",
+            "0",
+            json!({}),
+            Some("UNEXPECTED_TRANSACTION_VALUE"),
+        ),
+        (
+            "0x5555555555555555555555555555555555555555",
+            "0x12345678",
+            input.sell_amount.as_str(),
+            json!({}),
+            Some("UNEXPECTED_1INCH_CONTRACT"),
+        ),
+        (
+            router,
+            "0x12345678",
+            input.sell_amount.as_str(),
+            json!({"unsupported":true}),
+            Some("UPSTREAM_STATE_OVERRIDES_UNSUPPORTED"),
+        ),
+    ] {
+        let client = client([
+            json!({"dstAmount":"200","tx":{"to":target,"data":data,"value":value},"stateOverrides":overrides}),
+        ]);
+        let result = provider(&config, "1inch", client)
+            .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
+            .await;
+        match expected {
+            Some(code) => assert_eq!(
+                metamatch_backend::error::kind(&result.unwrap_err()).to_string(),
+                code
+            ),
+            None => {
+                let route = result.unwrap();
+                assert_eq!(route.buy_amount, "200");
+                assert_eq!(route.min_buy_amount, "199");
+                assert_eq!(route.spender, parse_address(router).unwrap());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn kyber_build_uses_shared_normalization_and_preserves_router_consistency() {
+    let config = config();
+    let input = input(1, NATIVE);
+    let router = "0x3333333333333333333333333333333333333333";
+    for (target, data, value, expected) in [
+        (router, "0x12345678", input.sell_amount.as_str(), None),
+        (
+            router,
+            "0x1234",
+            input.sell_amount.as_str(),
+            Some("INVALID_CALLDATA"),
+        ),
+        (
+            router,
+            "0x12345678",
+            "0",
+            Some("UNEXPECTED_TRANSACTION_VALUE"),
+        ),
+        (
+            "0x5555555555555555555555555555555555555555",
+            "0x12345678",
+            input.sell_amount.as_str(),
+            Some("UPSTREAM_ROUTER_CHANGED"),
+        ),
+    ] {
+        let client = client([
+            json!({"code":0,"data":{"routerAddress":target,"data":data,"amountOut":"200","transactionValue":value}}),
+            json!({"code":0,"data":{"routerAddress":router,"routeSummary":{"amountIn":input.sell_amount}}}),
+        ]);
+        let result = provider(&config, "kyber", client)
+            .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
+            .await;
+        match expected {
+            Some(code) => assert_eq!(
+                metamatch_backend::error::kind(&result.unwrap_err()).to_string(),
+                code
+            ),
+            None => assert_eq!(result.unwrap().min_buy_amount, "199"),
+        }
+    }
+}
+
+#[tokio::test]
 async fn zero_ex_keeps_allowance_target_separate_from_entry_point() {
-    let config = config_with(&[("ZERO_EX_API_KEY", "fixture-key")]);
+    let config = config_with(serde_json::json!({"providerKeys":{"0x":"fixture-key"}}));
     let sell_token = parse_address("0x5555555555555555555555555555555555555555").unwrap();
     let input = input(1, sell_token);
     let client = client([json!({
@@ -54,7 +160,7 @@ async fn zero_ex_keeps_allowance_target_separate_from_entry_point() {
         }
     })]);
     let route = provider(&config, "0x", client)
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(
@@ -69,7 +175,7 @@ async fn zero_ex_keeps_allowance_target_separate_from_entry_point() {
 
 #[tokio::test]
 async fn barter_uses_route_then_swap_and_enforces_two_percent_minimum() {
-    let config = config_with(&[("BARTER_API_KEY", "fixture-key")]);
+    let config = config_with(serde_json::json!({"providerKeys":{"barter":"fixture-key"}}));
     let sell_token = parse_address("0x5555555555555555555555555555555555555555").unwrap();
     let mut input = input(1, sell_token);
     input.slippage_bps = 500;
@@ -91,7 +197,7 @@ async fn barter_uses_route_then_swap_and_enforces_two_percent_minimum() {
         }),
     ]);
     let route = provider(&config, "barter", client.clone())
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.provider, "barter");
@@ -112,7 +218,7 @@ async fn bebop_maps_token_amounts_and_expiry() {
     let config = config();
     let input = input(1, NATIVE);
     let sell = format!("{NATIVE:#x}");
-    let buy = format!("{PREVIEW_TAKER:#x}");
+    let buy = format!("{FIXTURE_TAKER:#x}");
     let client = client([json!({
         "status": "SIG_SUCCESS",
         "chainId": 1,
@@ -120,7 +226,7 @@ async fn bebop_maps_token_amounts_and_expiry() {
         "approvalTarget": "0x2222222222222222222222222222222222222222",
         "sellTokens": {sell: {"amount": input.sell_amount}},
         "buyTokens": {buy: {"amount": "200", "minimumAmount": "199"}},
-        "taker": format!("{PREVIEW_TAKER:#x}"),
+        "taker": format!("{FIXTURE_TAKER:#x}"),
         "tx": {
             "to": "0x3333333333333333333333333333333333333333",
             "data": "0x12345678",
@@ -128,7 +234,7 @@ async fn bebop_maps_token_amounts_and_expiry() {
         }
     })]);
     let route = provider(&config, "bebop", client.clone())
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.min_buy_amount, "199");
@@ -146,13 +252,13 @@ async fn bebop_maps_token_amounts_and_expiry() {
     );
     assert!(request.url.contains(&format!(
         "taker_address={}",
-        PREVIEW_TAKER.to_checksum(None)
+        FIXTURE_TAKER.to_checksum(None)
     )));
 }
 
 #[tokio::test]
 async fn enso_rejects_cross_chain_route_legs() {
-    let config = config_with(&[("ENSO_API_KEY", "fixture-key")]);
+    let config = config_with(serde_json::json!({"providerKeys":{"enso":"fixture-key"}}));
     let input = input(1, NATIVE);
     let client = client([json!({
         "amountOut": "200",
@@ -166,7 +272,7 @@ async fn enso_rejects_cross_chain_route_legs() {
         }
     })]);
     let error = provider(&config, "enso", client.clone())
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap_err();
     assert_eq!(
@@ -184,21 +290,21 @@ async fn enso_rejects_cross_chain_route_legs() {
 
 #[tokio::test]
 async fn hyperbloom_requires_matching_chain_and_tokens() {
-    let config = config_with(&[("HYPERBLOOM_API_KEY", "fixture-key")]);
+    let config = config_with(serde_json::json!({"providerKeys":{"hyperBloom":"fixture-key"}}));
     let input = input(999, NATIVE);
     let client = client([json!({
         "chainId": 999,
         "sellAmount": input.sell_amount,
         "buyAmount": "200",
         "sellTokenAddress": format!("{NATIVE:#x}"),
-        "buyTokenAddress": format!("{PREVIEW_TAKER:#x}"),
+        "buyTokenAddress": format!("{FIXTURE_TAKER:#x}"),
         "allowanceTarget": "0x2222222222222222222222222222222222222222",
         "value": input.sell_amount,
         "to": "0x3333333333333333333333333333333333333333",
         "data": "0x12345678"
     })]);
     let route = provider(&config, "hyperBloom", client)
-        .quote(&input, &chain(&config, 999), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 999), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.buy_amount, "200");
@@ -210,7 +316,8 @@ async fn hyperbloom_requires_matching_chain_and_tokens() {
 
 #[tokio::test]
 async fn liquid_swap_reads_erc20_decimals_and_builds_route() {
-    let config = config_with(&[("RPC_URL_999", "https://rpc.example")]);
+    let config =
+        config_with(serde_json::json!({"chains":{"999":{"rpcUrl":"https://rpc.example"}}}));
     let sell_token = parse_address("0x5555555555555555555555555555555555555555").unwrap();
     let input = input(999, sell_token);
     let client = client([
@@ -218,7 +325,7 @@ async fn liquid_swap_reads_erc20_decimals_and_builds_route() {
             "success": true,
             "tokens": {
                 "tokenIn": {"address": format!("{sell_token:#x}")},
-                "tokenOut": {"address": format!("{PREVIEW_TAKER:#x}")}
+                "tokenOut": {"address": format!("{FIXTURE_TAKER:#x}")}
             },
             "execution": {
                 "to": "0x3333333333333333333333333333333333333333",
@@ -233,7 +340,7 @@ async fn liquid_swap_reads_erc20_decimals_and_builds_route() {
         json!({"jsonrpc": "2.0", "id": 1, "result": "0x12"}),
     ]);
     let route = provider(&config, "liquidSwap", client.clone())
-        .quote(&input, &chain(&config, 999), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 999), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.sell_amount, input.sell_amount);
@@ -253,13 +360,51 @@ async fn liquid_swap_reads_erc20_decimals_and_builds_route() {
 async fn liquid_swap_rejects_undocumented_native_sell_marker() {
     let config = config();
     let error = provider(&config, "liquidSwap", client([]))
-        .quote(&input(999, NATIVE), &chain(&config, 999), PREVIEW_TAKER)
+        .quote(&input(999, NATIVE), &chain(&config, 999), FIXTURE_TAKER)
         .await
         .unwrap_err();
     assert_eq!(
         metamatch_backend::error::kind(&error).to_string(),
         "NATIVE_SELL_UNSUPPORTED"
     );
+}
+
+#[tokio::test]
+async fn liquid_swap_decimal_formatting_covers_the_full_uint8_range() {
+    let config = config_with(json!({"chains":{"999":{"rpcUrl":"https://rpc.example"}}}));
+    for (amount, decimals, expected) in [
+        ("1234500", 0, "1234500".to_owned()),
+        ("1234500", 4, "123.45".to_owned()),
+        ("1000000", 6, "1".to_owned()),
+        ("12", 6, "0.000012".to_owned()),
+        ("1", 78, format!("0.{}1", "0".repeat(77))),
+        ("1", 255, format!("0.{}1", "0".repeat(254))),
+    ] {
+        let mut input = input(999, alloy_primitives::Address::repeat_byte(0x55));
+        input.sell_amount = amount.into();
+        let client = client([
+            json!({
+                "success":true,
+                "tokens":{"tokenIn":{"address":input.sell_token},"tokenOut":{"address":input.buy_token}},
+                "execution":{"to":alloy_primitives::Address::repeat_byte(0x33),"calldata":"0x12345678",
+                    "details":{"amountIn":amount,"amountOut":"200","minAmountOut":"199"}}
+            }),
+            json!({"jsonrpc":"2.0","id":1,"result":format!("0x{decimals:x}")}),
+        ]);
+        provider(&config, "liquidSwap", client.clone())
+            .quote(&input, &chain(&config, 999), FIXTURE_TAKER)
+            .await
+            .unwrap();
+        let requests = client.requests.lock().unwrap();
+        let url = url::Url::parse(&requests[1].url).unwrap();
+        assert_eq!(
+            url.query_pairs()
+                .find(|(key, _)| key == "amountIn")
+                .unwrap()
+                .1,
+            expected
+        );
+    }
 }
 
 #[tokio::test]
@@ -281,7 +426,7 @@ async fn odos_assembles_the_quote_path_into_a_route() {
         }),
     ]);
     let route = provider(&config, "odos", client.clone())
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.buy_amount, "200");
@@ -297,7 +442,7 @@ async fn odos_assembles_the_quote_path_into_a_route() {
 
 #[tokio::test]
 async fn ooga_booga_uses_chain_host_and_router_address() {
-    let config = config_with(&[("OOGABOOGA_API_KEY", "fixture-key")]);
+    let config = config_with(serde_json::json!({"providerKeys":{"oogaBooga":"fixture-key"}}));
     let input = input(80094, NATIVE);
     let client = client([json!({
         "status": "Success",
@@ -309,7 +454,7 @@ async fn ooga_booga_uses_chain_host_and_router_address() {
         "calldata": "0x12345678"
     })]);
     let route = provider(&config, "oogaBooga", client.clone())
-        .quote(&input, &chain(&config, 80094), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 80094), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.provider, "oogaBooga");
@@ -322,11 +467,9 @@ async fn ooga_booga_uses_chain_host_and_router_address() {
 
 #[tokio::test]
 async fn okx_v6_uses_upstream_minimum_and_approval_target() {
-    let config = config_with(&[
-        ("OKX_API_KEY", "fixture-key"),
-        ("OKX_SECRET_KEY", "fixture-secret"),
-        ("OKX_API_PASSPHRASE", "fixture-passphrase"),
-    ]);
+    let config = config_with(
+        serde_json::json!({"providerKeys":{"okx":"fixture-key"},"okxSecretKey":"fixture-secret","okxPassphrase":"fixture-passphrase"}),
+    );
     let sell_token = parse_address("0x5555555555555555555555555555555555555555").unwrap();
     let input = input(1, sell_token);
     let client = client([json!({
@@ -347,7 +490,7 @@ async fn okx_v6_uses_upstream_minimum_and_approval_target() {
         }]
     })]);
     let route = provider(&config, "okx", client.clone())
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.buy_amount, "200");
@@ -382,7 +525,7 @@ async fn open_ocean_and_velora_normalize_swap_transactions() {
                 "outAmount": "200",
                 "minOutAmount": "199",
                 "chainId": 10,
-                "from": format!("{PREVIEW_TAKER:#x}"),
+                "from": format!("{FIXTURE_TAKER:#x}"),
                 "to": "0x3333333333333333333333333333333333333333",
                 "value": open_input.sell_amount,
                 "data": "0x12345678"
@@ -392,7 +535,7 @@ async fn open_ocean_and_velora_normalize_swap_transactions() {
     ]);
     assert_eq!(
         provider(&config, "openOcean", open_ocean_client.clone())
-            .quote(&open_input, &chain(&config, 10), PREVIEW_TAKER)
+            .quote(&open_input, &chain(&config, 10), FIXTURE_TAKER)
             .await
             .unwrap()
             .buy_amount,
@@ -425,7 +568,7 @@ async fn open_ocean_and_velora_normalize_swap_transactions() {
     })]);
     assert_eq!(
         provider(&config, "velora", velora_client)
-            .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+            .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
             .await
             .unwrap()
             .min_buy_amount,
@@ -435,7 +578,7 @@ async fn open_ocean_and_velora_normalize_swap_transactions() {
 
 #[tokio::test]
 async fn enso_same_chain_route_can_omit_leg_chain_id() {
-    let config = config_with(&[("ENSO_API_KEY", "fixture-key")]);
+    let config = config_with(serde_json::json!({"providerKeys":{"enso":"fixture-key"}}));
     let input = input(1, NATIVE);
     let client = client([json!({
         "amountOut": "200", "minAmountOut": "199",
@@ -443,7 +586,7 @@ async fn enso_same_chain_route_can_omit_leg_chain_id() {
         "tx": {"to": "0x3333333333333333333333333333333333333333", "data": "0x12345678", "value": input.sell_amount}
     })]);
     let route = provider(&config, "enso", client)
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.buy_amount, "200");
@@ -459,7 +602,7 @@ async fn open_ocean_accepts_eip1559_gas_price_object() {
         json!({"code":200, "data":{"standard":{"legacyGasPrice":123456789, "maxFeePerGas":200000000, "maxPriorityFeePerGas":10000000}}}),
     ]);
     let route = provider(&config, "openOcean", client.clone())
-        .quote(&input, &chain(&config, 1), PREVIEW_TAKER)
+        .quote(&input, &chain(&config, 1), FIXTURE_TAKER)
         .await
         .unwrap();
     assert_eq!(route.buy_amount, "200");
@@ -472,7 +615,7 @@ async fn open_ocean_accepts_eip1559_gas_price_object() {
 
 #[test]
 fn registry_is_key_aware_and_chain_specific() {
-    let config = config_with(&[("ZERO_EX_API_KEY", "test-key")]);
+    let config = config_with(serde_json::json!({"providerKeys":{"0x":"test-key"}}));
     let providers = create_providers(&config, std::sync::Arc::new(support::MockHttp::default()));
     assert_eq!(providers.len(), 13);
     let expected_chain_ids = providers
@@ -509,11 +652,9 @@ fn registry_is_key_aware_and_chain_specific() {
 
 #[test]
 fn required_provider_credentials_gate_capability() {
-    let config = config_with(&[
-        ("OKX_API_KEY", "fixture-key"),
-        ("OKX_SECRET_KEY", "fixture-secret"),
-        ("OKX_API_PASSPHRASE", "fixture-passphrase"),
-    ]);
+    let config = config_with(
+        serde_json::json!({"providerKeys":{"okx":"fixture-key"},"okxSecretKey":"fixture-secret","okxPassphrase":"fixture-passphrase"}),
+    );
     let providers = create_providers(&config, std::sync::Arc::new(support::MockHttp::default()));
     let registry = ProviderRegistry::new(providers);
     assert!(
@@ -559,7 +700,8 @@ fn provider_metadata_exposes_effective_supported_chains() {
     assert!(!odos.requires_access_key());
     assert!(odos.supported_chains().contains(&1));
 
-    let with_optional_key = config_with(&[("BEBOP_API_KEY", "optional-key")]);
+    let with_optional_key =
+        config_with(serde_json::json!({"providerKeys":{"bebop":"optional-key"}}));
     let bebop = create_providers(
         &with_optional_key,
         std::sync::Arc::new(support::MockHttp::default()),

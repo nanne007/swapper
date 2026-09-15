@@ -8,23 +8,18 @@ use alloy_rpc_types_eth::{
 };
 use async_trait::async_trait;
 use metamatch_backend::{
-    app::App,
     chains::configured_chain,
     competitions::Services,
     config::{Config, load_config},
-    domain::{
-        Address as DomainAddress, Chain, Context, Input, NATIVE, PREVIEW_TAKER, Route, Rule,
-        SimulationSuccess, Tx, parse_address,
-    },
+    domain::{Chain, Context, Input, NATIVE, Route, SimulationSuccess, Tx},
     execution::swap_transaction,
     http::{HttpClient, HttpRequest, HttpResponse},
-    providers::{Provider, ProviderRegistry, create_providers},
+    providers::{Provider, create_providers},
     rpc::{ContextProvider, RpcClients},
     simulation::{SimResult, SimulationProvider, SimulationRequest},
 };
 use serde_json::Value;
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -65,15 +60,22 @@ pub fn client(responses: impl IntoIterator<Item = Value>) -> Arc<MockHttp> {
 }
 
 pub fn config() -> Config {
-    load_config(&HashMap::new()).unwrap()
+    load_config("{}").unwrap()
 }
 
-pub fn config_with(entries: &[(&str, &str)]) -> Config {
-    let env = entries
-        .iter()
-        .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
-        .collect();
-    load_config(&env).unwrap()
+pub fn config_with(value: Value) -> Config {
+    load_config(&value.to_string()).unwrap()
+}
+
+pub const FIXTURE_HOLDER: Address = Address::repeat_byte(0x44);
+pub const FIXTURE_TAKER: Address =
+    alloy_primitives::address!("b6d846be89cacda845610ca2b26d0635f1db90af");
+
+pub fn deployment(address: Address) -> metamatch_backend::domain::RouterDeployment {
+    metamatch_backend::domain::RouterDeployment {
+        address,
+        holder: FIXTURE_HOLDER,
+    }
 }
 
 pub fn chain(config: &Config, chain_id: u64) -> Chain {
@@ -84,10 +86,10 @@ pub fn input(chain_id: u64, sell_token: Address) -> Input {
     Input {
         chain_id,
         sell_token,
-        buy_token: PREVIEW_TAKER,
+        buy_token: FIXTURE_TAKER,
         sell_amount: "1000000000000000000".into(),
         slippage_bps: 30,
-        taker: PREVIEW_TAKER,
+        taker: FIXTURE_TAKER,
     }
 }
 
@@ -101,6 +103,8 @@ pub fn provider(config: &Config, id: &str, client: Arc<dyn HttpClient>) -> Arc<d
 #[derive(Clone, Copy, Default)]
 pub struct FixtureRpc {
     pub reorg: bool,
+    pub reorg_after_simulation: bool,
+    pub allowance: U256,
     pub false_approval: bool,
     pub unsupported_simulation: bool,
     pub revert: bool,
@@ -121,13 +125,21 @@ impl Drop for RpcServer {
 impl FixtureRpc {
     pub async fn start(self) -> RpcServer {
         use axum::{Json, Router, routing::post};
-        let requests = Arc::new(Mutex::new(Vec::new()));
+        let requests = Arc::new(Mutex::new(Vec::<Value>::new()));
         let recorded = requests.clone();
         let router = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
-                recorded.lock().unwrap().push(request.clone());
-                async move { Json(self.response(&request)) }
+                let mut fixture = self;
+                {
+                    let mut requests = recorded.lock().unwrap();
+                    fixture.reorg |= self.reorg_after_simulation
+                        && requests
+                            .iter()
+                            .any(|request| request["method"] == "eth_simulateV1");
+                    requests.push(request.clone());
+                }
+                async move { Json(fixture.response(&request)) }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -164,7 +176,7 @@ impl FixtureRpc {
                 json!(word_bytes(if is_balance {
                     U256::from(100)
                 } else {
-                    U256::ZERO
+                    self.allowance
                 }))
             }
             "eth_createAccessList" => {
@@ -192,11 +204,11 @@ impl FixtureRpc {
             let mut balance = block
                 .state_overrides
                 .as_ref()
-                .and_then(|overrides| overrides.get(&PREVIEW_TAKER))
+                .and_then(|overrides| overrides.get(&FIXTURE_TAKER))
                 .and_then(|account| account.balance)
                 .unwrap_or_default();
             for call in &block.calls {
-                if call.from != Some(PREVIEW_TAKER) {
+                if call.from != Some(FIXTURE_TAKER) {
                     continue;
                 }
                 let value = call.value.unwrap_or_default();
@@ -260,10 +272,10 @@ pub fn fixture_route(input: &Input) -> Route {
         buy_amount: "100".into(),
         min_buy_amount: "99".into(),
         sell_amount: input.sell_amount.clone(),
-        spender: PREVIEW_TAKER,
+        spender: FIXTURE_TAKER,
         tx: Tx {
-            to: PREVIEW_TAKER,
-            data: "0x12345678".into(),
+            to: FIXTURE_TAKER,
+            data: "0x12345678".parse().unwrap(),
             value: input.sell_amount.clone(),
         },
         deadline: None,
@@ -286,24 +298,36 @@ pub async fn run_simulation(
     .start()
     .await;
     chain.rpc_url = Some(server.url.clone());
+    chain.router = Some(deployment(alloy_primitives::Address::repeat_byte(0x22)));
     let input = input(1, NATIVE);
     let route = fixture_route(&input);
-    metamatch_backend::simulation::Simulator::new(
+    let simulator = metamatch_backend::simulation::Simulator::new(
         Arc::new(RpcClients::new(Duration::from_secs(1))),
         std::sync::Arc::new(metamatch_backend::balance_slots::BalanceSlots::new(
             Default::default(),
         )),
-    )
-    .run(SimulationRequest {
-        input: &input,
-        chain: &chain,
-        route: &route,
-        context: &fixture_context(),
-        rules: &[],
-        taker: PREVIEW_TAKER,
-        min: None,
-    })
-    .await
+    );
+    simulate(&simulator, &input, &chain, &route, &fixture_context()).await
+}
+
+pub async fn simulate(
+    simulator: &metamatch_backend::simulation::Simulator,
+    input: &Input,
+    chain: &Chain,
+    route: &Route,
+    context: &Context,
+) -> anyhow::Result<SimResult> {
+    let route = metamatch_backend::execution::validate_route(input, route.clone())?;
+    let preparation = simulator.prepare(input, chain, context).await?;
+    simulator
+        .run(SimulationRequest {
+            input,
+            chain,
+            route: &route,
+            context,
+            preparation: &preparation,
+        })
+        .await
 }
 
 pub struct MockContext;
@@ -319,6 +343,21 @@ pub struct MockSimulation;
 
 #[async_trait]
 impl SimulationProvider for MockSimulation {
+    async fn prepare(
+        &self,
+        input: &metamatch_backend::domain::Input,
+        chain: &metamatch_backend::domain::Chain,
+        context: &metamatch_backend::domain::Context,
+    ) -> anyhow::Result<metamatch_backend::simulation::SimulationPreparation> {
+        let _ = (input, context);
+        Ok(metamatch_backend::simulation::SimulationPreparation {
+            router: chain
+                .router
+                .context(metamatch_backend::error::ErrorKind::RouterNotConfigured)?,
+            approvals: Vec::new(),
+            sell_balance_slot: None,
+        })
+    }
     async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         Ok(SimResult {
             simulation: SimulationSuccess {
@@ -332,18 +371,14 @@ impl SimulationProvider for MockSimulation {
             approvals: Vec::new(),
             transaction: swap_transaction(
                 request.input,
-                request.chain,
+                request.preparation.router,
                 request.route,
-                request.rules,
-                request.min,
             )?,
         })
     }
 }
 
-pub struct MockProvider {
-    pub rule: Rule,
-}
+pub struct MockProvider;
 
 #[async_trait]
 impl Provider for MockProvider {
@@ -359,14 +394,6 @@ impl Provider for MockProvider {
         vec![1]
     }
 
-    fn rules(&self, chain_id: u64) -> Vec<Rule> {
-        if chain_id == 1 {
-            vec![self.rule.clone()]
-        } else {
-            Vec::new()
-        }
-    }
-
     async fn quote(&self, input: &Input, _chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         Ok(Route {
             provider: self.id(),
@@ -376,7 +403,7 @@ impl Provider for MockProvider {
             spender: sender,
             tx: Tx {
                 to: sender,
-                data: "0x12345678".into(),
+                data: "0x12345678".parse().unwrap(),
                 value: if input.sell_token == NATIVE {
                     input.sell_amount.clone()
                 } else {
@@ -394,13 +421,10 @@ pub fn competition_services() -> Services {
 }
 
 pub fn competition_services_for(config: &Config, configured_router: Option<Address>) -> Services {
-    let router = configured_router.unwrap_or(PREVIEW_TAKER);
     let mut chain = chain(config, 1);
-    chain.router = configured_router;
+    chain.router = configured_router.map(deployment);
     Services::new(
-        vec![Arc::new(MockProvider {
-            rule: fixture_rule(router),
-        })],
+        vec![Arc::new(MockProvider)],
         &[chain],
         Arc::new(MockContext),
         Arc::new(MockSimulation),
@@ -439,24 +463,4 @@ pub async fn request(
 
 fn word_bytes(value: U256) -> Bytes {
     Bytes::copy_from_slice(&value.to_be_bytes::<32>())
-}
-
-pub fn parse_fixture_address(value: &str) -> DomainAddress {
-    parse_address(value).unwrap()
-}
-
-pub fn fixture_rule(target: Address) -> Rule {
-    Rule {
-        target,
-        spender: target,
-        selector: "0x12345678".into(),
-    }
-}
-
-pub fn fixture_registry(_config: &Config, providers: Vec<Arc<dyn Provider>>) -> ProviderRegistry {
-    ProviderRegistry::new(providers)
-}
-
-pub fn fixture_app(config: Config, services: Services) -> App {
-    metamatch_backend::app::create_app_with_services(config, Some(services))
 }

@@ -1,5 +1,4 @@
 use super::*;
-use alloy_primitives::U256;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -163,16 +162,17 @@ fn positive_value(value: &Value) -> anyhow::Result<String> {
 }
 
 fn raw_to_decimal(value: &str, decimals: u8) -> anyhow::Result<String> {
-    let value = parse_positive(value)?;
+    parse_positive(value)?;
+    let decimals = usize::from(decimals);
     if decimals == 0 {
-        return Ok(value.to_string());
+        return Ok(value.to_owned());
     }
-    let scale = U256::from(10_u64).pow(U256::from(decimals));
-    let whole = value / scale;
-    let remainder = value % scale;
-    if remainder.is_zero() {
-        return Ok(whole.to_string());
-    }
-    let fraction = format!("{:0width$}", remainder, width = decimals as usize);
-    Ok(format!("{whole}.{}", fraction.trim_end_matches('0')))
+    let mut result = if value.len() > decimals {
+        let split = value.len() - decimals;
+        format!("{}.{}", &value[..split], &value[split..])
+    } else {
+        format!("0.{:0>width$}", value, width = decimals)
+    };
+    result.truncate(result.trim_end_matches('0').trim_end_matches('.').len());
+    Ok(result)
 }

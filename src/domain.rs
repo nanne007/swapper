@@ -1,71 +1,88 @@
 use crate::error::ErrorKind;
 pub use alloy_primitives::Address;
-use alloy_primitives::U256;
+use alloy_primitives::{Bytes, U256};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 pub const NATIVE: Address = Address::new([0xee; 20]);
-pub const HOLDER: Address = Address::new([
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x36, 0x84, 0xf2, 0x8c, 0x67, 0x53, 0x8d, 0x4d, 0x07,
-    0x2c, 0x22, 0x73, 0x4,
-]);
-// Low 20 bytes of keccak256("MetaMatch preview account"). Velora rejects 0x...0a11ce.
-// No signing key is held for this reserved account; it is used only with funding overrides.
-pub const PREVIEW_TAKER: Address =
-    alloy_primitives::address!("b6d846be89cacda845610ca2b26d0635f1db90af");
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Input {
+    #[serde(deserialize_with = "deserialize_chain_id")]
     pub chain_id: u64,
+    #[serde(deserialize_with = "deserialize_address")]
     pub sell_token: Address,
+    #[serde(deserialize_with = "deserialize_address")]
     pub buy_token: Address,
+    #[serde(deserialize_with = "deserialize_positive_amount")]
     pub sell_amount: String,
+    #[serde(
+        default = "default_slippage",
+        deserialize_with = "deserialize_slippage"
+    )]
     pub slippage_bps: u64,
+    #[serde(deserialize_with = "deserialize_address")]
     pub taker: Address,
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "camelCase")]
-pub struct CreateCompetitionRequest {
-    pub chain_id: u64,
-    pub sell_token: String,
-    pub buy_token: String,
-    pub sell_amount: String,
-    #[serde(default = "default_slippage")]
-    pub slippage_bps: u64,
-    pub taker: String,
+fn deserialize_chain_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    std::num::NonZeroU64::deserialize(deserializer).map(std::num::NonZeroU64::get)
+}
+
+fn deserialize_address<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Address, D::Error> {
+    // Alloy also accepts byte arrays and unprefixed hex; the API requires address strings.
+    let value = String::deserialize(deserializer)?;
+    parse_address(&value).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_positive_amount<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    parse_positive(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
+
+fn deserialize_slippage<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if !(1..=500).contains(&value) {
+        return Err(serde::de::Error::custom(
+            "slippageBps must be between 1 and 500",
+        ));
+    }
+    Ok(value)
 }
 
 fn default_slippage() -> u64 {
     30
 }
 
-pub fn validate_input(request: CreateCompetitionRequest) -> anyhow::Result<Input> {
-    let sell_token = parse_address(&request.sell_token)?;
-    let buy_token = parse_address(&request.buy_token)?;
-    if sell_token == buy_token || buy_token == NATIVE {
-        anyhow::bail!(ErrorKind::InvalidInput);
+impl Input {
+    /// Cross-field checks stay explicit so reserved takers retain their API error kind.
+    /// Field syntax and ranges are checked by Serde at the JSON boundary.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.sell_token == self.buy_token
+            || self.buy_token == NATIVE
+            || self.sell_token == Address::ZERO
+            || self.buy_token == Address::ZERO
+        {
+            anyhow::bail!(ErrorKind::InvalidInput);
+        }
+        if is_reserved_address(self.taker)
+            || U256::from_be_slice(self.taker.as_slice()) <= U256::from(0xffff_u64)
+        {
+            anyhow::bail!(ErrorKind::InvalidTaker);
+        }
+        Ok(())
     }
-    if !(1..=500).contains(&request.slippage_bps) {
-        anyhow::bail!(ErrorKind::InvalidInput);
-    }
-    let sell_amount = parse_positive(&request.sell_amount)?.to_string();
-    let taker = parse_address(&request.taker)?;
-    if is_reserved_address(taker) || U256::from_be_slice(taker.as_slice()) <= U256::from(0xffff_u64)
-    {
-        anyhow::bail!(ErrorKind::InvalidTaker);
-    }
-    Ok(Input {
-        chain_id: request.chain_id,
-        sell_token,
-        buy_token,
-        sell_amount,
-        slippage_bps: request.slippage_bps,
-        taker,
-    })
 }
 
 pub fn parse_address(value: &str) -> anyhow::Result<Address> {
@@ -75,12 +92,13 @@ pub fn parse_address(value: &str) -> anyhow::Result<Address> {
     Address::from_str(value).context(ErrorKind::InvalidInput)
 }
 
-pub fn parse_hex(value: &str) -> anyhow::Result<String> {
+pub fn parse_hex(value: &str) -> anyhow::Result<Bytes> {
     if !value.starts_with("0x") || value.len() < 4 || !value.len().is_multiple_of(2) {
         anyhow::bail!(ErrorKind::InvalidInput);
     }
-    hex::decode(&value[2..]).context(ErrorKind::InvalidInput)?;
-    Ok(value.to_ascii_lowercase())
+    hex::decode(&value[2..])
+        .map(Bytes::from)
+        .context(ErrorKind::InvalidInput)
 }
 
 pub fn parse_hex_quantity(value: &str) -> anyhow::Result<U256> {
@@ -110,14 +128,7 @@ pub fn parse_positive(value: &str) -> anyhow::Result<U256> {
 }
 
 pub fn is_reserved_address(value: Address) -> bool {
-    value == HOLDER || value == NATIVE || value == Address::ZERO
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Rule {
-    pub target: Address,
-    pub spender: Address,
-    pub selector: String,
+    value == NATIVE || value == Address::ZERO
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +136,14 @@ pub struct Chain {
     pub id: u64,
     pub name: String,
     pub rpc_url: Option<String>,
-    pub router: Option<Address>,
+    pub router: Option<RouterDeployment>,
+}
+
+/// A configured router is executable only together with the Holder read during bootstrap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterDeployment {
+    pub address: Address,
+    pub holder: Address,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -140,7 +158,7 @@ pub struct Context {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
     pub to: Address,
-    pub data: String,
+    pub data: Bytes,
     pub value: String,
 }
 
@@ -198,7 +216,14 @@ pub struct Quote {
 
 pub fn minimum(amount: &str, bps: u64) -> anyhow::Result<String> {
     let amount = parse_uint(amount)?;
-    Ok((amount * U256::from(10_000 - bps) / U256::from(10_000)).to_string())
+    let factor = U256::from(
+        10_000_u64
+            .checked_sub(bps)
+            .context(ErrorKind::InvalidInput)?,
+    );
+    let scale = U256::from(10_000);
+    // Keep floor(amount * factor / scale) without overflowing the intermediate product.
+    Ok(((amount / scale) * factor + (amount % scale) * factor / scale).to_string())
 }
 
 pub fn now_ms() -> u64 {

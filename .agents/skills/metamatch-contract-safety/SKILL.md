@@ -1,6 +1,6 @@
 ---
 name: metamatch-contract-safety
-description: 'Implement or review MetaMatch Solidity execution and AllowanceHolder integration. Use when changing contracts/src/MetaRouter.sol, Foundry tests, route allowlists, nested Holder calldata, recovery, ownership, approvals, refunds, minimum output, or reentrancy.'
+description: 'Implement or review MetaMatch Solidity execution and AllowanceHolder integration. Use when changing contracts/src/MetaRouter.sol, Foundry tests, permissionless routes, nested Holder calldata, receiver, approvals, refunds, minimum output, or reentrancy.'
 ---
 
 # MetaMatch contract safety
@@ -9,18 +9,17 @@ Read `AGENTS.md`, `docs/TECHNICAL.md`, `docs/VERIFICATION.md`, `contracts/README
 
 ## Invariants
 
-- Only the configured AllowanceHolder may call `MetaRouter.execute`; derive the real taker only from the Holder's verified forwarded-sender suffix.
-- Routes must match the owner-managed target/spender/selector allowlist and the off-chain provider rules. Default deny; do not auto-register response targets. Require valid contract targets/spenders, reject Router/self and direct ERC20 targets, and preserve the nested Holder `(Holder, Holder, exec)` call shape. Inner Holder targets/operators are not allowlisted; do not claim approved-provider identity guarantees.
+- Only the configured AllowanceHolder may call `MetaRouter.execute`; derive the real sender only from its forwarded-sender suffix, preserving calldata-length and sender checks. The Holder implementation must be trusted independently.
+- Rust and Solidity are permissionless: no admin, pause, allowlist, recovery, ownership transfer, or Rule. Do not reintroduce them implicitly. Preserve the current contract's target/spender checks, including code presence, Router self-call rejection, and exclusion of the selected sell/buy tokens as target. Other ERC20 targets and arbitrary nested Holder shapes are not categorically rejected. Neither outer nor inner route identity is audited by the Router.
 - Pull exactly the requested sell amount. Require native `msg.value`/call value rules, reject input-tax shortfalls, and clear ERC20 allowance to zero after the external call.
-- Measure the taker's buy-token balance delta and enforce `minBuyAmount`; do not use the taker's historical balance to satisfy the current trade.
-- Refund only the current transaction's native and token deltas. Preserve historical balances and reject false ERC20 return values, overspending, and reentrancy.
-- `recoverToken` is current-owner-only, supports ERC20/native amounts and remains available while paused. It must share the swap reentrancy lock; no callback may recover assets during a swap or start a swap during recovery. Recovery moves only Router-held balances, never wallet balances via Holder.
-- `transferOwnership` nominates a valid pending owner; only that nominee can `acceptOwnership`. Old-owner rights end on acceptance. Preserve events and rejection of zero/Router/Holder/native-sentinel nominees.
-- Do not add arbitrary delegatecall/admin-call helpers or user-controlled RPC/slot behavior. For 0x routes approve Holder rather than Settler. Idle assets are recoverable by the owner; document that authority explicitly.
+- Measure the receiver's final buy-token balance delta after transfers and refund callbacks and enforce `minBuyAmount`. Do not count its historical balance toward output or substitute sender's balance when receiver differs.
+- Refund current sell-token/native deltas to sender; transfer the Router's buy-token delta to receiver. Preserve the selected assets' baseline checks, false/malformed ERC20 return rejection, input limit and reentrancy protection. Unrelated idle assets are explicitly outside the guarantees and have no recovery promise.
+- `Executed.sold` deducts only same-asset refunds made through Router, floored at zero; direct provider refunds to sender and gas are excluded. Partial or zero net input consumption remains allowed when minimum output and other checks pass.
+- Keep IERC20/abi.encodeCall with the existing low-level return-value handling. Do not add arbitrary delegatecall/admin-call helpers or client-controlled RPC/slot inputs. For 0x nested routes approve Holder rather than Settler. Exact ABI, receiver exclusions and accounting examples live in `contracts/README.md`; update that source alongside behavior changes instead of copying the ABI here.
 
 ## Workflow
 
-1. Characterize the behavior with a focused Foundry test, including adversarial caller, allowlist registration/revocation and ownership permissions, value, token return, third-token transfer/approve, balance, ownership, and swap/recovery callback cases.
+1. Characterize the behavior with a focused Foundry test, including adversarial Holder/sender, receiver, target/spender, native value, token returns, minimum output, refunds and callback cases. Preserve the third-token boundary test and absence of removed management interfaces.
 2. Make the smallest contract change. Keep the compiler version and Foundry profile aligned with `contracts/foundry.toml`.
 3. Add fuzz coverage when an amount, balance, refund, or calldata-length invariant has a meaningful numeric domain.
 4. Run `forge fmt --root contracts`, `forge build --root contracts --deny-warnings`, and `forge test --root contracts`. Then run `cargo test --test e2e_local -- --ignored --nocapture` to verify the Rust envelope still matches the ABI.

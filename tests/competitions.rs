@@ -4,7 +4,7 @@ use alloy_primitives::Address;
 use async_trait::async_trait;
 use metamatch_backend::{
     competitions::{Competitions, FailureStatus, Services},
-    domain::{Chain, Context, Input, NATIVE, Route, Rule, SimulationSuccess},
+    domain::{Chain, Context, Input, NATIVE, Route, SimulationSuccess},
     error::{ErrorKind, kind},
     providers::Provider,
     rpc::ContextProvider,
@@ -44,12 +44,9 @@ impl Provider for Competitor {
     fn supported_chains(&self) -> Vec<u64> {
         vec![1]
     }
-    fn rules(&self, _: u64) -> Vec<Rule> {
-        vec![support::fixture_rule(Address::repeat_byte(0x22))]
-    }
     async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route> {
         let _in_flight = InFlight(self.dropped.clone());
-        assert_eq!(sender, chain.router.unwrap());
+        assert_eq!(sender, chain.router.unwrap().address);
         assert_eq!(input.taker, support::input(1, NATIVE).taker);
         sleep(Duration::from_millis(self.delay_ms)).await;
         if self.error {
@@ -68,7 +65,7 @@ impl Provider for Competitor {
             spender: sender,
             tx: metamatch_backend::domain::Tx {
                 to: sender,
-                data: "0x12345678".into(),
+                data: "0x12345678".parse().unwrap(),
                 value: input.sell_amount.clone(),
             },
             deadline: None,
@@ -102,9 +99,17 @@ struct SimulationFixture {
 }
 #[async_trait]
 impl SimulationProvider for SimulationFixture {
+    async fn prepare(
+        &self,
+        input: &metamatch_backend::domain::Input,
+        chain: &metamatch_backend::domain::Chain,
+        context: &metamatch_backend::domain::Context,
+    ) -> anyhow::Result<metamatch_backend::simulation::SimulationPreparation> {
+        sleep(Duration::from_millis(7)).await;
+        support::MockSimulation.prepare(input, chain, context).await
+    }
     async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         let _in_flight = InFlight(self.dropped.clone());
-        assert_eq!(request.taker, request.input.taker);
         assert_eq!(
             request.context.block_context(),
             support::fixture_context().block_context()
@@ -147,9 +152,9 @@ fn service(
     Arc<AtomicUsize>,
     Arc<AtomicUsize>,
 ) {
-    let config = support::config_with(&[("COMPETITION_TIMEOUT_MS", "100")]);
+    let config = support::config_with(serde_json::json!({"competitionTimeoutMs":100}));
     let mut chain = support::chain(&config, 1);
-    chain.router = Some(Address::repeat_byte(0x22));
+    chain.router = Some(support::deployment(Address::repeat_byte(0x22)));
     let quote_drops = Arc::new(AtomicUsize::new(0));
     let simulation_drops = Arc::new(AtomicUsize::new(0));
     let context_calls = Arc::new(AtomicUsize::new(0));
@@ -179,7 +184,7 @@ fn service(
         }),
     );
     (
-        Competitions::new(config, Some(services)),
+        Competitions::new(config, services),
         quote_drops,
         simulation_drops,
         context_calls,
@@ -213,6 +218,12 @@ async fn ranks_simulated_balance_delta_as_integers_and_finishes_early() {
         100
     );
     assert_eq!(context_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        result.quotes[0].latency_ms, 27,
+        "quote + shared preparation + simulation"
+    );
+    assert_eq!(result.quotes[1].latency_ms, 22);
+    assert_eq!(result.quotes[2].latency_ms, 17);
 }
 
 #[tokio::test(start_paused = true)]
@@ -315,7 +326,7 @@ async fn missing_router_and_context_failure_never_return_executable_transactions
         let config = support::config();
         let mut services = support::competition_services_for(&config, router);
         services.context = Arc::new(FailedContext);
-        let result = Competitions::new(config, Some(services))
+        let result = Competitions::new(config, services)
             .create(support::input(1, NATIVE))
             .await
             .unwrap();
@@ -326,6 +337,68 @@ async fn missing_router_and_context_failure_never_return_executable_transactions
 }
 
 #[tokio::test(start_paused = true)]
+async fn shared_preparation_consumes_the_same_absolute_deadline() {
+    struct SlowPreparation;
+    #[async_trait]
+    impl SimulationProvider for SlowPreparation {
+        async fn prepare(
+            &self,
+            input: &Input,
+            chain: &Chain,
+            context: &Context,
+        ) -> anyhow::Result<metamatch_backend::simulation::SimulationPreparation> {
+            sleep(Duration::from_millis(80)).await;
+            support::MockSimulation.prepare(input, chain, context).await
+        }
+        async fn run(&self, _: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
+            panic!("preparation used up the remaining deadline");
+        }
+    }
+    let config = support::config_with(serde_json::json!({"competitionTimeoutMs":100}));
+    let mut chain = support::chain(&config, 1);
+    chain.router = Some(support::deployment(Address::repeat_byte(0x22)));
+    let drops = Arc::new(AtomicUsize::new(0));
+    let services = Services::new(
+        vec![
+            Arc::new(Competitor {
+                id: "a",
+                delay_ms: 30,
+                error: false,
+                dropped: drops.clone(),
+            }),
+            Arc::new(Competitor {
+                id: "b",
+                delay_ms: 20,
+                error: false,
+                dropped: drops.clone(),
+            }),
+        ],
+        &[chain],
+        Arc::new(DelayedContext {
+            delay_ms: 0,
+            completed_routes: drops,
+            expected_routes: 2,
+            calls: Arc::new(AtomicUsize::new(0)),
+        }),
+        Arc::new(SlowPreparation),
+    );
+    let started = Instant::now();
+    let result = Competitions::new(config, services)
+        .create(support::input(1, NATIVE))
+        .await
+        .unwrap();
+    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    assert!(result.quotes.is_empty());
+    assert_eq!(result.failures.len(), 2);
+    assert!(
+        result
+            .failures
+            .iter()
+            .all(|failure| failure.error == "UPSTREAM_TIMEOUT")
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn invalid_output_cannot_become_executable() {
     let config = support::config();
     let mut services = support::competition_services_for(&config, Some(Address::repeat_byte(0x22)));
@@ -333,7 +406,7 @@ async fn invalid_output_cannot_become_executable() {
         dropped: Arc::new(AtomicUsize::new(0)),
         below_minimum: true,
     });
-    let result = Competitions::new(config, Some(services))
+    let result = Competitions::new(config, services)
         .create(support::input(1, NATIVE))
         .await
         .unwrap();
@@ -342,22 +415,24 @@ async fn invalid_output_cannot_become_executable() {
 }
 
 #[tokio::test]
-async fn taker_cannot_be_the_router_and_route_must_be_allowlisted() {
+async fn taker_cannot_be_router_or_holder_but_routes_need_no_allowlist() {
     let config = support::config();
     let router = Address::repeat_byte(0x22);
     let service = Competitions::new(
         config.clone(),
-        Some(support::competition_services_for(&config, Some(router))),
+        support::competition_services_for(&config, Some(router)),
     );
     let mut input = support::input(1, NATIVE);
-    input.taker = router;
-    assert_eq!(
-        kind(&service.create(input).await.unwrap_err()),
-        ErrorKind::InvalidTaker
-    );
-    struct Unallowlisted(support::MockProvider);
+    for reserved in [router, support::FIXTURE_HOLDER] {
+        input.taker = reserved;
+        assert_eq!(
+            kind(&service.create(input.clone()).await.unwrap_err()),
+            ErrorKind::InvalidTaker
+        );
+    }
+    struct Permissionless(support::MockProvider);
     #[async_trait]
-    impl Provider for Unallowlisted {
+    impl Provider for Permissionless {
         fn id(&self) -> &'static str {
             "kyber"
         }
@@ -377,19 +452,17 @@ async fn taker_cannot_be_the_router_and_route_must_be_allowlisted() {
         }
     }
     let mut chain = support::chain(&config, 1);
-    chain.router = Some(router);
+    chain.router = Some(support::deployment(router));
     let services = Services::new(
-        vec![Arc::new(Unallowlisted(support::MockProvider {
-            rule: support::fixture_rule(router),
-        }))],
+        vec![Arc::new(Permissionless(support::MockProvider))],
         &[chain],
         Arc::new(support::MockContext),
         Arc::new(support::MockSimulation),
     );
-    let result = Competitions::new(config, Some(services))
+    let result = Competitions::new(config, services)
         .create(support::input(1, NATIVE))
         .await
         .unwrap();
-    assert_eq!(result.failures[0].error, "ROUTE_NOT_ALLOWLISTED");
-    assert!(result.quotes.is_empty());
+    assert!(result.failures.is_empty());
+    assert_eq!(result.quotes.len(), 1);
 }

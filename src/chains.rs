@@ -1,6 +1,98 @@
-use crate::{config::Config, domain::Chain};
+use crate::{
+    config::Config,
+    domain::{Chain, RouterDeployment, is_reserved_address},
+    error::ErrorKind,
+    execution::allowanceHolderCall,
+    rpc::{RpcClients, map_rpc_error},
+};
 use alloy_chains::{Chain as AlloyChain, NamedChain};
+use alloy_provider::Provider;
+use alloy_rpc_types_eth::TransactionRequest;
+use alloy_sol_types::SolCall;
+use anyhow::Context as _;
+use std::time::Duration;
 use url::Url;
+
+/// Resolve deployment state once before accepting requests. Never fall back to a fixed Holder.
+pub async fn bootstrap_chains(
+    config: &Config,
+    chain_ids: impl IntoIterator<Item = u64>,
+    clients: &RpcClients,
+) -> anyhow::Result<Vec<Chain>> {
+    let mut chains = configured_chains(config, chain_ids);
+    for (&id, settings) in &config.chains {
+        let Some(address) = settings.router else {
+            continue;
+        };
+        let chain = chains
+            .iter_mut()
+            .find(|chain| chain.id == id)
+            .with_context(|| format!("router configured for unsupported chain {id}"))
+            .context(ErrorKind::InvalidConfig)?;
+        let deployment = tokio::time::timeout(Duration::from_millis(config.timeout_ms), async {
+            let rpc = clients.get(
+                chain
+                    .rpc_url
+                    .as_deref()
+                    .context(ErrorKind::RpcNotConfigured)?,
+            )?;
+            if rpc
+                .get_chain_id()
+                .await
+                .map_err(|e| map_rpc_error("eth_chainId", e))?
+                != id
+            {
+                anyhow::bail!(ErrorKind::RpcChainMismatch);
+            }
+            let block = rpc
+                .get_block_number()
+                .await
+                .map_err(|e| map_rpc_error("eth_blockNumber", e))?;
+            if rpc
+                .get_code_at(address)
+                .block_id(block.into())
+                .await
+                .map_err(|e| map_rpc_error("eth_getCode(router)", e))?
+                .is_empty()
+            {
+                anyhow::bail!("configured router has no code");
+            }
+            let data = rpc
+                .call(
+                    TransactionRequest::default()
+                        .to(address)
+                        .input(allowanceHolderCall {}.abi_encode().into()),
+                )
+                .block(block.into())
+                .await
+                .map_err(|e| map_rpc_error("allowanceHolder()", e))?;
+            anyhow::ensure!(data.len() == 32, "invalid allowanceHolder() return length");
+            let holder = allowanceHolderCall::abi_decode_returns_validate(&data)
+                .context("decode allowanceHolder()")?;
+            anyhow::ensure!(
+                !is_reserved_address(holder) && holder != address,
+                "invalid allowanceHolder() address"
+            );
+            if rpc
+                .get_code_at(holder)
+                .block_id(block.into())
+                .await
+                .map_err(|e| map_rpc_error("eth_getCode(holder)", e))?
+                .is_empty()
+            {
+                anyhow::bail!("router Holder has no code");
+            }
+            Ok::<_, anyhow::Error>(RouterDeployment { address, holder })
+        })
+        .await
+        .context(ErrorKind::UpstreamTimeout)
+        .and_then(|result| result)
+        .with_context(|| format!("bootstrap router for chain {id}"))
+        .context(ErrorKind::InvalidConfig)?;
+        chain.router = Some(deployment);
+    }
+    Ok(chains)
+}
 
 /// Builds runtime chain state from the current providers' supported chain IDs.
 pub fn configured_chains(config: &Config, chain_ids: impl IntoIterator<Item = u64>) -> Vec<Chain> {

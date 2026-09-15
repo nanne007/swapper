@@ -7,17 +7,22 @@ use metamatch_backend::{
     chains::{alchemy_rpc_url, configured_chain, configured_chains},
     competitions::{Competitions, Services},
     config::load_config,
-    domain::{
-        Input, NATIVE, PREVIEW_TAKER, Route, Rule, Tx, minimum, parse_address, parse_positive,
-        parse_uint, validate_input,
-    },
+    domain::{Input, NATIVE, Route, Tx, minimum, parse_address, parse_positive, parse_uint},
     execution::{swap_transaction, validate_route},
-    http::{HttpClient, HttpRequest, HttpResponse, json_request, url_with_params},
+    http::{HttpClient, HttpRequest, HttpResponse, json_request_as, url_with_params},
     rpc::{ContextProvider, ContextSource, RpcClients},
 };
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use support::{FixtureRpc, chain, config, fixture_context, input, request, run_simulation};
+use support::{
+    FIXTURE_TAKER, FixtureRpc, chain, config, fixture_context, input, request, run_simulation,
+};
+
+fn parse_input(value: Value) -> anyhow::Result<Input> {
+    let input: Input = serde_json::from_value(value)?;
+    input.validate()?;
+    Ok(input)
+}
 
 #[test]
 fn integer_math_never_uses_floating_point() {
@@ -42,15 +47,12 @@ fn integer_math_never_uses_floating_point() {
 
 #[test]
 fn input_rejects_unknown_fields_and_reserved_takers() {
-    fn parse_input(value: Value) -> anyhow::Result<Input> {
-        validate_input(serde_json::from_value(value)?)
-    }
     let base = json!({
         "chainId": 1,
         "sellToken": format!("{NATIVE:#x}"),
         "buyToken": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
         "sellAmount": "1",
-        "taker": format!("{PREVIEW_TAKER:#x}")
+        "taker": format!("{FIXTURE_TAKER:#x}")
     });
     assert!(parse_input(base.clone()).is_ok());
     assert!(parse_input(json!({"x": 1})).is_err());
@@ -64,6 +66,54 @@ fn input_rejects_unknown_fields_and_reserved_takers() {
         }))
         .is_err()
     );
+}
+
+#[test]
+fn input_wire_contract_preserves_defaults_ranges_and_error_kinds() {
+    let base = json!({
+        "chainId": u64::MAX,
+        "sellToken": format!("{NATIVE:#x}"),
+        "buyToken": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
+        "sellAmount": "115792089237316195423570985008687907853269984665640564039457584007913129639935",
+        "taker": format!("{FIXTURE_TAKER:#x}")
+    });
+    let parsed = parse_input(base.clone()).unwrap();
+    assert_eq!(parsed.chain_id, u64::MAX);
+    assert_eq!(parsed.slippage_bps, 30);
+    let mut expected = base.clone();
+    expected["slippageBps"] = json!(30);
+    assert_eq!(serde_json::to_value(&parsed).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<Input>(expected).unwrap(), parsed);
+
+    for (field, value) in [
+        ("chainId", json!(0)),
+        ("chainId", json!("1")),
+        ("chainId", json!(-1)),
+        ("slippageBps", json!(0)),
+        ("slippageBps", json!(501)),
+        ("slippageBps", Value::Null),
+        ("sellAmount", json!(0)),
+        ("sellAmount", json!("0")),
+        ("sellAmount", json!("01")),
+        ("sellAmount", json!("1e18")),
+        ("extra", json!(true)),
+    ] {
+        let mut invalid = base.clone();
+        invalid[field] = value;
+        assert!(
+            serde_json::from_value::<Input>(invalid).is_err(),
+            "must reject {field}"
+        );
+    }
+    for (field, value, kind) in [
+        ("buyToken", format!("{NATIVE:#x}"), ErrorKind::InvalidInput),
+        ("taker", format!("{NATIVE:#x}"), ErrorKind::InvalidTaker),
+    ] {
+        let mut invalid = base.clone();
+        invalid[field] = json!(value);
+        let error = parse_input(invalid).unwrap_err();
+        assert_eq!(error.downcast_ref::<ErrorKind>(), Some(&kind));
+    }
 }
 
 #[test]
@@ -81,8 +131,7 @@ fn chains_are_built_from_provider_chain_ids() {
 
 #[test]
 fn rpc_is_selected_by_chain_id() {
-    let env = HashMap::from([(String::from("RPC_URL_8453"), String::from("http://base"))]);
-    let config = load_config(&env).unwrap();
+    let config = support::config_with(json!({"chains":{"8453":{"rpcUrl":"http://base"}}}));
     assert_eq!(
         configured_chain(&config, 8453).rpc_url.as_deref(),
         Some("http://base")
@@ -91,8 +140,7 @@ fn rpc_is_selected_by_chain_id() {
 
 #[test]
 fn alchemy_base_urls_are_keyless_and_fill_provider_chains() {
-    let env = HashMap::from([(String::from("ALCHEMY_API_KEY"), String::from("fixture/key"))]);
-    let config = load_config(&env).unwrap();
+    let config = support::config_with(json!({"alchemyApiKey":"fixture/key"}));
     let expected = HashMap::from([
         (1, "https://eth-mainnet.g.alchemy.com/v2/"),
         (10, "https://opt-mainnet.g.alchemy.com/v2/"),
@@ -125,16 +173,9 @@ fn alchemy_base_urls_are_keyless_and_fill_provider_chains() {
 
 #[test]
 fn explicit_rpc_url_wins_over_alchemy() {
-    let env = HashMap::from([
-        (String::from("ALCHEMY_API_KEY"), String::from("fixture-key")),
-        (String::from("RPC_URL_8453"), String::from("http://base")),
-        (String::from("RPC_URL_1"), String::from("http://ethereum")),
-        (
-            String::from("ETHEREUM_RPC_URL"),
-            String::from("http://legacy-ethereum"),
-        ),
-    ]);
-    let config = load_config(&env).unwrap();
+    let config = support::config_with(
+        json!({"alchemyApiKey":"fixture-key","chains":{"8453":{"rpcUrl":"http://base"},"1":{"rpcUrl":"http://ethereum"}}}),
+    );
     let chains = configured_chains(&config, [8453, 1]);
 
     assert_eq!(
@@ -156,16 +197,7 @@ fn explicit_rpc_url_wins_over_alchemy() {
         Some("http://ethereum")
     );
 
-    let legacy_env = HashMap::from([
-        (String::from("ALCHEMY_API_KEY"), String::from("fixture-key")),
-        (
-            String::from("ETHEREUM_RPC_URL"),
-            String::from("http://legacy-ethereum"),
-        ),
-    ]);
-    let legacy_config = load_config(&legacy_env).unwrap();
-    let ethereum = configured_chain(&legacy_config, 1);
-    assert_eq!(ethereum.rpc_url.as_deref(), Some("http://legacy-ethereum"));
+    assert!(load_config(r#"{"ETHEREUM_RPC_URL":"http://legacy-ethereum"}"#).is_err());
 }
 
 #[test]
@@ -177,16 +209,11 @@ fn defaults_do_not_contain_chain_or_provider_selection() {
 
 #[test]
 fn rejects_bad_rpc_and_reads_provider_keys() {
-    let mut env = HashMap::from([
-        (
-            String::from("RPC_URL_8453"),
-            String::from("file:///tmp/rpc"),
-        ),
-        (String::from("ODOS_API_KEY"), String::from("test-key")),
-    ]);
-    assert!(load_config(&env).is_err());
-    env.insert(String::from("RPC_URL_8453"), String::from("http://base"));
-    let config = load_config(&env).unwrap();
+    let mut document =
+        json!({"chains":{"8453":{"rpcUrl":"file:///tmp/rpc"}},"providerKeys":{"odos":"test-key"}});
+    assert!(load_config(&document.to_string()).is_err());
+    document["chains"]["8453"]["rpcUrl"] = json!("http://base");
+    let config = load_config(&document.to_string()).unwrap();
     assert_eq!(config.provider_keys.get("odos").unwrap(), "test-key");
 }
 
@@ -213,7 +240,7 @@ async fn json_request_classifies_http_and_json_failures() {
             body: b"secret".to_vec(),
         },
     };
-    let error = json_request(
+    let error = json_request_as::<Value>(
         &client,
         HttpRequest {
             method: "GET".into(),
@@ -236,7 +263,7 @@ async fn json_request_classifies_http_and_json_failures() {
             body: b"not-json".to_vec(),
         },
     };
-    let error = json_request(
+    let error = json_request_as::<Value>(
         &client,
         HttpRequest {
             method: "GET".into(),
@@ -272,7 +299,7 @@ fn execution_input() -> Input {
         buy_token: parse_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap(),
         sell_amount: "1000000000000000000".into(),
         slippage_bps: 30,
-        taker: PREVIEW_TAKER,
+        taker: FIXTURE_TAKER,
     }
 }
 
@@ -285,7 +312,7 @@ fn execution_route() -> Route {
         spender: parse_address("0x1111111111111111111111111111111111111111").unwrap(),
         tx: Tx {
             to: parse_address("0x1111111111111111111111111111111111111111").unwrap(),
-            data: "0x12345678".into(),
+            data: "0x12345678".parse().unwrap(),
             value: "1000000000000000000".into(),
         },
         deadline: None,
@@ -296,33 +323,22 @@ fn execution_route() -> Route {
 fn unified_transaction_has_holder_and_minimum() {
     let mut chain = configured_chain(&config(), 1);
     let route = execution_route();
-    let provider = route.tx.to;
-    chain.router = Some(parse_address("0x2222222222222222222222222222222222222222").unwrap());
-    let rules = vec![Rule {
-        target: provider,
-        spender: provider,
-        selector: "0x12345678".into(),
-    }];
-    let tx = swap_transaction(
-        &execution_input(),
-        &chain,
-        &route,
-        &rules,
-        Some(&minimum("10000", 80).unwrap()),
-    )
-    .unwrap();
-    assert_eq!(tx.to, metamatch_backend::domain::HOLDER);
+    chain.router = Some(support::deployment(
+        parse_address("0x2222222222222222222222222222222222222222").unwrap(),
+    ));
+    let route = validate_route(&execution_input(), route).unwrap();
+    let tx = swap_transaction(&execution_input(), chain.router.unwrap(), &route).unwrap();
+    assert_eq!(tx.to, support::FIXTURE_HOLDER);
     assert_eq!(tx.value, execution_input().sell_amount);
-    assert!(tx.data.starts_with("0x"));
+    assert!(!tx.data.is_empty());
 }
 
 #[test]
 fn route_target_and_value_are_checked() {
-    let chain = configured_chain(&config(), 1);
     let mut bad = execution_route();
     bad.tx.value = "0".into();
     assert_eq!(
-        validate_route(&execution_input(), &chain, &bad, &[], false)
+        validate_route(&execution_input(), bad)
             .unwrap_err()
             .downcast_ref::<ErrorKind>()
             .unwrap()
@@ -332,41 +348,23 @@ fn route_target_and_value_are_checked() {
 }
 
 #[test]
-fn route_allowlist_requires_exact_tuple_and_guards_transaction_encoding() {
-    let mut chain = configured_chain(&config(), 1);
-    chain.router = Some(alloy_primitives::Address::repeat_byte(0x22));
-    let route = execution_route();
+fn permissionless_routes_preserve_arbitrary_target_spender_and_selector() {
+    use alloy_primitives::{Address, Bytes};
+    use alloy_sol_types::SolCall;
+    use metamatch_backend::execution::{execCall, executeCall};
     let input = execution_input();
-    let matching = support::fixture_rule(route.tx.to);
-    validate_route(
-        &input,
-        &chain,
-        &route,
-        std::slice::from_ref(&matching),
-        true,
-    )
-    .unwrap();
-    for field in 0..4 {
-        let mut rule = matching.clone();
-        match field {
-            0 => rule.target = alloy_primitives::Address::repeat_byte(0x44),
-            1 => rule.spender = alloy_primitives::Address::repeat_byte(0x44),
-            2 => rule.selector = "0x87654321".into(),
-            _ => {}
-        }
-        let rules = if field == 3 { vec![] } else { vec![rule] };
-        for error in [
-            validate_route(&input, &chain, &route, &rules, true).unwrap_err(),
-            swap_transaction(&input, &chain, &route, &rules, None).unwrap_err(),
-        ] {
-            assert_eq!(
-                metamatch_backend::error::kind(&error),
-                ErrorKind::RouteNotAllowlisted
-            );
-            let public = metamatch_backend::api_error::ApiError::from(&error);
-            assert_eq!(public.code, "ROUTE_NOT_ALLOWLISTED");
-        }
-    }
+    let router = support::deployment(Address::repeat_byte(0x22));
+    let mut route = execution_route();
+    route.tx.to = Address::repeat_byte(0x55);
+    route.spender = Address::repeat_byte(0x66);
+    route.tx.data = Bytes::from_static(&[0x87, 0x65, 0x43, 0x21]);
+    let route = validate_route(&input, route).unwrap();
+    let tx = swap_transaction(&input, router, &route).unwrap();
+    let outer = execCall::abi_decode(&tx.data).unwrap();
+    let inner = executeCall::abi_decode(&outer.data).unwrap();
+    assert_eq!(inner.target, route.tx.to);
+    assert_eq!(inner.spender, route.spender);
+    assert_eq!(inner.data, route.tx.data);
 }
 
 #[tokio::test]
@@ -423,12 +421,12 @@ async fn create_rejects_a_chain_not_supported_by_current_providers() {
     let config = config();
     let service = Competitions::new(
         config.clone(),
-        Some(Services::new(
+        Services::new(
             Vec::new(),
             &[configured_chain(&config, 1)],
             Arc::new(support::MockContext),
             Arc::new(support::MockSimulation),
-        )),
+        ),
     );
     let error = service.create(input(1, NATIVE)).await.unwrap_err();
     assert_eq!(
@@ -444,16 +442,16 @@ async fn provider_failure_isolated_from_available_provider() {
     let router = parse_address("0x2222222222222222222222222222222222222222").unwrap();
     let service = Competitions::new(
         config.clone(),
-        Some(support::competition_services_for(&config, Some(router))),
+        support::competition_services_for(&config, Some(router)),
     );
     let created = service
         .create(Input {
             chain_id: 1,
             sell_token: NATIVE,
-            buy_token: PREVIEW_TAKER,
+            buy_token: FIXTURE_TAKER,
             sell_amount: "1".into(),
             slippage_bps: 30,
-            taker: PREVIEW_TAKER,
+            taker: FIXTURE_TAKER,
         })
         .await
         .unwrap();
@@ -465,15 +463,15 @@ async fn provider_failure_isolated_from_available_provider() {
 
 #[tokio::test]
 async fn create_rejects_chain_outside_current_provider_union() {
-    let service = Competitions::new(config(), Some(support::competition_services()));
+    let service = Competitions::new(config(), support::competition_services());
     let error = service
         .create(Input {
             chain_id: 999_999,
             sell_token: NATIVE,
-            buy_token: PREVIEW_TAKER,
+            buy_token: FIXTURE_TAKER,
             sell_amount: "1".into(),
             slippage_bps: 30,
-            taker: PREVIEW_TAKER,
+            taker: FIXTURE_TAKER,
         })
         .await
         .unwrap_err();
@@ -486,15 +484,8 @@ async fn create_rejects_chain_outside_current_provider_union() {
 #[tokio::test]
 async fn capabilities_list_only_eligible_providers() {
     let config = config();
-    let capability_app = create_app(config.clone());
-    let (status, _, body) = request(
-        &capability_app.router,
-        "GET",
-        "/v1/capabilities",
-        None,
-        None,
-    )
-    .await;
+    let capability_app = create_app(config.clone()).await.unwrap();
+    let (status, _, body) = request(&capability_app, "GET", "/v1/capabilities", None, None).await;
     assert_eq!(status, StatusCode::OK);
     let capabilities: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(capabilities["chains"].as_array().unwrap().len(), 17);
@@ -512,32 +503,34 @@ async fn capabilities_list_only_eligible_providers() {
 
 #[test]
 fn execution_preserves_upstream_deadline_without_inventing_a_ttl() {
-    use alloy_primitives::{Bytes, U256};
+    use alloy_primitives::U256;
     use alloy_sol_types::{SolCall, sol};
     sol! {
         function exec(address operator, address token, uint256 amount, address target, bytes data) payable returns (bytes);
-        function execute(address sellToken, address buyToken, uint256 sellAmount, uint256 minBuyAmount, address target, address spender, uint256 value, bytes data, uint256 deadline) payable returns (uint256);
+        function execute(address sellToken, address buyToken, address receiver, uint256 sellAmount, uint256 minBuyAmount, uint256 deadline, address spender, address target, uint256 value, bytes data) payable returns (uint256);
     }
     let mut chain = configured_chain(&config(), 1);
-    chain.router = Some(alloy_primitives::Address::repeat_byte(0x22));
+    chain.router = Some(support::deployment(alloy_primitives::Address::repeat_byte(
+        0x22,
+    )));
     let mut route = execution_route();
-    let rules = [support::fixture_rule(route.tx.to)];
     let upstream_deadline = metamatch_backend::domain::now_ms() / 1000 + 120;
     for deadline in [None, Some(upstream_deadline)] {
         route.deadline = deadline;
-        let tx = swap_transaction(&execution_input(), &chain, &route, &rules, None).unwrap();
-        let outer = execCall::abi_decode(&hex::decode(&tx.data[2..]).unwrap()).unwrap();
+        let validated = validate_route(&execution_input(), route.clone()).unwrap();
+        let tx = swap_transaction(&execution_input(), chain.router.unwrap(), &validated).unwrap();
+        let outer = execCall::abi_decode(&tx.data).unwrap();
         let inner = executeCall::abi_decode(&outer.data).unwrap();
         assert_eq!(
             inner.deadline,
             deadline.map(U256::from).unwrap_or(U256::MAX)
         );
         assert_eq!(inner.minBuyAmount, U256::from(9970));
+        assert_eq!(inner.receiver, execution_input().taker);
+        assert_eq!(outer.operator, chain.router.unwrap().address);
+        assert_eq!(tx.to, support::FIXTURE_HOLDER);
         assert_eq!(inner.sellAmount, parse_uint(&route.sell_amount).unwrap());
-        assert_eq!(
-            inner.data,
-            Bytes::from(hex::decode(&route.tx.data[2..]).unwrap())
-        );
+        assert_eq!(inner.data, route.tx.data);
     }
 }
 
@@ -551,8 +544,8 @@ fn competition_timeout_configuration_is_bounded() {
         ("30001", false),
         ("abc", false),
     ] {
-        let env = HashMap::from([("COMPETITION_TIMEOUT_MS".into(), value.into())]);
-        let result = load_config(&env);
+        let value_json = value.parse::<u64>().map_or(json!(value), |n| json!(n));
+        let result = load_config(&json!({"competitionTimeoutMs":value_json}).to_string());
         assert_eq!(result.is_ok(), valid);
         if valid {
             assert_eq!(result.unwrap().timeout_ms.to_string(), value);

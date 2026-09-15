@@ -25,11 +25,4 @@ jobs:
           toolchain: 1.94.1
           components: rustfmt, clippy
       - uses: foundry-rs/foundry-toolchain@v1
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: cargo test --all
-      - run: cargo build --release
-      - run: forge fmt --root contracts --check
-      - run: forge build --root contracts --deny-warnings
-      - run: forge test --root contracts
-      - run: cargo test --test e2e_local -- --ignored --nocapture
+      - run: sh scripts/check.sh

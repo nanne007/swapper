@@ -4,12 +4,13 @@ use alloy_primitives::Address;
 use alloy_provider::Provider;
 use metamatch_backend::{
     competitions::Competitions,
-    domain::{NATIVE, PREVIEW_TAKER},
+    domain::NATIVE,
     rpc::RpcClients,
     simulation::{SimResult, SimulationFailure, SimulationProvider, SimulationRequest, Simulator},
 };
 use serde_json::json;
 use std::{sync::Arc, time::Duration};
+use support::FIXTURE_TAKER;
 
 #[test]
 fn rpc_clients_reuse_the_alloy_provider_for_each_endpoint() {
@@ -27,6 +28,9 @@ async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding(
     let server = support::FixtureRpc::default().start().await;
     let mut chain = support::chain(&support::config(), 1);
     chain.rpc_url = Some(server.url.clone());
+    chain.router = Some(support::deployment(alloy_primitives::Address::repeat_byte(
+        0x22,
+    )));
     let input = support::input(1, NATIVE);
     let route = support::fixture_route(&input);
     let context = support::fixture_context();
@@ -36,16 +40,7 @@ async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding(
             Default::default(),
         )),
     );
-    let result = simulator
-        .run(SimulationRequest {
-            input: &input,
-            chain: &chain,
-            route: &route,
-            context: &context,
-            rules: &[],
-            taker: PREVIEW_TAKER,
-            min: None,
-        })
+    let result = support::simulate(&simulator, &input, &chain, &route, &context)
         .await
         .unwrap();
     assert_eq!(result.simulation.bought_amount, "100");
@@ -55,6 +50,7 @@ async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding(
         let params = &request["params"];
         match request["method"].as_str().unwrap() {
             "eth_getBlockByNumber" => assert_eq!(params[0], "0x10"),
+            "eth_getCode" => assert_eq!(params[1], "0x10"),
             "eth_simulateV1" => {
                 assert_eq!(params[1], "0x10");
                 let block = &params[0]["blockStateCalls"][0];
@@ -62,7 +58,7 @@ async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding(
                 assert_eq!(calls.first().unwrap()["gasPrice"], "0x0");
                 assert_eq!(calls.last().unwrap()["gasPrice"], "0x0");
                 assert!(
-                    block["stateOverrides"][format!("{PREVIEW_TAKER:#x}")]["balance"].is_string()
+                    block["stateOverrides"][format!("{FIXTURE_TAKER:#x}")]["balance"].is_string()
                 );
             }
             method => panic!("unexpected RPC method: {method}"),
@@ -107,6 +103,9 @@ async fn erc20_slot_resolution_and_approval_failures_still_reject_simulation() {
     ] {
         let mut chain = support::chain(&support::config(), 1);
         chain.rpc_url = Some(server.url.clone());
+        chain.router = Some(support::deployment(alloy_primitives::Address::repeat_byte(
+            0x22,
+        )));
         let mut input = support::input(1, Address::repeat_byte(0x55));
         input.sell_amount = "1000".into();
         let configured = slot
@@ -128,18 +127,15 @@ async fn erc20_slot_resolution_and_approval_failures_still_reject_simulation() {
         );
         let mut route = support::fixture_route(&input);
         route.tx.value = "0".into();
-        let error = simulator
-            .run(SimulationRequest {
-                input: &input,
-                chain: &chain,
-                route: &route,
-                context: &support::fixture_context(),
-                rules: &[],
-                taker: PREVIEW_TAKER,
-                min: None,
-            })
-            .await
-            .unwrap_err();
+        let error = support::simulate(
+            &simulator,
+            &input,
+            &chain,
+            &route,
+            &support::fixture_context(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             serde_json::to_value(error.downcast_ref::<SimulationFailure>().unwrap()).unwrap(),
             expected
@@ -153,7 +149,7 @@ async fn shared_transaction_validation_keeps_provider_and_execution_guards() {
         error::{ErrorKind, kind},
         execution::validate_route,
     };
-    let config = support::config_with(&[("ZERO_EX_API_KEY", "fixture-key")]);
+    let config = support::config_with(serde_json::json!({"providerKeys":{"0x":"fixture-key"}}));
     let input = support::input(1, NATIVE);
     let chain = support::chain(&config, 1);
     for (value, data, expected) in [
@@ -166,18 +162,15 @@ async fn shared_transaction_validation_keeps_provider_and_execution_guards() {
     ] {
         let mut route = support::fixture_route(&input);
         route.tx.value = value.into();
-        route.tx.data = data.into();
-        assert_eq!(
-            kind(&validate_route(&input, &chain, &route, &[], false).unwrap_err()),
-            expected
-        );
+        route.tx.data = data.parse().unwrap();
+        assert_eq!(kind(&validate_route(&input, route).unwrap_err()), expected);
         let client = support::client([json!({
             "liquidityAvailable": true, "sellAmount": input.sell_amount,
             "buyAmount": "100", "minBuyAmount": "99",
-            "transaction": {"to": format!("{PREVIEW_TAKER:#x}"), "data": data, "value": value}
+            "transaction": {"to": format!("{FIXTURE_TAKER:#x}"), "data": data, "value": value}
         })]);
         let error = support::provider(&config, "0x", client)
-            .quote(&input, &chain, PREVIEW_TAKER)
+            .quote(&input, &chain, FIXTURE_TAKER)
             .await
             .unwrap_err();
         assert_eq!(kind(&error), expected);
@@ -185,13 +178,21 @@ async fn shared_transaction_validation_keeps_provider_and_execution_guards() {
     let mut route = support::fixture_route(&input);
     route.deadline = Some(0);
     assert_eq!(
-        kind(&validate_route(&input, &chain, &route, &[], false).unwrap_err()),
+        kind(&validate_route(&input, route).unwrap_err()),
         ErrorKind::QuoteExpired
     );
 }
 
 #[async_trait::async_trait]
 impl SimulationProvider for FailedSimulation {
+    async fn prepare(
+        &self,
+        input: &metamatch_backend::domain::Input,
+        chain: &metamatch_backend::domain::Chain,
+        context: &metamatch_backend::domain::Context,
+    ) -> anyhow::Result<metamatch_backend::simulation::SimulationPreparation> {
+        support::MockSimulation.prepare(input, chain, context).await
+    }
     async fn run(&self, _request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         Err(anyhow::anyhow!("original simulation cause").context(self.0))
     }
@@ -215,7 +216,7 @@ async fn simulation_failures_keep_categories_and_release_capacity() {
         let mut services =
             support::competition_services_for(&config, Some(Address::repeat_byte(0x22)));
         services.simulator = Arc::new(FailedSimulation(failure));
-        let service = Competitions::new(config, Some(services));
+        let service = Competitions::new(config, services);
         for _ in 0..2 {
             let response = service.create(support::input(1, NATIVE)).await.unwrap();
             assert!(response.quotes.is_empty());

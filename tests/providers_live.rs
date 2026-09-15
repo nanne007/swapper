@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use metamatch_backend::{
-    config::load_config_from_env,
+    config::load_config_file,
     domain::{Address, Chain, Input, NATIVE, parse_address, parse_positive},
     http::{HttpClient, HttpRequest, HttpResponse, ReqwestClient},
     providers::create_providers,
@@ -172,7 +172,8 @@ async fn exercise(spec: ProviderSpec) {
         return;
     }
 
-    let config = load_config_from_env().expect("live test environment must load as valid config");
+    let config =
+        load_config_file("config.json").expect("live test JSON configuration must be valid");
     let observation = Arc::new(Observation::default());
     let client: Arc<dyn HttpClient> = Arc::new(ObservedReqwestClient {
         inner: ReqwestClient::default(),

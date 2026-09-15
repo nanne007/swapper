@@ -1,6 +1,7 @@
 target
 .git
 .env
+config.json
 config.local.json
 contracts/out
 contracts/cache

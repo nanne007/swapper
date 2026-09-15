@@ -33,7 +33,6 @@ impl From<&anyhow::Error> for ApiError {
             ErrorKind::UpstreamStateOverridesUnsupported => {
                 ("UPSTREAM_STATE_OVERRIDES_UNSUPPORTED", 422)
             }
-            ErrorKind::RouteNotAllowlisted => ("ROUTE_NOT_ALLOWLISTED", 422),
             ErrorKind::CapacityExceeded => ("CAPACITY_EXCEEDED", 429),
             ErrorKind::ProviderUnconfigured => ("PROVIDER_UNCONFIGURED", 503),
             ErrorKind::RpcNotConfigured => ("RPC_NOT_CONFIGURED", 503),

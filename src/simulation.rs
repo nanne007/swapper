@@ -2,10 +2,9 @@ use crate::error::ErrorKind;
 use crate::{
     balance_slots::{BalanceSlotError, BalanceSlots, storage_key},
     domain::{
-        Address, Chain, Context, Input, NATIVE, Route, Rule, SimulationSuccess, Tx, parse_hex,
-        parse_uint,
+        Address, Chain, Context, Input, NATIVE, RouterDeployment, SimulationSuccess, Tx, parse_uint,
     },
-    execution::{allowance_data, approval, balance_data, swap_transaction},
+    execution::{ValidatedRoute, allowance_data, approval, balance_data, swap_transaction},
     rpc::{RpcClients, block_id, block_number, map_rpc_error},
 };
 use alloy_primitives::{B256, Bytes, U256};
@@ -37,15 +36,26 @@ pub struct SimulationCallError {
 pub struct SimulationRequest<'a> {
     pub input: &'a Input,
     pub chain: &'a Chain,
-    pub route: &'a Route,
+    pub route: &'a ValidatedRoute,
     pub context: &'a Context,
-    pub rules: &'a [Rule],
-    pub taker: Address,
-    pub min: Option<&'a str>,
+    pub preparation: &'a SimulationPreparation,
+}
+
+/// Immutable, request-local prerequisites. Each route builds its own state overrides.
+pub struct SimulationPreparation {
+    pub router: RouterDeployment,
+    pub approvals: Vec<Tx>,
+    pub sell_balance_slot: Option<B256>,
 }
 
 #[async_trait]
 pub trait SimulationProvider: Send + Sync {
+    async fn prepare(
+        &self,
+        input: &Input,
+        chain: &Chain,
+        context: &Context,
+    ) -> anyhow::Result<SimulationPreparation>;
     async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult>;
 }
 
@@ -62,66 +72,96 @@ impl Simulator {
         }
     }
 
-    pub async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
-        let SimulationRequest {
-            input,
-            chain,
-            route,
-            context,
-            rules,
-            taker,
-            min,
-        } = request;
-        let transaction = swap_transaction(input, chain, route, rules, min)?;
-        let mut approvals = Vec::new();
-        let Some(url) = &chain.rpc_url else {
-            anyhow::bail!(SimulationFailure::Unsupported("RPC_NOT_CONFIGURED"));
-        };
-        let rpc = self.clients.get(url)?;
+    pub async fn prepare(
+        &self,
+        input: &Input,
+        chain: &Chain,
+        context: &Context,
+    ) -> anyhow::Result<SimulationPreparation> {
+        let router = chain.router.context(ErrorKind::RouterNotConfigured)?;
+        let rpc = self.rpc(chain)?;
         assert_block(&rpc, context).await.map_err(rpc_failure)?;
         let block = block_id(context)?;
-        if let Some(router) = chain.router {
+        let code = async {
             let code = rpc
-                .get_code_at(router)
+                .get_code_at(router.address)
                 .block_id(block)
                 .await
                 .map_err(|error| rpc_failure(map_rpc_error("eth_getCode", error)))?;
             if code.is_empty() {
                 anyhow::bail!(SimulationFailure::Unsupported("ROUTER_NOT_DEPLOYED"));
             }
-        }
-        let mut overrides = StateOverride::default();
-        let transaction_value = parse_uint(&transaction.value)?;
-        let gas_price = parse_uint(&context.gas_price)?;
-        if input.sell_token != NATIVE {
-            let base = self
-                .balance_slots
-                .resolve(&rpc, chain.id, input.sell_token, block)
-                .await
-                .map_err(balance_slot_failure)?;
-            let amount = parse_uint(&input.sell_amount)?;
-            overrides = token_balance_override(input.sell_token, storage_key(taker, base), amount);
-            let spender = chain
-                .router
-                .map_or(route.spender, |_| crate::domain::HOLDER);
-            let allowance = rpc
-                .call(contract_call(
-                    input.sell_token,
-                    allowance_data(taker, spender),
-                )?)
-                .block(block)
-                .await
-                .map_err(|error| rpc_failure(map_rpc_error("eth_call", error)))?;
-            let allowance = parse_return_word(&allowance)?;
+            Ok::<_, anyhow::Error>(())
+        };
+        let funding = async {
+            if input.sell_token == NATIVE {
+                return Ok((None, Vec::new()));
+            }
+            let base = async {
+                self.balance_slots
+                    .resolve(&rpc, chain.id, input.sell_token, block)
+                    .await
+                    .map_err(balance_slot_failure)
+            };
+            let allowance = async {
+                let data = rpc
+                    .call(contract_call(
+                        input.sell_token,
+                        allowance_data(input.taker, router.holder),
+                    ))
+                    .block(block)
+                    .await
+                    .map_err(|error| rpc_failure(map_rpc_error("eth_call", error)))?;
+                parse_return_word(&data)
+            };
+            let (base, allowance) = tokio::try_join!(base, allowance)?;
             let sell_amount = parse_uint(&input.sell_amount)?;
+            let mut approvals = Vec::new();
             if allowance < sell_amount {
                 if !allowance.is_zero() {
-                    approvals.push(approval(input.sell_token, spender, U256::ZERO));
+                    approvals.push(approval(input.sell_token, router.holder, U256::ZERO));
                 }
-                approvals.push(approval(input.sell_token, spender, sell_amount));
+                approvals.push(approval(input.sell_token, router.holder, sell_amount));
             }
-        }
-        let balance_call = balance_call(input.buy_token, taker)?
+            Ok::<_, anyhow::Error>((Some(storage_key(input.taker, base)), approvals))
+        };
+        let ((), (sell_balance_slot, approvals)) = tokio::try_join!(code, funding)?;
+        Ok(SimulationPreparation {
+            router,
+            approvals,
+            sell_balance_slot,
+        })
+    }
+
+    fn rpc(&self, chain: &Chain) -> anyhow::Result<DynProvider> {
+        let Some(url) = &chain.rpc_url else {
+            anyhow::bail!(SimulationFailure::Unsupported("RPC_NOT_CONFIGURED"));
+        };
+        self.clients.get(url)
+    }
+
+    pub async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
+        let SimulationRequest {
+            input,
+            chain,
+            route,
+            context,
+            preparation,
+        } = request;
+        let transaction = swap_transaction(input, preparation.router, route)?;
+        let approvals = &preparation.approvals;
+        let taker = input.taker;
+        let rpc = self.rpc(chain)?;
+        let block = block_id(context)?;
+        let mut overrides = match preparation.sell_balance_slot {
+            Some(slot) => {
+                token_balance_override(input.sell_token, slot, parse_uint(&input.sell_amount)?)
+            }
+            None => StateOverride::default(),
+        };
+        let transaction_value = parse_uint(&transaction.value)?;
+        let gas_price = parse_uint(&context.gas_price)?;
+        let balance_call = contract_call(input.buy_token, balance_data(taker))
             .from(taker)
             .gas_limit(100_000)
             .gas_price(0);
@@ -204,7 +244,7 @@ impl Simulator {
             ));
         }
         let bought = after - before;
-        if bought < parse_uint(min.unwrap_or(&route.min_buy_amount))? {
+        if bought < parse_uint(&route.min_buy_amount)? {
             anyhow::bail!(SimulationFailure::Reverted(
                 "SIMULATED_OUTPUT_BELOW_MINIMUM"
             ));
@@ -227,7 +267,7 @@ impl Simulator {
                 block_context: context.block_context(),
                 simulated_timestamp: context.timestamp.saturating_add(1),
             },
-            approvals,
+            approvals: approvals.clone(),
             transaction,
         })
     }
@@ -235,6 +275,14 @@ impl Simulator {
 
 #[async_trait]
 impl SimulationProvider for Simulator {
+    async fn prepare(
+        &self,
+        input: &Input,
+        chain: &Chain,
+        context: &Context,
+    ) -> anyhow::Result<SimulationPreparation> {
+        Simulator::prepare(self, input, chain, context).await
+    }
     async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         Simulator::run(self, request).await
     }
@@ -274,21 +322,10 @@ fn rpc_failure(error: anyhow::Error) -> anyhow::Error {
     error.context(outcome)
 }
 
-fn bytes_from_hex(value: &str) -> anyhow::Result<Bytes> {
-    let value = parse_hex(value)?;
-    Ok(Bytes::from(
-        hex::decode(&value[2..]).context(ErrorKind::InvalidCalldata)?,
-    ))
-}
-
-fn contract_call(to: Address, data: String) -> anyhow::Result<TransactionRequest> {
-    Ok(TransactionRequest::default()
+fn contract_call(to: Address, data: Bytes) -> TransactionRequest {
+    TransactionRequest::default()
         .to(to)
-        .input(TransactionInput::both(bytes_from_hex(&data)?)))
-}
-
-fn balance_call(token: Address, owner: Address) -> anyhow::Result<TransactionRequest> {
-    contract_call(token, balance_data(owner))
+        .input(TransactionInput::new(data))
 }
 
 fn rpc_transaction(
@@ -299,7 +336,7 @@ fn rpc_transaction(
     Ok(TransactionRequest::default()
         .from(from)
         .to(transaction.to)
-        .input(TransactionInput::both(bytes_from_hex(&transaction.data)?))
+        .input(TransactionInput::new(transaction.data.clone()))
         .value(parse_uint(&transaction.value)?)
         .gas_limit(0x7a1200)
         .gas_price(parse_uint(gas_price)?.to::<u128>()))

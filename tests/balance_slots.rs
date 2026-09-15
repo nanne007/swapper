@@ -6,7 +6,7 @@ use metamatch_backend::{
     config::load_config,
     error::{ErrorKind, kind},
     rpc::RpcClients,
-    simulation::{SimulationRequest, Simulator},
+    simulation::Simulator,
 };
 use serde_json::{Value, json};
 use std::{
@@ -167,7 +167,7 @@ impl Fixture {
 #[test]
 fn config_parses_full_width_base_slots_and_rejects_invalid_values() {
     let value = json!({"1":{format!("{TOKEN:#x}"):format!("{:#x}",U256::MAX)},"8453":{format!("{TOKEN:#x}"):"0x0"}}).to_string();
-    let config = load_config(&HashMap::from([("BALANCE_SLOTS".into(), value)])).unwrap();
+    let config = load_config(&format!(r#"{{"balanceSlots":{value}}}"#)).unwrap();
     assert_eq!(config.balance_slots[&1][&TOKEN], U256::MAX);
     assert_eq!(config.balance_slots[&8453][&TOKEN], U256::ZERO);
     for value in [
@@ -178,7 +178,7 @@ fn config_parses_full_width_base_slots_and_rejects_invalid_values() {
         json!({"1":{format!("{TOKEN:#x}"):"-1"}}).to_string(),
         json!({"1":{"invalid":"0x0"}}).to_string(),
     ] {
-        let error = load_config(&HashMap::from([("BALANCE_SLOTS".into(), value)]))
+        let error = load_config(&format!(r#"{{"balanceSlots":{value}}}"#))
             .err()
             .unwrap();
         assert_eq!(kind(&error), ErrorKind::InvalidConfig);
@@ -405,22 +405,22 @@ async fn simulate(
     let simulator = Simulator::new(Arc::new(RpcClients::new(Duration::from_secs(2))), slots);
     let mut chain = support::chain(&support::config(), 1);
     chain.rpc_url = Some(server.url.clone());
+    chain.router = Some(support::deployment(alloy_primitives::Address::repeat_byte(
+        0x22,
+    )));
     let mut input = support::input(1, TOKEN);
     input.sell_amount = "100".into();
     input.taker = owner;
     let mut route = support::fixture_route(&input);
     route.tx.value = "0".into();
-    simulator
-        .run(SimulationRequest {
-            input: &input,
-            chain: &chain,
-            route: &route,
-            context: &support::fixture_context(),
-            rules: &[],
-            taker: owner,
-            min: None,
-        })
-        .await
+    support::simulate(
+        &simulator,
+        &input,
+        &chain,
+        &route,
+        &support::fixture_context(),
+    )
+    .await
 }
 
 #[tokio::test]

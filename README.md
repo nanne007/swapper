@@ -9,10 +9,12 @@
 需要 Rust 1.94.1 和 Cargo。无需数据库、API key、RPC、钱包或 Docker 即可启动健康检查；无 key provider 默认参与，必需 key 缺失的 provider 会明确返回 unavailable。
 
 ```sh
+cp config.example.json config.json
 cargo run
+# 可选：cargo run -- /absolute/path/config.json
 ```
 
-启动时会从当前目录或父目录读取可选 `.env`，已有的 shell/部署环境变量优先；文件不存在时继续启动，文件存在但不可读或格式错误时直接失败。默认监听 127.0.0.1:3000。修改 Rust 源码后可使用 `cargo run` 重启。服务不会生成 mock 报价，也不会访问缺少必需凭据的 provider。
+启动默认读取当前工作目录的 `config.json`，也可传入单个文件路径参数。不再读取 `.env` 或应用环境变量；文件缺失、非法配置或 Router bootstrap 失败时退出。默认监听 127.0.0.1:3000。配置示例不含 RPC、凭据或 Router，可用于 health/capabilities；配置变更后重启。完整字段、迁移表和校验规则见 [JSON 配置说明](docs/CONFIGURATION.md)。
 
 排障时可以启用内部 backtrace；日志写入 stderr，默认过滤为 `metamatch_backend=info`：
 
@@ -38,36 +40,25 @@ curl -s http://127.0.0.1:3000/v1/competitions \
 
 用户选择一条结果，按顺序执行必要的 approvals 并等待确认，再执行返回的同一笔 swap。simulation 总是把 taker 的卖出资产和 native gas 资金覆盖到本次请求所需数额，`funding` 固定为 `overridden`；成功结果证明这组交易在该假定资金和固定区块上下文中可执行，不证明钱包当前余额充足。API 不返回 `expiresAt`，也不设置人工报价 TTL。`simulation.blockContext` 包含基础区块 `number`（十六进制字符串）、`hash`、`timestamp`（Unix 秒）；`simulatedTimestamp` 是实际用于模拟执行的时间。调用方发送前应确认钱包余额，并自行决定是否重新仿真；重新竞赛会重新获取 provider 报价，最低到账变化需要调用方重新确认。provider 原生签名期限和 calldata 内的 deadline 仍按链上规则生效。
 
-竞赛总预算用 `COMPETITION_TIMEOUT_MS` 配置（默认 6000，允许 100–30000）。旧 `PROVIDER_TIMEOUT_MS` 和 `QUOTE_TTL_MS` 已移除；请更新部署环境中的配置名称。金额使用十进制字符串，不能用小数或 JS Number。API 从不代签或广播。
+竞赛总预算用 `competitionTimeoutMs` 配置（默认 6000，允许 100–30000）。旧 `PROVIDER_TIMEOUT_MS` 和 `QUOTE_TTL_MS` 已移除；请迁移为 JSON 配置字段。金额使用十进制字符串，不能用小数或 JS Number。API 从不代签或广播。
 
-## Live 配置
+## 配置、Router 与 Holder
 
-Rust 进程读取环境变量和本地 `.env`，配置项见 `.env.example`；v1 不使用链/provider/token 业务配置文件。不要提交真实环境文件。
+应用配置以 [config.example.json](config.example.json) 为模板，完整字段、旧环境变量迁移表、启动校验与 Docker 使用方法见 [CONFIGURATION.md](docs/CONFIGURATION.md)。真实 `config.json` 已排除出 Git 和 Docker context；本次不会读取、转换或删除已有 `.env`。
 
-- 需要 key 的 provider 使用原生环境变量：`ZERO_EX_API_KEY`、`ONE_INCH_API_KEY`、`BARTER_API_KEY`、`ENSO_API_KEY`、`HYPERBLOOM_API_KEY`、`OOGABOOGA_API_KEY`、`OKX_API_KEY`。
-- OKX 还必须配置 `OKX_SECRET_KEY`、`OKX_API_PASSPHRASE`；`OKX_PROJECT_ID` 可选。`BEBOP_API_KEY`、`KYBER_CLIENT_ID` 和 `ODOS_API_KEY` 为 optional，配置后只传给对应 adapter，不改变其参与资格。Kyber 公共 legacy gateway、Odos、LiquidSwap、OpenOcean、Velora 当前可免 key 访问；完整接入差异见 [Provider 官方接入手册](docs/PROVIDER_INTEGRATION_GUIDE.md)。
-- `RPC_URL_<chainId>`：对应链的可信 HTTP RPC，例如 `RPC_URL_8453`；需要支持带 state override 的 `eth_simulateV1`。未配置 ERC20 mapping base 时还需要 `eth_createAccessList`。Ethereum 也兼容 `ETHEREUM_RPC_URL`。
-- `ALCHEMY_API_KEY`：当某条链没有显式 `RPC_URL_<chainId>`（Ethereum 也没有旧别名）时，按官方 Alchemy network endpoint 自动补齐 RPC。显式 RPC 始终优先；key 只在服务端使用，不得写入日志或提交到仓库。
-- 不配置 RPC 时链仍会出现在 capabilities，但仿真会明确返回 unavailable/unsupported。
+- 每链使用 `chains.<chainId>.rpcUrl` 和 `chains.<chainId>.router`；显式 RPC 优先于 `alchemyApiKey` endpoint fallback。
+- provider 凭据使用 `providerKeys`，OKX 补充字段使用 `okxSecretKey / okxPassphrase / okxProjectId`。必需/可选凭据的参与规则不变。
+- `balanceSlots` 是直接嵌套的 JSON 对象，不再是 JSON 环境变量；缺失时沿用假 owner 的 `eth_createAccessList` 探测。
+- 配置 Router 后，服务在监听前检查 RPC chain ID、Router 代码、`allowanceHolder()` 返回值和 Holder 代码。Holder 只从 Router 读取，不可配置，也没有硬编码 fallback；钱包 approval 和最外层交易使用该 Holder。
+- 未配置 Router 的链保留在 capabilities，竞赛返回 `ROUTER_NOT_CONFIGURED`。已配置但无法验证的 Router 导致启动失败，不降级运行。
 
-Alchemy 官方列出 endpoint 不代表每条链都支持本服务依赖的全部仿真方法；`eth_simulateV1`、state override 和按需 `eth_createAccessList` 仍由运行时 RPC 检查，方法缺失不会被当成成功。
+Rust 已匹配当前 `execute(sellToken, buyToken, receiver, sellAmount, minBuyAmount, deadline, spender, target, value, data)` ABI；API 保持 `taker`，映射为合约 sender/receiver。配置中不提供 chain/provider/token 白名单。
 
-服务不维护 token 白名单；API 收到的 token 地址经过格式、金额和 route 安全校验后透传给 provider。MetaRouter 要求管理员登记 `(target, spender, selector)` 白名单；不得把 provider 返回的任意目标自动加白。合约结构检查、精确授权、最低到账和仿真继续生效，正式 Router/Holder 仍需按链逐一核对。
+当前 Solidity 是无管理员、无暂停、无路由白名单和无 recover 的轻量 Router；只保护本次 sell/buy/native 交换边界，不保证无关暂存 token 的安全。详细行为见 [合约文档](contracts/README.md)。
 
-`BALANCE_SLOTS` 是可选的服务端 JSON 环境变量，格式为 `{"1":{"0x1111111111111111111111111111111111111111":"0x0"}}`（示例地址，非真实 token 配置）：chain ID → token 地址 → uint256 十六进制 mapping 基础槽位。`BalanceSlots::resolve(rpc, chainId, token, block)` 只返回 base，优先读配置和进程缓存；缺失时对两个固定假地址并行调用 `eth_createAccessList`，交叉匹配 token 实际访问的 storage key 后缓存。缓存键只有 chain ID 和 token，与用户地址无关。simulation 使用 base 计算 taker 的 storage key，并直接把卖出 token 和 native balance 写入 state override；不读取真实余额，也不额外验证 override。自动识别范围为 base `0..1023`，详细边界见 [技术方案](docs/TECHNICAL.md#61-独立-balanceslots)。
+Rust 与合约均采用 permissionless 路由策略：不维护 target/spender/selector 白名单，也不再返回 `ROUTE_NOT_ALLOWLISTED`。adapter 原生约束、金额/value/calldata 校验和完整 Holder/Router 仿真仍为必要条件；API 不接受任意 calldata。真实 provider/RPC、正式部署和主网执行仍需独立验收。
 
-`Rule`、`Provider::rules()` 和 `ROUTE_NOT_ALLOWLISTED` 已恢复；生产 provider 默认 rules 仍为空，经审核的链专属规则与链上登记尚需补齐。生产链的 `router` 目前仍固定为 `None`，正式地址接入尚需实现；当前返回 `unavailable / ROUTER_NOT_CONFIGURED`，不会自动切换到逐家授权。
-
-当前 13 个 provider 均已注册真实 HTTP adapter，并通过脱敏 fixture 验证请求参数、响应归一化和 route 安全边界；真实 key、生产 RPC、Router/allowlist 和成功仿真仍需独立 release gate。跨链和非 EVM 不属于 v1。
-
-## MetaRouter 管理
-
-- 路由通过 owner-only `setAllowed(target, spender, selector, enabled)` 登记或撤销，默认拒绝；直接 ERC20 target 仍被禁止，防止通过 transfer/approve 移走第三种暂存 token。
-- 当前 `owner` 可以调用 `recoverToken(token, recipient, amount)` 提取 Router 中的 ERC20；native 使用 `router.NATIVE()`，amount 为 base units/wei。暂停期间可提取，recover 与 swap 共用重入锁。
-- 管理员转移采用 `transferOwnership(newOwner)` → 新管理员调用 `acceptOwnership()`。接受前旧管理员保留权限，接受后立即失权。
-- recover 仅转出 Router 自有余额，不拉取钱包资产。暂存资产可被管理员提取，Router 不应作为存款地址。
-
-完整参数、错误条件、事件和 ABI/部署迁移说明见 [MetaRouter 合约文档](contracts/README.md)。本次没有部署；非代理旧合约不能原地更新。
+同一轮竞赛共享 parent hash、Router code、Holder allowance 和卖出 token mapping base 的准备结果；各 route 的仿真状态和模拟后 hash 检查仍独立。内部 calldata 使用 Bytes，公开交易仍为 hex data 字符串。性能回归与边界见 [验证记录](docs/VERIFICATION.md)。
 
 ## 真实 provider smoke test
 
@@ -78,13 +69,13 @@ METAMATCH_RUN_LIVE_PROVIDER_TESTS=1 \
   cargo test --test providers_live -- --ignored --nocapture
 ```
 
-需要 access key 的 provider 从进程环境读取已有的原生 key；缺少必需字段时测试明确 `SKIP`，不会发请求。Bebop、Kyber、LiquidSwap、Odos、OpenOcean、Velora 即使没有 key 也会尝试进入测试。Ethereum、Optimism、Base、Arbitrum 使用公开的 WETH/USDC 默认输入；HyperEVM 使用 WHYPE/USDT0，Berachain 使用 native/HONEY。可通过 `METAMATCH_LIVE_BUY_TOKEN_<chainId>`、`METAMATCH_LIVE_SELL_TOKEN_<chainId>` 和 `METAMATCH_LIVE_SELL_AMOUNT_<chainId>` 覆盖输入，但不会把这些测试默认值引入产品 token registry。`METAMATCH_LIVE_CHAIN_ID` 可让所有 provider 使用同一个替代链，但该链必须在对应 provider 的 `supported_chains()` 中。
+需要 access key 的 provider 从 `config.json` 读取凭据；缺少必需字段时测试明确 `SKIP`，不会发请求。Bebop、Kyber、LiquidSwap、Odos、OpenOcean、Velora 即使没有 key 也会尝试进入测试。Ethereum、Optimism、Base、Arbitrum 使用公开的 WETH/USDC 默认输入；HyperEVM 使用 WHYPE/USDT0，Berachain 使用 native/HONEY。可通过 `METAMATCH_LIVE_BUY_TOKEN_<chainId>`、`METAMATCH_LIVE_SELL_TOKEN_<chainId>` 和 `METAMATCH_LIVE_SELL_AMOUNT_<chainId>` 覆盖输入，但不会把这些测试默认值引入产品 token registry。`METAMATCH_LIVE_CHAIN_ID` 可让所有 provider 使用同一个替代链，但该链必须在对应 provider 的 `supported_chains()` 中。
 
 每个实际发出请求的 live test 都要求全程 HTTP 2xx，并且生产 adapter 必须返回通过安全校验的归一化 `Route`；只有“服务器返回了错误”不算通过。live 结果会受上游限流、IP 策略、实时流动性和服务变更影响，不属于普通 CI 门禁。OpenOcean 官方公开 API 虽免 key，但 403 表示出口 IP 被安全策略拦截，需要联系 OpenOcean 加白，详见验证文档。
 
 ### 重放完整 ETH → USDC 竞赛
 
-`tests/replay_live.rs` 使用上面同一个无 taker 的 1 ETH → USDC 请求，经过真实 Axum 路由、生产 provider adapter 和配置的 RPC。它自动将可选 `.env` 解析到局部配置 map，进程环境变量优先，不修改测试进程的全局环境。需要显式启用，运行会消耗上游配额：
+`tests/replay_live.rs` 从 `config.json` 加载应用设置，要求通过 `METAMATCH_LIVE_TAKER` 显式提供真实 taker，经过 Axum、生产 adapter 和配置的 RPC。仅在显式启用时运行，会消耗上游配额，不签名、不广播：
 
 ```sh
 METAMATCH_RUN_LIVE_REPLAY=1 cargo test --test replay_live -- --ignored --nocapture
@@ -95,34 +86,21 @@ METAMATCH_RUN_LIVE_REPLAY=1 cargo test --test replay_live -- --ignored --nocaptu
 ## 测试
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
-cargo build --release
-# 另需 Foundry 的 forge 在 PATH 中
-forge fmt --root contracts --check
-forge build --root contracts --deny-warnings
-forge test --root contracts
-cargo test --test e2e_local -- --ignored --nocapture
-# 显式配置 key/token 后再运行真实 provider smoke；默认不会访问外部服务
-# METAMATCH_RUN_LIVE_PROVIDER_TESTS=1 cargo test --test providers_live -- --ignored --nocapture
+# 需要 Rust 工具链及 Foundry 的 forge/anvil 在 PATH 中
+sh scripts/check.sh
 ```
+
+完整命令顺序只维护在 [scripts/check.sh](scripts/check.sh)，本地与 CI 共用：Rust fmt、Clippy、测试、release build、Foundry fmt/build/test、隔离 Anvil E2E。任一步失败即退出；不会开启生产 provider/RPC 测试。依赖已缓存时可使用 `CARGO_NET_OFFLINE=true sh scripts/check.sh`，这只是 Cargo 的离线选项，不是应用配置。
 
 Rust 当前已覆盖 domain/config、HTTP/provider/RPC fixture、ABI 编码、仿真失败分类、单请求 HTTP 竞赛、总超时/取消、真实 taker 执行边界和本地 Anvil E2E。生产 `src/` 不包含测试模块；测试统一放在 `tests/`。
 
 ## 格式化、Lint 与 AI agent
 
-代码质量入口已经统一到 Cargo 与 Foundry：
+迭代时可单独格式化，交付前运行上述统一质量门：
 
 ```sh
 cargo fmt --all       # 格式化 Rust
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
-cargo build --release
-forge fmt --root contracts --check
-forge build --root contracts --deny-warnings
-forge test --root contracts
+forge fmt --root contracts
 ```
 
 Rust 通过 `rustfmt`、Clippy 和 Cargo 测试保持代码质量；Solidity 不引入第二套 formatter，以 Foundry `forge fmt` 为唯一格式来源。生成的 `target`、Foundry `out/cache` 和本地密钥均被忽略。
@@ -131,11 +109,11 @@ Rust 通过 `rustfmt`、Clippy 和 Cargo 测试保持代码质量；Solidity 不
 
 更细的 agent skill 说明见 [docs/AI-AGENT.md](docs/AI-AGENT.md)。仓库内的 `.agents/skills/` 按供应商适配、合约安全、质量门拆分工作流；当前不自动安装外部 plugin，避免在没有明确授权时引入第三方账号、私有数据或部署能力。
 
-GitHub Actions 位于 `.github/workflows/ci.yml`，在每个 push/PR 上执行 Rust 格式、Clippy、测试、release build 和 Foundry 合约质量门。CI 没有生产密钥，也不会部署或广播交易。
+GitHub Actions 位于 `.github/workflows/ci.yml`，对 main 分支的 push/PR 调用同一个 `scripts/check.sh`。CI 没有生产密钥，不会部署或广播真实网络交易。
 
-`cargo test --test e2e_local -- --ignored --nocapture` 启动并清理独立本地 Anvil，用测试 Token、测试 Provider 与 mock Holder 跑 Rust HTTP → 仿真 → 授权 → 重建 → 实际本地成交；它不是主网 fork，也不证明真实上游供应商可执行。
+`cargo test --test e2e_local -- --ignored --nocapture` 可单独启动并清理独立本地 Anvil，用测试 Token、测试 Provider 与 mock Holder 跑 Rust HTTP → 仿真 → 执行返回的同一组授权/swap → 实际本地成交；没有二次 build，不是主网 fork，也不证明真实上游供应商可执行。
 
-Dockerfile 已切换为 Rust multi-stage 构建，镜像构建需另行验证；此版本不要求 Docker。任何真实部署前须完成供应商条款/限流评估、真实 AllowanceHolder 主网 fork、RPC 兼容性、合约外部审计、小额人工验收与多签管理。
+Dockerfile 已切换为 Rust multi-stage 构建，镜像构建需另行验证；此版本不要求 Docker。任何真实部署前须完成供应商条款/限流评估、真实 AllowanceHolder 主网 fork、RPC 兼容性、合约外部审计、小额人工验收与部署权限核验。
 
 ## 运维边界
 

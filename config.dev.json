@@ -1,0 +1,26 @@
+{
+  "host": "127.0.0.1",
+  "port": 3000,
+  "competitionTimeoutMs": 6000,
+  "maxActive": 20,
+  "chains": {
+    "8453": { "rpcUrl": null, "router": "0x952c4C22B097787B29Cc114515D8a3cDc1bA6CeB" }
+  },
+  "alchemyApiKey": "alch_bM2_GlyWZ_B6j_tMS3xL2",
+  "balanceSlots": {},
+  "providerKeys": {
+    "0x": "cab6b114-42e0-465e-8cee-a73cb556d768",
+    "1inch": null,
+    "barter": null,
+    "bebop": null,
+    "enso": "4126328a-4236-43aa-8410-8e38670abca8",
+    "hyperBloom": null,
+    "kyber": null,
+    "odos": null,
+    "oogaBooga": null,
+    "okx": null
+  },
+  "okxSecretKey": null,
+  "okxPassphrase": null,
+  "okxProjectId": null
+}

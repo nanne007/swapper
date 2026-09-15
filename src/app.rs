@@ -3,7 +3,7 @@ use crate::{
     api_error::ApiError,
     competitions::{CompetitionResponse, Competitions, Services},
     config::Config,
-    domain::{CreateCompetitionRequest, validate_input},
+    domain::Input,
 };
 use axum::{
     Json, Router,
@@ -15,25 +15,16 @@ use axum::{
 };
 use axum_extra::extract::WithRejection;
 use serde::Serialize;
+use std::sync::Arc;
 
-#[derive(Clone)]
-pub struct AppState {
-    pub competitions: Competitions,
+pub async fn create_app(config: Config) -> anyhow::Result<Router> {
+    let services = Services::production(&config).await?;
+    Ok(create_app_with_services(config, services))
 }
 
-pub struct App {
-    pub router: Router,
-}
-
-pub fn create_app(config: Config) -> App {
-    create_app_with_services(config, None)
-}
-
-pub fn create_app_with_services(config: Config, services: Option<Services>) -> App {
-    let state = AppState {
-        competitions: Competitions::new(config, services),
-    };
-    let router = Router::new()
+pub fn create_app_with_services(config: Config, services: Services) -> Router {
+    let competitions = Arc::new(Competitions::new(config, services));
+    Router::new()
         .route("/health", get(health))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/competitions", post(create_competition))
@@ -41,8 +32,7 @@ pub fn create_app_with_services(config: Config, services: Option<Services>) -> A
         .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::extract::DefaultBodyLimit::max(16_384))
         .layer(map_response(no_store))
-        .with_state(state);
-    App { router }
+        .with_state(competitions)
 }
 
 #[derive(Debug, Serialize)]
@@ -68,24 +58,19 @@ struct ChainCapabilities {
     net_fee_comparison: &'static str,
 }
 
-async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
+async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
         storage: "none",
     })
 }
 
-async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesResponse> {
-    let chains = state
-        .competitions
+async fn capabilities(State(competitions): State<Arc<Competitions>>) -> Json<CapabilitiesResponse> {
+    let chains = competitions
         .chains()
         .iter()
         .map(|chain| {
-            let providers = state
-                .competitions
-                .provider_ids_for_chain(chain.id)
-                .into_iter()
-                .collect::<Vec<_>>();
+            let providers = competitions.provider_ids_for_chain(chain.id);
             ChainCapabilities {
                 chain_id: chain.id,
                 name: chain.name.clone(),
@@ -105,11 +90,11 @@ async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRespons
 }
 
 async fn create_competition(
-    State(state): State<AppState>,
-    WithRejection(Json(body), _): WithRejection<Json<CreateCompetitionRequest>, ApiError>,
+    State(competitions): State<Arc<Competitions>>,
+    WithRejection(Json(input), _): WithRejection<Json<Input>, ApiError>,
 ) -> Result<Json<CompetitionResponse>, ApiError> {
-    let input = validate_input(body)?;
-    Ok(Json(state.competitions.create(input).await?))
+    input.validate()?;
+    Ok(Json(competitions.create(input).await?))
 }
 
 async fn not_found() -> ApiError {

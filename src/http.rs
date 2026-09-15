@@ -3,7 +3,6 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use futures::StreamExt;
 use serde::de::DeserializeOwned;
-use serde_json::Value;
 use std::{collections::HashMap, time::Duration};
 
 pub const MAX_RESPONSE_BYTES: usize = 2_000_000;
@@ -97,11 +96,11 @@ impl HttpClient for ReqwestClient {
     }
 }
 
-pub async fn json_request(
+pub async fn json_request_as<T: DeserializeOwned>(
     client: &dyn HttpClient,
     request: HttpRequest,
     timeout: Duration,
-) -> anyhow::Result<Value> {
+) -> anyhow::Result<T> {
     // Only provider host/path are used here; RPC credentials never pass through this client.
     let endpoint = url::Url::parse(&request.url)
         .ok()
@@ -134,23 +133,31 @@ pub async fn json_request(
     if response.body.is_empty() {
         anyhow::bail!(ErrorKind::UpstreamEmpty);
     }
-    serde_json::from_slice(&response.body)
-        .context(ErrorKind::UpstreamInvalidJson)
-        .with_context(|| format!("{endpoint}: JSON decode"))
-}
-
-pub async fn json_request_as<T: DeserializeOwned>(
-    client: &dyn HttpClient,
-    request: HttpRequest,
-    timeout: Duration,
-) -> anyhow::Result<T> {
-    let raw = json_request(client, request, timeout).await?;
-    serde_path_to_error::deserialize(raw).map_err(|error| {
+    let mut deserializer = serde_json::Deserializer::from_slice(&response.body);
+    let result = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| {
         let path = error.path().to_string();
-        anyhow::Error::new(error)
-            .context(ErrorKind::UpstreamInvalidResponse)
-            .context(format!("decode {} at {path}", std::any::type_name::<T>()))
-    })
+        let kind = if error.inner().is_data() {
+            // A DTO can reject an early field before reaching malformed trailing input.
+            // Only on this error path, validate syntax without allocating a Value tree.
+            if let Err(syntax) = serde_json::from_slice::<serde::de::IgnoredAny>(&response.body) {
+                return anyhow::Error::new(syntax)
+                    .context(ErrorKind::UpstreamInvalidJson)
+                    .context(format!("{endpoint}: JSON decode"));
+            }
+            ErrorKind::UpstreamInvalidResponse
+        } else {
+            ErrorKind::UpstreamInvalidJson
+        };
+        anyhow::Error::new(error).context(kind).context(format!(
+            "{endpoint}: decode {} at {path}",
+            std::any::type_name::<T>()
+        ))
+    })?;
+    deserializer
+        .end()
+        .context(ErrorKind::UpstreamInvalidJson)
+        .with_context(|| format!("{endpoint}: trailing JSON"))?;
+    Ok(result)
 }
 
 #[derive(Debug, thiserror::Error)]

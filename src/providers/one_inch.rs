@@ -74,20 +74,23 @@ impl Provider for OneInchProvider {
             anyhow::bail!(ErrorKind::UpstreamStateOverridesUnsupported);
         }
         let buy_amount = positive_string(&response.dst_amount)?;
-        let transaction = response.tx.into_tx(sender)?;
         let spender = parse_address("0x111111125421ca6dc452d289314280a0f8842a65")?;
-        if transaction.to != spender {
+        if parse_address(&response.tx.to)? != spender {
             anyhow::bail!(ErrorKind::Unexpected1inchContract);
         }
-        Ok(Route {
-            provider: self.id(),
-            min_buy_amount: minimum(&buy_amount, input.slippage_bps)?,
-            buy_amount,
-            sell_amount: input.sell_amount.clone(),
-            spender,
-            tx: transaction,
-            deadline: None,
-        })
+        normalize_route(
+            self.id(),
+            input,
+            sender,
+            RouteCandidate {
+                min_buy_amount: minimum(&buy_amount, input.slippage_bps)?,
+                buy_amount,
+                sell_amount: input.sell_amount.clone(),
+                spender,
+                tx: response.tx,
+                deadline: None,
+            },
+        )
     }
 }
 

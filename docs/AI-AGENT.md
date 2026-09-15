@@ -6,7 +6,7 @@
 
 1. `AGENTS.md` 是 coding agent 的总规则：产品范围、模块边界、资金安全不变量、禁止事项和质量门。
 2. `.agents/skills/*/SKILL.md` 是按任务触发的低上下文工作流，只加载当前任务需要的 skill。
-3. `.github/workflows/ci.yml` 是机器强制的质量门，不依赖 agent 是否记得执行命令。CI 不持有生产密钥，也不执行部署和广播。
+3. `.github/workflows/ci.yml` 调用 `scripts/check.sh` 执行与本地一致的质量门，不依赖 agent 是否记得执行命令。CI 不持有生产密钥，也不执行真实网络部署和广播。
 
 ## Skill 选择
 
@@ -15,7 +15,7 @@
 | 修改 competition、quote、simulation、transactions、ranking、总 deadline 或公共状态 | `metamatch-domain-modeling` | simulated output、overridden funding、状态语义、taker 绑定、底价不可降低、fixture 边界 |
 | 修改 0x、1inch、KyberSwap 或其他报价源 | `metamatch-provider-adapter` | 固定官方 endpoint、serde DTO、target/spender/selector/value 校验、fixture 契约 |
 | 修改 RPC、`eth_call`、`eth_simulateV1`、state override、费用或重组检查 | `metamatch-evm-simulation` | Alloy typed RPC、固定 block context、顺序调用、余额差、gas、unsupported/reorg |
-| 修改 MetaRouter、AllowanceHolder、Token、退款、最小到账、recover 或管理员转移 | `metamatch-contract-safety` | 路由三元组白名单、禁止直接 token target、exact spend、余额差、recover/swap 共用锁、两步 ownership 和 Foundry fuzz |
+| 修改 MetaRouter、AllowanceHolder、Token、退款、receiver 或最小到账 | `metamatch-contract-safety` | permissionless、Holder sender 身份、精确输入与临时授权、receiver 最终余额差、净 sold、退款与重入、Foundry fuzz；无关暂存资产不受保护 |
 | 修改测试、fixture、Foundry fuzz、Anvil E2E 或验收证据 | `metamatch-test-verification` | 行为/不变量、证据分层、避免过度 mock、区分 fixture 和 local EVM |
 | 修改 Cargo、Clippy、Foundry、CI 或准备交付 | `metamatch-quality-gates` | fmt → clippy → test → release build → contract → E2E |
 

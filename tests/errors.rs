@@ -5,7 +5,7 @@ use axum::{Json, Router, response::IntoResponse, routing::post};
 use http_body_util::BodyExt;
 use metamatch_backend::{
     api_error::ApiError,
-    http::{HttpRequest, UpstreamHttpError, json_request, json_request_as},
+    http::{HttpRequest, UpstreamHttpError, json_request_as},
     rpc::{RpcClients, map_rpc_error},
 };
 use serde::Deserialize;
@@ -79,6 +79,38 @@ fn http_request() -> HttpRequest {
 }
 
 #[tokio::test]
+async fn typed_http_decode_rejects_trailing_json_and_distinguishes_syntax_from_schema() {
+    for (body, code) in [
+        (r#"{"data":[{"amount":"1"}]} {}"#, "UPSTREAM_INVALID_JSON"),
+        (r#"{"data":[{"amount":"1"}]"#, "UPSTREAM_INVALID_JSON"),
+        (r#"{"data":[{"amount":1}]}"#, "UPSTREAM_INVALID_RESPONSE"),
+        (
+            r#"{"data":[{"amount":1}], "broken": ]}"#,
+            "UPSTREAM_INVALID_JSON",
+        ),
+        (
+            r#"{"data":[{"amount":"1","amount":"2"}]}"#,
+            "UPSTREAM_INVALID_RESPONSE",
+        ),
+    ] {
+        let client = support::MockHttp::default();
+        client
+            .responses
+            .lock()
+            .unwrap()
+            .push(metamatch_backend::http::HttpResponse {
+                status: 200,
+                body: body.as_bytes().to_vec(),
+            });
+        let error = json_request_as::<Envelope>(&client, http_request(), Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert_eq!(ApiError::from(&error).code, code, "{body}");
+        assert!(error.chain().count() >= 2);
+    }
+}
+
+#[tokio::test]
 async fn http_status_and_serde_path_are_preserved_as_internal_causes() {
     let client = support::MockHttp::default();
     client
@@ -89,7 +121,7 @@ async fn http_status_and_serde_path_are_preserved_as_internal_causes() {
             status: 403,
             body: br#"{"message":"fixture-secret access denied"}"#.to_vec(),
         });
-    let error = json_request(&client, http_request(), Duration::from_secs(1))
+    let error = json_request_as::<Value>(&client, http_request(), Duration::from_secs(1))
         .await
         .unwrap_err();
     assert_eq!(
@@ -166,8 +198,8 @@ async fn alloy_rpc_error_keeps_method_code_and_original_cause() {
 #[tokio::test]
 async fn simulation_preserves_per_call_revert_details_internally() {
     use metamatch_backend::{
-        domain::{NATIVE, PREVIEW_TAKER},
-        simulation::{SimulationCallError, SimulationRequest, Simulator},
+        domain::NATIVE,
+        simulation::{SimulationCallError, Simulator},
     };
     let mut chain = support::chain(&support::config(), 1);
     let server = support::FixtureRpc {
@@ -177,6 +209,9 @@ async fn simulation_preserves_per_call_revert_details_internally() {
     .start()
     .await;
     chain.rpc_url = Some(server.url.clone());
+    chain.router = Some(support::deployment(alloy_primitives::Address::repeat_byte(
+        0x22,
+    )));
     let input = support::input(1, NATIVE);
     let simulator = Simulator::new(
         std::sync::Arc::new(RpcClients::new(Duration::from_secs(1))),
@@ -184,18 +219,15 @@ async fn simulation_preserves_per_call_revert_details_internally() {
             Default::default(),
         )),
     );
-    let error = simulator
-        .run(SimulationRequest {
-            input: &input,
-            chain: &chain,
-            route: &support::fixture_route(&input),
-            context: &support::fixture_context(),
-            rules: &[],
-            taker: PREVIEW_TAKER,
-            min: None,
-        })
-        .await
-        .unwrap_err();
+    let error = support::simulate(
+        &simulator,
+        &input,
+        &chain,
+        &support::fixture_route(&input),
+        &support::fixture_context(),
+    )
+    .await
+    .unwrap_err();
     let simulation = *error
         .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
         .unwrap();
@@ -252,16 +284,18 @@ impl metamatch_backend::providers::Provider for SlowProvider {
 async fn provider_deadline_still_produces_a_quote_failure() {
     use metamatch_backend::competitions::{Competitions, Services};
     use std::sync::Arc;
-    let config = support::config_with(&[("COMPETITION_TIMEOUT_MS", "100")]);
+    let config = support::config_with(serde_json::json!({"competitionTimeoutMs":100}));
     let mut chain = support::chain(&config, 1);
-    chain.router = Some(alloy_primitives::Address::repeat_byte(0x22));
+    chain.router = Some(support::deployment(alloy_primitives::Address::repeat_byte(
+        0x22,
+    )));
     let services = Services::new(
         vec![Arc::new(SlowProvider)],
         &[chain],
         Arc::new(support::MockContext),
         Arc::new(support::MockSimulation),
     );
-    let competitions = Competitions::new(config, Some(services));
+    let competitions = Competitions::new(config, services);
     let created = competitions
         .create(support::input(1, metamatch_backend::domain::NATIVE))
         .await

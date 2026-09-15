@@ -117,19 +117,24 @@ impl Provider for KyberProvider {
             None if input.sell_token == NATIVE => input.sell_amount.clone(),
             None => String::from("0"),
         };
-        Ok(Route {
-            provider: self.id(),
-            buy_amount: amount_out.clone(),
-            min_buy_amount: minimum(&amount_out, input.slippage_bps)?,
-            sell_amount: input.sell_amount.clone(),
-            spender: built_router,
-            tx: Tx {
-                to: built_router,
-                data: parse_hex(&data.data)?,
-                value: transaction_value,
+        normalize_route(
+            self.id(),
+            input,
+            sender,
+            RouteCandidate {
+                buy_amount: amount_out.clone(),
+                min_buy_amount: minimum(&amount_out, input.slippage_bps)?,
+                sell_amount: input.sell_amount.clone(),
+                spender: built_router,
+                tx: RawTransaction {
+                    to: data.router_address,
+                    data: data.data,
+                    value: Value::String(transaction_value),
+                    from: None,
+                },
+                deadline: None,
             },
-            deadline: None,
-        })
+        )
     }
 }
 

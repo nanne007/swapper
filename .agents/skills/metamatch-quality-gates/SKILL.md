@@ -5,22 +5,17 @@ description: 'Run or modify the MetaMatch Cargo, Clippy, test, release, Solidity
 
 # MetaMatch quality gates
 
-Read `AGENTS.md`, `Cargo.toml`, `rust-toolchain.toml`, `contracts/foundry.toml`, and `.github/workflows/ci.yml` first. Keep local fixtures, the Anvil E2E, and any future live integration clearly separated.
+Read `AGENTS.md`, `Cargo.toml`, `rust-toolchain.toml`, `contracts/foundry.toml`, `scripts/check.sh`, and `.github/workflows/ci.yml` first. Keep local fixtures, the Anvil E2E, and live integration clearly separated.
 
 ## Local sequence
 
 Use the smallest relevant command while iterating, then run the complete sequence:
 
 ```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all
-cargo build --release
-forge fmt --root contracts --check
-forge build --root contracts --deny-warnings
-forge test --root contracts
-cargo test --test e2e_local -- --ignored --nocapture
+sh scripts/check.sh
 ```
+
+`scripts/check.sh` owns the exact commands and is also invoked by CI. Modify the sequence there, not in copied lists. For cached offline dependencies, use `CARGO_NET_OFFLINE=true sh scripts/check.sh`; this changes Cargo dependency resolution only, not application configuration.
 
 `forge fmt` is the only Solidity formatter. Do not weaken Clippy, compiler warnings, assertions, or security checks to make a gate green.
 

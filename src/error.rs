@@ -33,8 +33,6 @@ pub enum ErrorKind {
     QuoteExpired,
     #[error("ROUTER_NOT_CONFIGURED")]
     RouterNotConfigured,
-    #[error("ROUTE_NOT_ALLOWLISTED")]
-    RouteNotAllowlisted,
     #[error("RPC_CALL_FAILED")]
     RpcCallFailed,
     #[error("RPC_CHAIN_MISMATCH")]

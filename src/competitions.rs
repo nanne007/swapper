@@ -1,14 +1,16 @@
 use crate::error::ErrorKind;
 use crate::{
     balance_slots::BalanceSlots,
-    chains::configured_chains,
+    chains::bootstrap_chains,
     config::Config,
     domain::{Chain, Context, Input, Quote, is_reserved_address, parse_positive, parse_uint, rank},
-    execution::validate_route,
+    execution::{ValidatedRoute, validate_route},
     http::ReqwestClient,
     providers::{Provider, ProviderRegistry, create_providers},
     rpc::{ContextProvider, ContextSource, RpcClients},
-    simulation::{SimulationFailure, SimulationProvider, SimulationRequest, Simulator},
+    simulation::{
+        SimulationFailure, SimulationPreparation, SimulationProvider, SimulationRequest, Simulator,
+    },
 };
 use anyhow::Context as _;
 use futures::future::join_all;
@@ -50,13 +52,13 @@ impl Services {
         }
     }
 
-    pub fn production(config: &Config) -> Self {
+    pub async fn production(config: &Config) -> anyhow::Result<Self> {
         let client = Arc::new(ReqwestClient::default());
         let providers = create_providers(config, client.clone());
         let registry = ProviderRegistry::new(providers);
-        let chains = configured_chains(config, registry.chain_ids());
         let clients = Arc::new(RpcClients::new(Duration::from_millis(config.timeout_ms)));
-        Self {
+        let chains = bootstrap_chains(config, registry.chain_ids(), &clients).await?;
+        Ok(Self {
             registry,
             chains,
             context: Arc::new(ContextSource::new(clients.clone())),
@@ -64,7 +66,7 @@ impl Services {
                 clients,
                 Arc::new(BalanceSlots::new(config.balance_slots.clone())),
             )),
-        }
+        })
     }
 }
 
@@ -76,8 +78,7 @@ pub struct Competitions {
 }
 
 impl Competitions {
-    pub fn new(config: Config, services: Option<Services>) -> Self {
-        let services = services.unwrap_or_else(|| Services::production(&config));
+    pub fn new(config: Config, services: Services) -> Self {
         let active = Arc::new(Semaphore::new(config.max_active));
         Self {
             config: Arc::new(config),
@@ -108,7 +109,11 @@ impl Competitions {
             .iter()
             .find(|chain| chain.id == input.chain_id)
             .context(ErrorKind::InvalidInput)?;
-        if chain.router == Some(input.taker) || is_reserved_address(input.taker) {
+        if chain
+            .router
+            .is_some_and(|router| input.taker == router.address || input.taker == router.holder)
+            || is_reserved_address(input.taker)
+        {
             anyhow::bail!(ErrorKind::InvalidTaker);
         }
         let _permit = self
@@ -144,7 +149,7 @@ impl Competitions {
             // Routes must precede the shared context: an upstream route can be built
             // from state newer than a context fetched before the provider requests.
             let route_outcomes = join_all(providers.iter().map(|provider| {
-                self.fetch_route(provider.as_ref(), &input, chain, sender, deadline)
+                self.fetch_route(provider.as_ref(), &input, chain, sender.address, deadline)
                     .instrument(tracing::info_span!("provider", provider = provider.id()))
             }))
             .await;
@@ -157,15 +162,29 @@ impl Competitions {
             }
 
             if !routes.is_empty() {
-                let context = timeout_at(deadline, self.services.context.get(&input, chain))
-                    .await
-                    .context(ErrorKind::UpstreamTimeout)
-                    .and_then(|result| result);
-                match context {
-                    Ok(context) => {
-                        let outcomes = join_all(routes.into_iter().map(|route| {
-                            let provider = route.provider;
-                            self.simulate(route, &input, chain, &context, deadline)
+                let prepared = timeout_at(deadline, async {
+                    let context = self.services.context.get(&input, chain).await?;
+                    let preparation_started = Instant::now();
+                    let preparation = self
+                        .services
+                        .simulator
+                        .prepare(&input, chain, &context)
+                        .await?;
+                    Ok::<_, anyhow::Error>((
+                        context,
+                        preparation,
+                        preparation_started.elapsed().as_millis() as u64,
+                    ))
+                })
+                .await
+                .context(ErrorKind::UpstreamTimeout)
+                .and_then(|result| result);
+                match prepared {
+                    Ok((context, preparation, preparation_ms)) => {
+                        let outcomes = join_all(routes.into_iter().map(|mut route| {
+                            route.latency_ms += preparation_ms;
+                            let provider = route.route.provider;
+                            self.simulate(route, &input, chain, &context, &preparation, deadline)
                                 .instrument(tracing::info_span!("provider", provider))
                         }))
                         .await;
@@ -180,7 +199,7 @@ impl Competitions {
                         let code = quote_error_code(&error);
                         failures.extend(routes.into_iter().map(|route| {
                             provider_failure(
-                                route.provider,
+                                route.route.provider,
                                 &error,
                                 code.clone(),
                                 started.elapsed().as_millis() as u64,
@@ -215,21 +234,14 @@ impl Competitions {
             if route.provider != provider.id() {
                 anyhow::bail!(ErrorKind::InvalidRoute);
             }
-            let rules = provider.rules(chain.id);
-            validate_route(input, chain, &route, &rules, true)?;
-            Ok((route, rules))
+            validate_route(input, route)
         })
         .await
         .context(ErrorKind::UpstreamTimeout)
         .and_then(|result| result);
         let latency_ms = started.elapsed().as_millis() as u64;
         result
-            .map(|(route, rules)| PreparedRoute {
-                provider: provider.id(),
-                route,
-                rules,
-                quote_latency_ms: latency_ms,
-            })
+            .map(|route| PreparedRoute { route, latency_ms })
             .map_err(|error| {
                 provider_failure(provider.id(), &error, quote_error_code(&error), latency_ms)
             })
@@ -241,8 +253,10 @@ impl Competitions {
         input: &Input,
         chain: &Chain,
         context: &Context,
+        preparation: &SimulationPreparation,
         deadline: Instant,
     ) -> Result<Quote, ProviderFailure> {
+        let provider = prepared.route.provider;
         let started = Instant::now();
         let result = timeout_at(deadline, async {
             let result = self
@@ -253,9 +267,7 @@ impl Competitions {
                     chain,
                     route: &prepared.route,
                     context,
-                    rules: &prepared.rules,
-                    taker: input.taker,
-                    min: None,
+                    preparation,
                 })
                 .await?;
             if parse_positive(&result.simulation.bought_amount)?
@@ -266,7 +278,7 @@ impl Competitions {
                 ));
             }
             Ok(Quote {
-                route: prepared.route,
+                route: prepared.route.into_inner(),
                 simulation: result.simulation,
                 approvals: result.approvals,
                 transaction: result.transaction,
@@ -276,28 +288,21 @@ impl Competitions {
         .await
         .context(ErrorKind::UpstreamTimeout)
         .and_then(|result| result);
-        let latency_ms = prepared.quote_latency_ms + started.elapsed().as_millis() as u64;
+        let latency_ms = prepared.latency_ms + started.elapsed().as_millis() as u64;
         result
             .map(|mut quote| {
                 quote.latency_ms = latency_ms;
                 quote
             })
             .map_err(|error| {
-                provider_failure(
-                    prepared.provider,
-                    &error,
-                    quote_error_code(&error),
-                    latency_ms,
-                )
+                provider_failure(provider, &error, quote_error_code(&error), latency_ms)
             })
     }
 }
 
 struct PreparedRoute {
-    provider: &'static str,
-    route: crate::domain::Route,
-    rules: Vec<crate::domain::Rule>,
-    quote_latency_ms: u64,
+    route: ValidatedRoute,
+    latency_ms: u64,
 }
 
 #[derive(Debug, Serialize)]

@@ -2,7 +2,7 @@ use crate::error::ErrorKind;
 use crate::{
     config::Config,
     domain::{
-        Address, Chain, Input, NATIVE, Route, Rule, Tx, minimum, parse_address, parse_hex,
+        Address, Chain, Input, NATIVE, Route, Tx, minimum, parse_address, parse_hex,
         parse_positive, parse_uint,
     },
     http::{HttpClient, HttpRequest, auth_headers, json_request_as, url_with_params},
@@ -45,10 +45,6 @@ pub trait Provider: Send + Sync {
     /// Chains this configured adapter can actually enter in the competition.
     fn supported_chains(&self) -> Vec<u64>;
 
-    /// Provider-specific route tuples used by the off-chain preflight check.
-    fn rules(&self, _chain_id: u64) -> Vec<Rule> {
-        Vec::new()
-    }
     async fn quote(&self, input: &Input, chain: &Chain, sender: Address) -> anyhow::Result<Route>;
 }
 
@@ -172,10 +168,6 @@ impl ProviderRegistry {
         ids.iter()
             .filter_map(|id| self.providers.get(id).cloned())
             .collect()
-    }
-
-    pub fn get(&self, id: &str) -> Option<Arc<dyn Provider>> {
-        self.providers.get(id).cloned()
     }
 
     pub fn by_chain(&self) -> &HashMap<u64, Vec<&'static str>> {
