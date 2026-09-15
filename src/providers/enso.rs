@@ -112,7 +112,7 @@ impl Provider for EnsoProvider {
                 min_buy_amount: response.min_amount_out,
                 spender,
                 tx: response.tx,
-                expires_at: crate::domain::now_ms().saturating_add(20_000),
+                deadline: None,
             },
         )
     }

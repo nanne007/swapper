@@ -1,12 +1,14 @@
 use crate::error::ErrorKind;
 use crate::{
+    balance_slots::{BalanceSlotError, BalanceSlots, storage_key},
     domain::{
-        Address, Chain, Context, Input, NATIVE, Route, Rule, Simulation, Tx, parse_hex, parse_uint,
+        Address, Chain, Context, Input, NATIVE, Route, Rule, SimulationSuccess, Tx, parse_hex,
+        parse_uint,
     },
     execution::{allowance_data, approval, balance_data, swap_transaction},
     rpc::{RpcClients, block_id, block_number, map_rpc_error},
 };
-use alloy_primitives::{B256, Bytes, U256, keccak256};
+use alloy_primitives::{B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider};
 use alloy_rpc_types_eth::{
     BlockOverrides, TransactionInput, TransactionRequest,
@@ -19,7 +21,7 @@ use std::sync::Arc;
 
 #[derive(Debug)]
 pub struct SimResult {
-    pub simulation: Simulation,
+    pub simulation: SimulationSuccess,
     pub approvals: Vec<Tx>,
     pub transaction: Tx,
 }
@@ -39,7 +41,6 @@ pub struct SimulationRequest<'a> {
     pub context: &'a Context,
     pub rules: &'a [Rule],
     pub taker: Address,
-    pub actual: bool,
     pub min: Option<&'a str>,
 }
 
@@ -50,11 +51,15 @@ pub trait SimulationProvider: Send + Sync {
 
 pub struct Simulator {
     clients: Arc<RpcClients>,
+    balance_slots: Arc<BalanceSlots>,
 }
 
 impl Simulator {
-    pub fn new(clients: Arc<RpcClients>) -> Self {
-        Self { clients }
+    pub fn new(clients: Arc<RpcClients>, balance_slots: Arc<BalanceSlots>) -> Self {
+        Self {
+            clients,
+            balance_slots,
+        }
     }
 
     pub async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
@@ -65,7 +70,6 @@ impl Simulator {
             context,
             rules,
             taker,
-            actual,
             min,
         } = request;
         let transaction = swap_transaction(input, chain, route, rules, min)?;
@@ -87,51 +91,16 @@ impl Simulator {
             }
         }
         let mut overrides = StateOverride::default();
-        let native_balance = rpc
-            .get_balance(taker)
-            .block_id(block)
-            .await
-            .map_err(|error| rpc_failure(map_rpc_error("eth_getBalance", error)))?;
         let transaction_value = parse_uint(&transaction.value)?;
         let gas_price = parse_uint(&context.gas_price)?;
-        if actual && native_balance < transaction_value {
-            anyhow::bail!(SimulationFailure::Reverted(
-                "INSUFFICIENT_NATIVE_BALANCE_FOR_GAS"
-            ));
-        }
         if input.sell_token != NATIVE {
-            let balance = self
-                .read_balance(&rpc, input.sell_token, taker, block)
+            let base = self
+                .balance_slots
+                .resolve(&rpc, chain.id, input.sell_token, block)
                 .await
-                .map_err(rpc_failure)?;
-            if balance < parse_uint(&input.sell_amount)? {
-                if actual {
-                    anyhow::bail!(SimulationFailure::Reverted("INSUFFICIENT_SELL_BALANCE"));
-                }
-                let Some(slot) = chain.balance_slots.get(&format!("{:#x}", input.sell_token))
-                else {
-                    anyhow::bail!(SimulationFailure::Unsupported(
-                        "BALANCE_OVERRIDE_SLOT_UNCONFIGURED"
-                    ));
-                };
-                let amount = parse_uint(&input.sell_amount)?;
-                let key = balance_storage_key(taker, *slot);
-                overrides
-                    .entry(input.sell_token)
-                    .or_default()
-                    .set_state_diff([(key, B256::from(amount.to_be_bytes::<32>()))]);
-                let overridden = rpc
-                    .call(balance_call(input.sell_token, taker)?)
-                    .block(block)
-                    .overrides(overrides.clone())
-                    .await
-                    .map_err(|error| rpc_failure(map_rpc_error("eth_call", error)))?;
-                if parse_return_word(&overridden)? != amount {
-                    anyhow::bail!(SimulationFailure::Unsupported(
-                        "BALANCE_OVERRIDE_VALIDATION_FAILED"
-                    ));
-                }
-            }
+                .map_err(balance_slot_failure)?;
+            let amount = parse_uint(&input.sell_amount)?;
+            overrides = token_balance_override(input.sell_token, storage_key(taker, base), amount);
             let spender = chain
                 .router
                 .map_or(route.spender, |_| crate::domain::HOLDER);
@@ -173,17 +142,10 @@ impl Simulator {
                     * U256::from(call.gas_price.unwrap_or_default())
         });
         let required_native = transaction_value + gas_budget;
-        if actual && native_balance < required_native {
-            anyhow::bail!(SimulationFailure::Reverted(
-                "INSUFFICIENT_NATIVE_BALANCE_FOR_GAS"
-            ));
-        }
-        if !actual {
-            overrides
-                .entry(taker)
-                .or_default()
-                .set_balance(required_native.max(native_balance));
-        }
+        overrides
+            .entry(taker)
+            .or_default()
+            .set_balance(required_native);
         let payload = SimulatePayload {
             block_state_calls: vec![SimBlock {
                 block_overrides: Some(BlockOverrides {
@@ -250,14 +212,6 @@ impl Simulator {
         let gas_used = call_results[1..call_results.len() - 1]
             .iter()
             .fold(U256::ZERO, |sum, call| sum + U256::from(call.gas_used));
-        if actual
-            && native_balance
-                < transaction_value + gas_used * gas_price * U256::from(12) / U256::from(10)
-        {
-            anyhow::bail!(SimulationFailure::Reverted(
-                "INSUFFICIENT_NATIVE_BALANCE_FOR_GAS"
-            ));
-        }
         assert_block(&rpc, context).await.map_err(rpc_failure)?;
         let gas_fee = if chain.id == 1 {
             Some((gas_used * gas_price).to_string())
@@ -265,35 +219,17 @@ impl Simulator {
             None
         };
         Ok(SimResult {
-            simulation: Simulation::Success {
+            simulation: SimulationSuccess {
                 bought_amount: bought.to_string(),
                 gas_used: gas_used.to_string(),
                 gas_fee_wei: gas_fee,
-                funding: if actual {
-                    "actual".into()
-                } else {
-                    "overridden".into()
-                },
-                block_hash: context.block_hash.clone(),
+                funding: "overridden".into(),
+                block_context: context.block_context(),
+                simulated_timestamp: context.timestamp.saturating_add(1),
             },
             approvals,
             transaction,
         })
-    }
-
-    async fn read_balance(
-        &self,
-        rpc: &DynProvider,
-        token: Address,
-        owner: Address,
-        block: alloy_rpc_types_eth::BlockId,
-    ) -> anyhow::Result<U256> {
-        let value = rpc
-            .call(balance_call(token, owner)?)
-            .block(block)
-            .await
-            .map_err(|error| map_rpc_error("eth_call", error))?;
-        parse_return_word(&value)
     }
 }
 
@@ -317,7 +253,8 @@ async fn assert_block(rpc: &DynProvider, context: &Context) -> anyhow::Result<()
 }
 
 /// Typed outcome context, not an error container: anyhow retains the original source.
-#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[derive(Debug, Clone, Copy, thiserror::Error, serde::Serialize)]
+#[serde(tag = "status", content = "reason", rename_all = "camelCase")]
 pub enum SimulationFailure {
     #[error("{0}")]
     Reverted(&'static str),
@@ -325,22 +262,6 @@ pub enum SimulationFailure {
     Unsupported(&'static str),
     #[error("{0}")]
     Error(&'static str),
-}
-
-impl From<SimulationFailure> for Simulation {
-    fn from(failure: SimulationFailure) -> Self {
-        match failure {
-            SimulationFailure::Reverted(reason) => Self::Reverted {
-                reason: reason.into(),
-            },
-            SimulationFailure::Unsupported(reason) => Self::Unsupported {
-                reason: reason.into(),
-            },
-            SimulationFailure::Error(reason) => Self::Error {
-                reason: reason.into(),
-            },
-        }
-    }
 }
 
 fn rpc_failure(error: anyhow::Error) -> anyhow::Error {
@@ -395,14 +316,6 @@ fn word_bytes(value: U256) -> Bytes {
     Bytes::from(value.to_be_bytes::<32>())
 }
 
-fn balance_storage_key(owner: Address, slot: u64) -> B256 {
-    let mut encoded = Vec::with_capacity(64);
-    encoded.extend_from_slice(&[0_u8; 12]);
-    encoded.extend_from_slice(owner.as_slice());
-    encoded.extend_from_slice(&U256::from(slot).to_be_bytes::<32>());
-    keccak256(encoded)
-}
-
 fn parse_simulation_calls(blocks: Vec<SimulatedBlock>) -> anyhow::Result<Vec<SimCallResult>> {
     if blocks.len() != 1 {
         anyhow::bail!(ErrorKind::RpcInvalidResponse);
@@ -412,4 +325,24 @@ fn parse_simulation_calls(blocks: Vec<SimulatedBlock>) -> anyhow::Result<Vec<Sim
         .next()
         .expect("block count was checked")
         .calls)
+}
+
+fn token_balance_override(token: Address, slot: B256, amount: U256) -> StateOverride {
+    let mut overrides = StateOverride::default();
+    overrides
+        .entry(token)
+        .or_default()
+        .set_state_diff([(slot, B256::from(amount.to_be_bytes::<32>()))]);
+    overrides
+}
+
+fn balance_slot_failure(error: anyhow::Error) -> anyhow::Error {
+    let reason = match error.downcast_ref::<BalanceSlotError>() {
+        Some(BalanceSlotError::NotFound) => "BALANCE_OVERRIDE_SLOT_NOT_FOUND",
+        Some(BalanceSlotError::Ambiguous) => "BALANCE_OVERRIDE_SLOT_AMBIGUOUS",
+        Some(BalanceSlotError::ProbeLimit) => "BALANCE_OVERRIDE_PROBE_LIMIT",
+        Some(BalanceSlotError::CacheBusy) => "BALANCE_OVERRIDE_CACHE_BUSY",
+        None => return rpc_failure(error),
+    };
+    error.context(SimulationFailure::Unsupported(reason))
 }

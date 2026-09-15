@@ -1,6 +1,6 @@
 # MetaMatch 产品需求 v1
 
-日期：2026-09-13。状态：v1 运行时契约与 13 个 provider adapter 已落库；公开 provider 已执行 live quote，仍缺必需 key、生产 RPC、正式 Router 和主网执行验证。
+日期：2026-09-15。状态：v1 运行时契约与 13 个 provider adapter 已落库；公开 provider 已执行 live quote，仍缺必需 key、生产 RPC、正式 Router 和主网执行验证。
 
 ## 1. 产品目标
 
@@ -16,7 +16,7 @@ MetaMatch 是一个非托管的 EVM 同链 exact-input swap 报价竞赛服务�
 - 配置不维护 token 白名单、token 列表或 token metadata。API 收到的 token 地址只做地址格式和交易不变量校验，然后透传给 provider。
 - provider 自己实现 `supported_chains()`。需要 access key 的 provider 在没有对应环境变量时返回空集合；不需要 access key 的 provider 不因缺少 key 被排除。配置了 optional key 时仍传给对应 adapter。其余 provider 一律参与竞赛，失败只影响自身报价。
 - 请求带 `chainId`，服务必须拒绝当前 provider 实例支持链并集之外的链；`buyToken` 暂不允许使用 native sentinel，保持现有资金模型简单。
-- quote 阶段可因缺少 RPC 或执行 Router 而成为 preview/unavailable；build 必须重新报价和仿真，不把 preview 当作可执行成功。
+- `taker` 必填并绑定收款人与返回交易。竞赛仿真始终覆盖本次卖出资产和 native gas 资金，不读取真实钱包余额；缺少 RPC 或执行 Router 返回明确失败。
 
 ## 3. provider 与链
 
@@ -42,35 +42,54 @@ provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hy
    }
    ```
 
-3. 服务返回 `202`、短期 `accessToken` 和 competition ID；调用方带 Bearer token 轮询结果。
-4. 只有未过期、统一 route 校验通过、仿真成功且有有效 `quotedAmount` 的 quote 才能推荐；同一请求的买入 token 和链一致，因此按整数报价输出排序，不引入 token registry 或固定 decimals。
-5. build 接收真实 taker 和调用方此前接受的 `acceptedMinBuyAmount`，重新 quote、重新仿真，低于底价或 route 改变即拒绝。
-6. 调用方完成 approval（如果需要），重新 build，最后自行签名和广播。
+3. 服务在 `COMPETITION_TIMEOUT_MS` 总预算内完成竞赛并返回 `200`；全部 provider 提前完成时立即返回。每家 provider 的 quote、构建与 simulation 独立串联并发运行，超时取消尚未完成的流程，保留已完成结果。
+4. 仿真先覆盖 taker 的卖出资产和 native gas 资金，再执行完整的「买入 token 余额查询 → 必要 approvals → swap → 余额查询」。仅 route 与完整仿真都成功的结果成为 `Quote`，按模拟余额增量 `simulation.boughtAmount` 降序排序；金额相同按 provider ID 排序。Gas 单独展示，未支持的费用保持 `null`，不做伪造价格换算。
+5. 成功结果包含该次仿真对应的 `approvals[]` 和 `transaction`，`simulation.funding` 固定为 `overridden`。用户选择一条并依序执行；发送前自行确认真实余额足够。失败 provider 的诊断信息单独放入 `failures`，不能执行。
+6. API 不返回 `expiresAt`，不维护报价 TTL。每条成功 simulation 返回基础区块 `blockContext.number/hash/timestamp` 和 `simulatedTimestamp`。调用方决定是否重做 simulation 或重新竞赛；后者可能产生新的最低到账，需调用方重新确认，不会自动替换用户已接受的交易。
+7. provider 返回的真实报价期限及 calldata/签名内的 deadline 仍生效。没有上游期限时，服务不额外增加人工时间限制。链上最低到账保护继续执行，仿真不保证未来成交。
 
 ## 5. 最小 API
 
 | 方法 | 路径 | 作用 |
 | --- | --- | --- |
-| GET | `/health` | 进程健康状态 |
+| GET | `/health` | 进程健康状态，无竞赛存储 |
 | GET | `/v1/capabilities` | 链与 provider 反向索引发现，不返回 token 列表 |
-| POST | `/v1/competitions` | 创建异步报价竞赛 |
-| GET | `/v1/competitions/{id}` | 读取带鉴权的结果快照 |
-| POST | `/v1/competitions/{id}/quotes/{quoteId}/build` | 重新报价、仿真并生成 unsigned 交易 |
+| POST | `/v1/competitions` | 一次请求完成竞赛，返回排序后的仿真与交易 |
+
+响应为 `{id, input, quotes, failures}`，`id` 仅用于诊断关联。`quotes` 只包含成功的 `Quote {route, simulation, approvals, transaction, latencyMs}`，所有字段必填；`simulation` 为仅含成功数据的 `SimulationSuccess`，没有 status/error/reason。完整归一化 route 包含 `provider/buyAmount/minBuyAmount/sellAmount/spender/tx`，以及上游明确提供时才存在的原生 `deadline`（Unix 秒，不是 API TTL）。钱包执行 quote 顶层的 `approvals/transaction`，不直接签署 provider 的 `route.tx`。
+
+`failures` 包含 `provider/status/latencyMs/error`，存在明确仿真失败时包含失败专用 `simulation {status, reason}`，其 status 只能是 reverted/unsupported/error。失败对象没有 route 或交易字段。两个数组始终存在；全成功时 failures 为空，全失败时 quotes 为空。成功项按模拟到账量排序，失败项按 provider ID 排序。
+
+本轮字段迁移：`quote.provider → quote.route.provider`、`quote.quotedAmount → quote.route.buyAmount`、`quote.minBuyAmount → quote.route.minBuyAmount`；移除 quote.status/error 和成功 simulation.status，调用方无需在 quotes 内筛选成功项。
+
+这是接口破坏性变更：移除 GET competition 和 POST build 路由、access token、生命周期状态、quote ID、recommended quote ID 及 `expiresAt`；旧路由返回 404。`taker` 从可选变为必填。重新仿真现有交易由调用方通过钱包/RPC 完成，本次没有新增任意 calldata 仿真接口。
 
 ## 6. 配置原则
 
+- `COMPETITION_TIMEOUT_MS` 是一次请求的总工作预算（默认 6000，范围 100–30000）；移除旧 `PROVIDER_TIMEOUT_MS`、`QUOTE_TTL_MS`。并发请求容量保留，完成/失败/取消后自动释放，不存储竞赛快照。
+
 - 不配置链集合，也不维护 `CHAIN_CATALOG`：运行时链集合来自当前 provider 实例的 `supported_chains()` 并集。
 - 不配置 provider 集合：代码内 provider 注册表始终创建全部 13 个 provider。
-- 不配置 token：没有 token allowlist；未知 token 由 provider 和链上仿真决定是否可交易。
+- 没有 token allowlist；未知 token 由 provider 和链上仿真决定是否可交易。可选 `BALANCE_SLOTS` 提供余额 mapping 基础槽位，独立 resolver 在配置和按 chain/token 建立的进程缓存缺失时，对两个固定假地址并行调用 `eth_createAccessList`。所有 simulation 消费 base 并直接覆盖本次卖出余额；它不读取真实余额，也不改变 provider 参与资格。
 - RPC 是运行基础设施，不是产品能力开关。对并集中的每个 chain ID，解析优先级为 `RPC_URL_<chainId>`、Ethereum 旧别名 `ETHEREUM_RPC_URL`、`ALCHEMY_API_KEY` 自动生成的官方链 endpoint。没有任何来源时链仍保留在 capabilities，但不能仿真；capabilities 只返回是否已配置 RPC，不返回 URL。
 - provider access key 使用各 provider 原生环境变量，不抽象成 credential trait。需要 key 的 provider 缺少任一必需字段时不进入索引；完整名称见 [src/config.rs](../src/config.rs)。
 
-## 7. 明确不在 v1
+## 7. MetaRouter 路由与管理权限
+
+- Router 维护管理员登记的 target/spender/selector 白名单，默认拒绝。Rust provider rules 预检与链上登记均须通过，不得因上游返回某个目标而自动加白；provider 原生响应校验、完整仿真和金额/到账保护继续执行。白名单只约束外层元组，嵌套 Holder 的内层身份不因此得到验证。
+- 为保护历史暂存资产，Router 拒绝把 ERC20 合约直接作为路由目标，保留目标代码、禁止自调用、Holder 调用形状等结构检查。带 `balanceOf` 接口的 vault/其他入口也可能被拒绝，具体判定见合约文档。
+- 管理员使用现有 `owner` 名称。`recoverToken(token, recipient, amount)` 可提取 Router 持有的 ERC20/native 指定数量，在暂停期间可用；只有当前 owner 有权限，且不能在 swap/recover 回调中重入资金操作。
+- 管理员转移需要两步：原 owner 提名、新 pendingOwner 接受。接受前原 owner 继续负责 pause/recover/白名单管理，接受后权限转交，旧 owner 失权。
+- 管理员可以提取历史余额及误转资产，但 recover 不会从用户钱包拉款。Router 不作为存款保管地址；管理操作由管理员账户直接调用合约，HTTP 后端不新增管理员接口或签名能力。
+
+接口、事件、错误和迁移说明见 [contracts/README.md](../contracts/README.md)。生产运行时的 Router 地址接入、provider 的经审核 rules 与链上登记仍待完成；恢复白名单不代表已完成正式部署。
+
+## 8. 明确不在 v1
 
 数据库、多副本状态、分布式限流、跨链、非 EVM、token registry、价格/decimals 目录、provider 熔断、智能路由重写、平台抽成、用户身份系统、SSE、交易广播和回执存储。
 
-## 8. 当前实现状态
+## 9. 当前实现状态
 
-v1 的 provider 派生链集合、13 个字符串 provider ID、`supported_chains` 规则、access-key 过滤、反向索引和 13 家真实 HTTP adapter 已实现。每家 adapter 都把 provider 原生 quote 转为统一 `Route`，并拒绝金额、expiry、target、spender、calldata 或 native value 不一致的响应。当前仍不应宣称真实 key、生产 RPC、正式 Router 或主网执行已经验证。
+v1 的 provider 派生链集合、13 个字符串 provider ID、`supported_chains` 规则、access-key 过滤、反向索引和 13 家真实 HTTP adapter 已实现。每家 adapter 都把 provider 原生 quote 转为统一 `Route`，并拒绝金额、上游原生 deadline、target、spender、calldata 或 native value 不一致的响应。当前仍不应宣称真实 key、生产 RPC、正式 Router 或主网执行已经验证。
 
 实现和验证状态以 [VERIFICATION.md](VERIFICATION.md) 和 [RUST_REWRITE_LOG.md](RUST_REWRITE_LOG.md) 为准。

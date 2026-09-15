@@ -105,7 +105,7 @@ impl Provider for BebopProvider {
                 min_buy_amount,
                 spender: parse_address(&response.approval_target)?,
                 tx: response.tx,
-                expires_at: response.expiry.saturating_mul(1_000),
+                deadline: Some(response.expiry),
             },
         )
     }

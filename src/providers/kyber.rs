@@ -128,7 +128,7 @@ impl Provider for KyberProvider {
                 data: parse_hex(&data.data)?,
                 value: transaction_value,
             },
-            expires_at: crate::domain::now_ms().saturating_add(10_000),
+            deadline: None,
         })
     }
 }

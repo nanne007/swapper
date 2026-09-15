@@ -101,7 +101,7 @@ impl Provider for ZeroExProvider {
                 min_buy_amount: response.min_buy_amount,
                 spender,
                 tx: response.transaction,
-                expires_at: crate::domain::now_ms().saturating_add(20_000),
+                deadline: None,
             },
         )
     }

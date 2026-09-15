@@ -11,10 +11,11 @@ interface IAllowanceHolder {
 
 /// @notice Exact-input execution with AllowanceHolder's ERC-2771 sender forwarding.
 /// @dev The administrator must only allow audited provider target/spender/selector tuples.
-///      Nonstandard taxed/rebasing tokens are not supported. No rescue or arbitrary-call admin API.
+///      The owner can recover idle assets. Nonstandard taxed/rebasing tokens are not supported.
 contract MetaRouter {
     address public constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-    address public immutable owner;
+    address public owner;
+    address public pendingOwner;
     address public immutable allowanceHolder;
     bool public paused;
     bool private entered;
@@ -30,17 +31,30 @@ contract MetaRouter {
     error BalanceInvariant();
     error InsufficientOutput();
     error NativeRefundFailed();
+    error NativeTransferFailed();
 
     event RoutePermission(address indexed target, address indexed spender, bytes4 selector, bool enabled);
+    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event TokenRecovered(address indexed token, address indexed recipient, uint256 amount);
     event PauseChanged(bool paused);
     event Executed(
         address indexed taker, address indexed sellToken, address indexed buyToken, uint256 sold, uint256 bought
     );
 
     constructor(address owner_, address allowanceHolder_) {
-        if (owner_ == address(0) || allowanceHolder_.code.length == 0) revert InvalidInput();
+        if (
+            owner_ == address(0) || owner_ == address(this) || owner_ == allowanceHolder_ || owner_ == NATIVE
+                || allowanceHolder_.code.length == 0
+        ) revert InvalidInput();
         owner = owner_;
         allowanceHolder = allowanceHolder_;
+        emit OwnershipTransferred(address(0), owner_);
+    }
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert Unauthorized();
+        _;
     }
 
     modifier nonReentrant() {
@@ -50,14 +64,12 @@ contract MetaRouter {
         entered = false;
     }
 
-    function setPaused(bool value) external {
-        if (msg.sender != owner) revert Unauthorized();
+    function setPaused(bool value) external onlyOwner {
         paused = value;
         emit PauseChanged(value);
     }
 
-    function setAllowed(address target, address spender, bytes4 selector, bool enabled) external {
-        if (msg.sender != owner) revert Unauthorized();
+    function setAllowed(address target, address spender, bytes4 selector, bool enabled) external onlyOwner {
         if (
             enabled
                 && (target.code.length == 0
@@ -65,19 +77,46 @@ contract MetaRouter {
                     || target == address(this)
                     || spender == address(this))
         ) revert InvalidInput();
-        // 0x allowance-holder routes call the holder a second time. In this nested execution
-        // the Router is the token owner and Settler is the operator; its ephemeral allowance
-        // is distinct from the outer (Router, taker, token) slot. Permit only exec here.
+        // Nested Holder calls use a separate (operator, Router, token) allowance.
+        // This validates only the outer tuple, not the inner target/operator.
         if (
             enabled && (target == allowanceHolder || spender == allowanceHolder)
                 && (target != allowanceHolder
                     || spender != allowanceHolder
                     || selector != IAllowanceHolder.exec.selector)
-        ) {
-            revert InvalidInput();
-        }
+        ) revert InvalidInput();
         allowed[keccak256(abi.encode(target, spender, selector))] = enabled;
         emit RoutePermission(target, spender, selector, enabled);
+    }
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0) || newOwner == address(this) || newOwner == allowanceHolder || newOwner == NATIVE) {
+            revert InvalidInput();
+        }
+        pendingOwner = newOwner;
+        emit OwnershipTransferStarted(owner, newOwner);
+    }
+
+    function acceptOwnership() external {
+        if (msg.sender != pendingOwner) revert Unauthorized();
+        address previousOwner = owner;
+        owner = msg.sender;
+        pendingOwner = address(0);
+        emit OwnershipTransferred(previousOwner, msg.sender);
+    }
+
+    /// @notice Recover assets held by this contract, including while swaps are paused.
+    /// @dev Shares the swap lock so callbacks cannot recover funds during an active execution.
+    function recoverToken(address token, address payable recipient, uint256 amount) external onlyOwner nonReentrant {
+        if (recipient == address(0) || recipient == address(this) || amount == 0) revert InvalidInput();
+        if (token == NATIVE) {
+            (bool success,) = recipient.call{value: amount}("");
+            if (!success) revert NativeTransferFailed();
+        } else {
+            if (token.code.length == 0) revert InvalidInput();
+            _transfer(token, recipient, amount);
+        }
+        emit TokenRecovered(token, recipient, amount);
     }
 
     function execute(
@@ -106,8 +145,11 @@ contract MetaRouter {
         if (
             taker == address(0) || taker == address(this) || taker == allowanceHolder || sellAmount == 0
                 || minBuyAmount == 0 || buyToken.code.length == 0 || buyToken == sellToken || data.length < 4
-                || target == sellToken || target == buyToken
+                || target == sellToken || target == buyToken || target == address(this) || spender == address(this)
+                || target.code.length == 0 || spender.code.length == 0
         ) revert InvalidInput();
+        // Route safety relies on administrator review; balance deltas do not protect unrelated assets.
+        // setAllowed already enforces the Holder call shape when enabling a tuple.
         if (!allowed[keccak256(abi.encode(target, spender, bytes4(data[:4])))]) revert RouteNotAllowed();
 
         bool nativeSell = sellToken == NATIVE;

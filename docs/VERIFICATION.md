@@ -2,6 +2,8 @@
 
 本记录描述当前 Rust runtime、本地验证和未验证生产边界，不表示服务已经过主网审计或可以直接投入真实资金。
 
+本文件按日期保留历史结果；旧章节中的无白名单、不可转移 owner 和无 recover 的状态不代表当前实现。2026-09-15 的合约变更见本文件后续对应章节及 [合约说明](../contracts/README.md)。
+
 ## Rust 最小核心验收（2026-09-12）
 
 根目录 Cargo crate 是唯一构建、启动和 CI 入口。
@@ -186,6 +188,173 @@ METAMATCH_RUN_LIVE_REPLAY=1 cargo test --test replay_live -- --ignored --nocaptu
 
 本轮 Rust 源码净减少 303 行（4,690 → 4,387，以本轮开始时的工作区为基线，含注释/空行），不把测试迁移或既有改动计入生产源码精简。详见 [处理日志](RUST_REWRITE_LOG.md)。本地结果不证明 macOS 以外的 CI 环境、正式 Holder/Router、真实 provider 权限或主网成交。
 
+## 单请求竞赛与直接执行（2026-09-14）
+
+本轮将原 create/poll/build 改为一次 POST 请求返回最终结果。真实 taker 必填，provider 完整 quote → 构建 → simulation 使用同一总 deadline；成功结果按模拟余额增量排序，并直接返回同轮 approvals 和 swap。移除存储、access token、独立 build、API expiresAt 和 route 元数据人工 TTL；上游签名及 calldata 自有期限继续生效。
+
+本轮验证（生产网络测试未运行）：
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --all-targets --all-features --offline -- -D warnings` | 通过 |
+| `RUST_LIB_BACKTRACE=1 cargo test --all --offline` | **61/61**；15 项默认 ignored |
+| `cargo build --release --offline` | 通过 |
+| `forge fmt --root contracts --check` | 通过 |
+| `forge build --root contracts --deny-warnings` | 通过，复用合约构建缓存 |
+| `forge test --root contracts` | **27/27**，含 3 项 fuzz |
+| `cargo test --test e2e_local --offline -- --ignored --nocapture` | **1/1** |
+
+关键行为证据：
+
+- `tests/competitions.rs` 使用 Tokio 虚拟时间验证一个 deadline 覆盖 context/quote/simulation、提前结束、保留已完成结果、取消未完成 future、公共 context 超时与 provider 局部失败。排名覆盖大于 JS 安全整数的余额增量、原报价排名反转、平局稳定排序，以及未知 Gas 费用不妨碍到账数量排序。
+- `tests/concurrency.rs` 验证取消请求 future 后立即释放并发容量；`tests/simplification.rs` 验证普通失败后容量释放与仿真失败分类。
+- `tests/api.rs` 验证一次 POST 返回 200、真实 taker 必填、区块 number/hash/timestamp 与模拟时间、原样交易字段、旧轮询/build 路由 404 和 no-store。
+- `tests/core.rs` 解码返回的 Holder/Router calldata，验证没有上游 deadline 时为 U256::MAX，有上游 deadline 时保留 Unix 秒，minimum/amount/provider calldata 不变。
+- 本地 Anvil E2E 只调用一次竞赛，然后执行第一次返回的 approval 和同一笔 swap；最终买入余额为模拟的 200，Router 临时 allowance 清零。测试没有重新 build。
+
+没有新增或升级运行时依赖；删除直接 subtle 依赖和 axum-extra typed-header feature，仅为确定性测试启用已有 Tokio 的 test-util。合约源码没有修改。15 项 ignored 包含 13 个 provider live、1 个 production replay 和另行执行的本地 Anvil。Foundry nightly/参数弃用提示仍存在，命令退出成功。
+
+接口迁移与当前配置详见 PRODUCT/TECHNICAL/README。旧版 preview live 记录仅为历史证据，不能替代本次新接口的真实钱包、正式 Holder/Router 与生产执行验证。
+
+## Quote 成功数据与失败分离（2026-09-15）
+
+`Quote` 改为必填的 `route: Route`、`simulation: SimulationSuccess`、`approvals`、`transaction` 和 `latencyMs`，没有 status/error 或可缺失的成功数据。`SimResult.simulation` 同样只表示成功；仿真失败通过原有 anyhow + SimulationFailure 传播。竞赛返回独立 `quotes` 和 `failures`，只对成功结果按 boughtAmount 排序，全部失败时 quotes 为空。
+
+字段迁移：provider/buyAmount/minBuyAmount 从 route 读取，成功 simulation 不再携带 status；失败的 status/error 和可选失败专用 simulation 仅在 ProviderFailure 中。Route 的 tx 是 provider 路由交易，钱包继续执行 quote 顶层的 approvals/transaction。
+
+本轮验证：
+
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features --offline -- -D warnings`：通过。首次 Clippy 指出迁移后 Copy 类型多余借用，已修正并重跑通过。
+- `RUST_LIB_BACKTRACE=1 cargo test --all --offline`：**62/62**；15 项默认 ignored。
+- `cargo build --release --offline`：通过。
+- `forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过，**27/27**；合约源码未修改，构建复用缓存。
+- `cargo test --test e2e_local --offline -- --ignored --nocapture`：**1/1**。单请求返回的 approval 与同一笔 swap 直接在隔离 Anvil 执行，到账仍为 200。
+- `git diff --check`：通过。原有 staged diff 的 SHA-256 在本轮前后相同，本轮修改未 stage/commit。
+
+API 测试新增全失败时 quotes=[] 与独立 failures 的响应断言；混合成功/超时/上游错误测试检查成功结果与失败诊断不交叉携带字段。原有金额排序、统一 deadline、取消释放名额、真实资金、minimum、reorg、原始错误原因隔离测试继续通过。未新增依赖、未访问生产 provider/RPC、未部署合约。
+
+## BalanceSlots 配置、探测与 mapping base 缓存（2026-09-15）
+
+新增独立 `src/balance_slots.rs`，优先使用 `BALANCE_SLOTS` 配置，无配置时通过 prestateTracer 的实际 storage 访问与本地 base hash 匹配自动探测。缓存只保存 `(chainId, token) -> mappingBase: U256`，与 owner 无关；每次使用根据 owner 计算 storage key 并重新验证，旧 base 不匹配时失效重探测。配置错误不静默回退，失败不缓存为成功。
+
+本轮证据：
+
+- `tests/balance_slots.rs` **11/11**：完整 uint256 配置与非法输入、配置优先且错误不回退、跨链/token 隔离、不同 owner 复用 base、13 个 owner 并发仅一次探测、失效重探测、常量/packed/共享 scalar/歧义拒绝、RPC 错误分类与重试、候选上限、自动范围边界及配置补充、取消释放锁、1024 项 FIFO 淘汰，以及真实资金模拟不触发探测。
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features --offline -- -D warnings`：通过。
+- `cargo test --all --offline`：**73/73**；15 项默认 ignored（13 provider live、1 production replay、1 本地 Anvil）。
+- `cargo build --release --offline`：通过。
+- `cargo test --test balance_slots --test e2e_local --offline -- --include-ignored --nocapture`：本地 Anvil **1/1**，两个未持有卖出 token 的地址依次通过自动发现/复用 mapping base、覆盖余额与完整 approval/swap 仿真；公开竞赛返回的同一笔 approval/swap 继续执行成功。隔离 Anvil 上的模拟覆盖没有写入真实余额。这不是主网或正式 Holder 证明。
+- `forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过，合约 **27/27**，未修改合约源码。
+- `git diff --check`、`git diff --cached --check`：通过。原有暂存区 diff 的 SHA-256 保持不变，未 stage/commit。
+
+自动探测只匹配 mapping base `0..1023`，没有逐槽 RPC 扫描；任意 uint256/namespaced base 可通过配置提供。生产 RPC 的 debug namespace、state override 支持，以及特殊 token/proxy/rebase/外部记账布局仍需单独验证。公开竞赛保持实际资金语义。本轮未新增依赖、未请求生产 provider/RPC、未部署合约。
+
+## MetaRouter 无白名单、资产 recover 与管理员转移（2026-09-15，历史记录）
+
+本节记录当时的实现与验证；其中移除白名单的部分已按用户后续要求回退，当前状态见后文“恢复路由白名单”。recover 与两步 ownership 保留。
+
+按用户明确要求移除链上 `allowed/setAllowed` 和 Rust `Rule/Provider::rules()`、`ROUTE_NOT_ALLOWLISTED`。交易无需登记路由；继续保留实际到账 minimum、精确临时授权、历史余额隔离、pause、重入和 Holder 调用形状检查。新增 owner-only ERC20/native `recoverToken`，与 swap 共用锁，支持暂停期间提取；owner 转移采用提名/接受两步，带事件且旧 owner 在接受后失权。
+
+新增回归先复现了无白名单直接调用第三种暂存 ERC20 的风险：以该 token 的 `transfer` 为目标，在 native 退款回调中补足输出，原先预期拒绝的测试实际成功。补入 target 的 `balanceOf(router)` 检查后，transfer 和 approve 两条路径均被拒绝，测试转绿。该检查不是地址登记，也不是任意恶意 token 的完整证明；带相同余额接口的 vault/入口会被拒绝。
+
+本轮新鲜验证：
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --all-targets --all-features -- -D warnings` | 通过 |
+| `cargo test --all` | **73/73**；15 项网络/Anvil 测试默认 ignored |
+| `cargo build --release` | 通过 |
+| `forge fmt --root contracts --check` | 通过 |
+| `forge build --root contracts --deny-warnings` | 通过 |
+| `forge test --root contracts` | **42/42**；5 项 fuzz 各 256 runs |
+| `cargo test --test e2e_local -- --ignored --nocapture` | **1/1**；无 setAllowed/route rules 的本地完整执行 |
+| `git diff --check` / `git diff --cached --check` | 通过 |
+
+行为覆盖包括：新 target/spender/selector 免登记、非法/直接 ERC20 target 拒绝、保留原有资金不变量、ERC20/native 部分提取与余额守恒、无返回值 token、false/revert/余额不足/拒收失败、非 owner 拒绝、pending owner 替换和接受、旧 owner 失权、swap → recover 与 recover → swap/recover 的交叉重入。Rust 检查移除白名单后的有效路由、零地址拒绝及 Holder/Router ABI 原样编码；Anvil 无登记步骤即可完成模拟和成交。
+
+Gas 行为变化包含删除白名单 storage 查询、新增 target/spender 代码检查与 target 的 balanceOf 探测；实际增减依 provider 实现和调用路径而定，不把测试 helper 的 gas 作为主网成本。`execute` ABI 和构造参数顺序不变，旧白名单 ABI 移除；owner 不再 immutable，新部署采用可转移管理员。
+
+更新了 contracts/README、产品/技术/架构/接入说明、根 README、AGENTS 和相关项目 skill。历史验收条目保留原记录。没有新增依赖、没有提交代码或访问生产 provider/RPC；本地测试使用 mock Holder。生产 Router 地址接入、正式 Holder/provider fork 兼容性和外部审计尚未完成。管理员可提取 Router 的暂存资产，这一权限变化已在文档明确说明。
+
+## BalanceSlots 只读布局解析与 simulation 职责分离（2026-09-15）
+
+`BalanceSlots::resolve(rpc, chainId, token, block) -> U256` 只解析 mapping base。配置和缓存命中直接返回，不接收真实 owner/amount，不构造或应用 StateOverride。无缓存时，两个由固定标签派生的假地址分别 trace balanceOf，在同一 block 上交叉匹配唯一 mapping base。发现流程可以独立于 simulation 运行；缓存仍按 chain/token 保存 base。
+
+simulation 消费 base 后自行计算用户 storage key、构造和验证余额覆盖。配置错误不会被自动覆盖；缓存 base 验证失败时当次明确失败，并按旧值条件失效，下次请求重新解析。晚到的旧失败不能清除不同的新 base。只读 trace 识别布局，不证明该 word 可直接作为完整余额改写；packed/constant/shared-scalar 拒绝由 simulation 测试覆盖。
+
+本轮验证：
+
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features --offline -- -D warnings`：通过。
+- `cargo test --all --offline`：**77/77**；15 项默认 ignored。`tests/balance_slots.rs` **15/15** 覆盖独立探测、两个假地址、全程无 override、配置/缓存无 RPC、链/token 隔离、并发合并、条件失效、错误分类/重试、取消、容量淘汰、检测范围，以及 simulation 独立验证和不同真实 owner 消费预解析 base。
+- `cargo build --release --offline`：通过。
+- `cargo test --test e2e_local --offline -- --ignored --nocapture`：**1/1**。先在隔离 Anvil 上独立 resolve，再由两个未持币测试地址消费同一个 base 完成完整仿真；原有公开竞赛 → 返回 approval/swap → 本地执行继续通过。
+- `forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过，当前合约 **42/42**；本轮未修改合约和管理员/路由逻辑。
+- `git diff --check`、`git diff --cached --check`：通过，原有暂存区保持不变。
+
+自动识别仍限定 base `0..1023` 与 token 自身 storage；完整 uint256 base 可配置。没有新增后台探测或公开 API，没有改变真实资金竞赛的资金规则。未增加依赖，未使用生产 provider/RPC，未部署或提交代码。
+
+## 双 trace 并发与缓存结构简化（2026-09-15）
+
+`BalanceSlots::resolve` 用 `tokio::try_join!` 并发运行两个只读 `trace_bases`；任一错误结束本次探测并丢弃另一侧 future，成功时仍取两个假地址候选的交集。使用本地 RPC barrier 测试要求两个请求到齐才响应，先在旧串行实现复现超时，再验证并发实现通过。
+
+缓存改为 `Mutex<HashMap<(u64, Address), SharedBase>>`，`SharedBase` 为 `Arc<tokio::sync::Mutex<Option<U256>>>`，删除 CacheKey/CacheEntry 和 VecDeque。外层锁只保护索引，内层锁继续合并同一 key 的探测；1024 项容量、正在使用项不淘汰、条件失效和取消后重试保持。淘汰策略改为任意空闲项，不再保证 FIFO；对应测试检查容量淘汰及新插入项命中，不绑定被淘汰的具体 key。并发失败可能已有一到两个请求送达 RPC，测试保留错误分类与重试检查，不再假定只有一个请求发出。
+
+本轮验证：`cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features --offline -- -D warnings`、`cargo test --all --offline`（**78/78**，15 项默认 ignored）、`cargo build --release --offline` 全部通过。`tests/balance_slots.rs` 为 **16/16**。`forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts` 通过（**42/42**）；`cargo test --test e2e_local --offline -- --ignored --nocapture` **1/1** 通过。`git diff --check` 与 `git diff --cached --check` 通过，原有暂存区 SHA-256 不变。
+
+未新增依赖、未修改公开接口或 simulation 资金边界、未调用生产 provider/RPC、未部署或提交代码。
+
+## 恢复路由白名单，保留 recover/ownership（2026-09-15）
+
+按用户要求仅回退移除路由白名单的部分：恢复链上 `allowed`、owner-only `setAllowed`、`RoutePermission`、`RouteNotAllowed`，以及 Rust `Rule`、`Provider::rules(chainId)`、竞赛/仿真/交易编码的三元组预检和 `ROUTE_NOT_ALLOWLISTED`（HTTP 422）。默认拒绝，规则不能从当次上游响应自动生成。`execute` ABI 不变。
+
+保留 ERC20/native `recoverToken`、两步管理员转移、共用重入锁，以及直接 ERC20 target、Router 自调用和 Holder 形状检查。未增加前置最低到账或强制消耗全部输入的新规则。BalanceSlots、已有 Rust 重构和其他未提交变更保留；未 stage/commit。
+
+本轮验证（以下通过结果对应并行仿真接口变更出现之前的白名单恢复快照，不代表最终混合工作区通过）：
+
+- Rust `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features --offline -- -D warnings` 通过。首次 Clippy 指出 Anvil fixture 的 selector 多余借用，修正后重跑通过，没有放宽 lint。
+- `cargo test --all --offline`：**79/79**；15 项默认 ignored（13 provider live、1 production replay、1 另行运行的本地 Anvil）。新增 target/spender/selector 不匹配及空规则拒绝测试，同时检查直接交易编码不可绕过预检；恢复竞赛层未登记 provider 的失败断言。
+- Foundry fmt/build/test 通过，`forge test --root contracts`：**44/44**，含 5 项 fuzz、各 256 runs。覆盖新 target 默认拒绝、登记后成功、撤销后拒绝、selector/spender 不匹配、非法登记、旧/待接任/新 owner 的白名单权限和全部 recover 回归。
+- `cargo test --test e2e_local --offline -- --ignored --nocapture`：**1/1**，本地 Anvil 显式登记测试路由并提供对应 rules，完整仿真与返回的同一笔 approval/swap 执行成功；保留独立 BalanceSlots resolve 和两个 preview owner 的覆盖测试。
+
+最终复核发现并行工作区变更移除了 `SimulationRequest.actual`，并改变了 simulation 的资金覆盖语义。此时再次运行本地 E2E 编译失败：`tests/e2e_local.rs` 仍传 `actual: false`，产生 E0560；其他尚未迁移的测试也仍引用该字段。最终 Rust fmt 检查同时报告 `src/simulation.rs` 新改动的格式差异。此前 release build 已退出成功，但当前混合工作区不能据此标记全量门禁通过。白名单回退没有覆盖或接管这组无关的并行修改，需由该接口迁移完成后重新执行全量验证。
+
+白名单恢复增加一次路由权限 storage 查询；未做主网 gas benchmark。登记 `(Holder, Holder, exec)` 仍只约束外层形状，不验证内层 target/operator，不能作为内层 provider 身份审核证明。生产 Router 地址仍未接入，各生产 provider 的 rules 默认为空，经审核的链专属规则、链上登记、正式 Holder fork 测试和外部审计仍是上线前置条件。本轮未访问生产 provider/RPC、未部署或广播真实网络交易。
+
+## Simulation 统一使用资金覆盖（2026-09-15）
+
+移除 `SimulationRequest.actual` 及其两套资金分支。所有 simulation 都不读取 taker 的真实 native 或卖出 token 余额：ERC20 通过 `BalanceSlots` 解析 mapping base 后，直接把 `storage_key(taker, base)` 写为 `sellAmount`；native balance 直接覆盖为 transaction value 与完整调用序列声明 gas budget 之和。allowance 仍按固定区块读取，以决定是否加入 reset/approve。
+
+删除 `validate_balance_override`、反值 probe、另一地址不变检查和 `BalanceSlots::invalidate`。配置或缓存的 base 不再因一次 simulation 失败而清除；错误布局由后续完整 approval/swap 仿真失败暴露。成功结果的 `funding` 固定为 `overridden`，公共 competition 不再拒绝余额不足的钱包。`boughtAmount` 仍来自完整调用序列的买入 token 余额差，并继续执行 route minimum、固定区块 hash、approval 返回值和调用状态检查。成功只证明交易在假定资金与该 block context 中通过仿真，不证明钱包当前可发送；客户端需自行检查余额和决定是否重新 simulate。
+
+本轮验证：
+
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features --offline -- -D warnings`：通过。
+- `cargo test --all --offline`：**75/75**；15 项 live/Anvil 测试默认 ignored。RPC fixture 明确检查 native/ERC20 state override、无 `eth_getBalance`、固定区块、slot 探测失败和 approval false 分类；competition/API 检查 `funding: overridden`、模拟到账整数排序和 minimum 失败隔离。
+- `cargo build --release --offline`：通过。
+- `forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过，**45/45**；本轮未修改合约资金或路由逻辑。
+- `cargo test --test e2e_local --offline -- --ignored --nocapture`：**1/1**。两个无卖出 token 的地址复用自动探测 base 完成覆盖仿真，公开 HTTP competition 返回 `funding: overridden`，有真实资金的本地账户执行同一 approval/swap 成功；state override 未改变链上余额。
+
+本轮没有调用生产 provider/RPC，没有签名、部署或广播真实网络交易。生产 RPC 仍需逐链验证 `eth_simulateV1` state override 与按需 `debug_traceCall`；错误或不兼容的配置 base 可能让完整仿真失败，当前不会自动纠正配置或淘汰缓存。
+
+## BalanceSlots 改用 eth_createAccessList（2026-09-15）
+
+自动 mapping base 探测已从 `debug_traceCall/prestateTracer` 改为 Alloy typed `Provider::create_access_list(...).block_id(block)`。两个固定假 owner 的 `balanceOf` access list 仍通过 `tokio::try_join!` 并行生成；resolver 只读取 token 地址对应的 `storageKeys`，在本地匹配 base `0..1023` 后取交集并按 chain/token 缓存。全过程不使用 state override、真实 owner 或真实余额，也不需要 Alloy `debug-api` feature 或手写 `raw_request` JSON。
+
+RPC transport/method 错误继续通过 `map_rpc_error("eth_createAccessList", ...)` 分类；HTTP 200 的 `AccessListResult.error` 保留原始内部原因并分类为 `RPC_CALL_FAILED`。token storage key 超过 32、无候选或多候选继续明确失败。配置命中不调用 RPC，缓存并发合并、1024 项容量、取消后重试和 simulation 直接覆盖资金的边界不变。
+
+本轮验证：
+
+- `cargo test --test balance_slots --offline`：**12/12**，覆盖 typed access-list 请求、固定 block、两个假 owner 并行、无 override、配置/缓存、错误字段与错误码、畸形响应、候选上限和取消/容量行为。
+- `cargo test --test simplification --offline`：**5/5**，未配置 base 且 RPC 不支持 `eth_createAccessList` 时仍公开为稳定的 `RPC_METHOD_UNSUPPORTED`。
+- `cargo test --test e2e_local --offline -- --ignored --nocapture`：**1/1**，本地 Anvil 的 access-list 自动探测、两个无卖出 token 地址的覆盖仿真，以及公开竞赛返回交易的本地执行全部通过。
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features --offline -- -D warnings`：通过。
+- `cargo test --all --offline`：**75/75**；15 项 live/Anvil 测试默认 ignored。`cargo build --release --offline`：通过。
+- Foundry fmt/build/test：通过，**45/45**；本轮没有修改合约。
+
+尚未把生产 RPC 支持视为已验证：托管节点可能关闭或未实现 `eth_createAccessList`，部署前需逐链测试。配置错误或非标准余额布局仍可能让完整仿真失败，不会自动纠正配置或淘汰已缓存 base。
+
 ## 未验证边界
 
 本节之前的 live 记录是历史运行快照，不因后续结构重构自动成为新的 live 验证。
@@ -193,11 +362,11 @@ METAMATCH_RUN_LIVE_REPLAY=1 cargo test --test replay_live -- --ignored --nocaptu
 1. Provider live smoke 已落库，但真实报价、费用、地址和执行可用性仍取决于运行时提供的 key、链专用 token、上游限流和生产 simulate RPC；live smoke 不广播交易，也不等价于主网 fork 或正式执行验证。
 2. 本地 E2E 的 Holder 是测试 mock 写入固定地址，不是从主网读取的正式字节码；正式 Holder 与嵌套路由必须补 fork 验证。
 3. Router 未部署、未外部审计；服务不签署、不广播真实网络交易。本次唯一广播发生在测试进程创建的隔离本地 Anvil，测试完成即关闭。
-4. 真实 provider endpoint 的访问路径已有可显式运行的 smoke test，但每个 key 的权限、实时流动性、生产 RPC、正式 Router/allowlist 和主网执行仍需逐环境验证；不能把 fixture 或 reachability 通过当作 live E2E。
+4. 真实 provider endpoint 的访问路径已有可显式运行的 smoke test，但每个 key 的权限、实时流动性、生产 RPC、正式 Router 和主网执行仍需逐环境验证；生产 `Chain.router` 仍为 None，正式地址接入未实现；生产 provider 默认 rules 为空，经审核的规则和链上登记仍未完成。不能把 fixture 或 reachability 通过当作 live E2E。
 5. 跨链、非 EVM、原生币 buy、intent、平台抽成和公网身份系统不属于当前最小核心。
 6. Redis/Postgres、多副本、分布式限流、业务审计库、供应商熔断和 RPC 容灾未实现；当前是有界单进程版本。
 7. Dockerfile 已提供，但 Docker daemon 不可用，镜像 build/run 未验证。
-8. 仿真、费用估算和报价都不是未来成交保证；必要 approval 后必须重新 build，最终仍由链上 minimum output 保护。
+8. 仿真、费用估算和报价都不是未来成交保证；当前单请求流程由用户依序执行返回的 approvals/swap，并根据 blockContext 决定是否重新 simulate。没有 expiresAt 或强制重新 build；最终仍由链上 minimum output 与 provider 原生约束保护。
 
 ## 文件位置与交付
 
@@ -205,4 +374,4 @@ METAMATCH_RUN_LIVE_REPLAY=1 cargo test --test replay_live -- --ignored --nocaptu
 
 ## 上线前顺序
 
-申请并核对供应商服务权限 → 配置专用 simulate RPC → 正式 Holder/Router/provider fork 测试 → 外部合约审计 → 多签部署与最小白名单 → 完整监控/访问控制 → 小额人工验收。其他链要另立产品范围并补齐费用模型、route 验证和测试。
+申请并核对供应商服务权限 → 配置专用 simulate RPC → 正式 Holder/Router/provider fork 测试 → 外部合约审计 → 多签部署、Router 地址接入与两步管理员管理 → 完整监控/访问控制 → 小额人工验收。上线前必须补齐经审核的 provider rules，并由管理员登记匹配的链上三元组；对嵌套 Holder 等通用入口单独核对内层权限。其他链要另立产品范围并补齐费用模型、route 验证和测试。

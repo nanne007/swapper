@@ -1,26 +1,14 @@
 /// Machine-readable context only; anyhow owns the error, source chain and backtrace.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum ErrorKind {
-    #[error("BUILD_CAPACITY_EXCEEDED")]
-    BuildCapacityExceeded,
-    #[error("BUILD_ERROR")]
-    BuildError,
-    #[error("BUILD_REVERTED")]
-    BuildReverted,
-    #[error("BUILD_UNSUPPORTED")]
-    BuildUnsupported,
     #[error("CAPACITY_EXCEEDED")]
     CapacityExceeded,
     #[error("CHAIN_REORG_REQUOTE")]
     ChainReorgRequote,
-    #[error("COMPETITION_NOT_FOUND_OR_EXPIRED")]
-    CompetitionNotFoundOrExpired,
     #[error("CROSS_CHAIN_ROUTE_UNSUPPORTED")]
     CrossChainRouteUnsupported,
     #[error("INTERNAL_ERROR")]
     InternalError,
-    #[error("INVALID_ACCESS_TOKEN")]
-    InvalidAccessToken,
     #[error("INVALID_CALLDATA")]
     InvalidCalldata,
     #[error("INVALID_CONFIG")]
@@ -33,24 +21,16 @@ pub enum ErrorKind {
     InvalidTaker,
     #[error("METHOD_NOT_ALLOWED")]
     MethodNotAllowed,
-    #[error("MINIMUM_DOWNGRADE_REJECTED")]
-    MinimumDowngradeRejected,
     #[error("NATIVE_SELL_UNSUPPORTED")]
     NativeSellUnsupported,
     #[error("NOT_FOUND")]
     NotFound,
     #[error("PAYLOAD_TOO_LARGE")]
     PayloadTooLarge,
-    #[error("PRICE_MOVED_BELOW_ACCEPTED_MINIMUM")]
-    PriceMovedBelowAcceptedMinimum,
     #[error("PROVIDER_UNCONFIGURED")]
     ProviderUnconfigured,
     #[error("QUOTE_EXPIRED")]
     QuoteExpired,
-    #[error("QUOTE_NOT_FOUND")]
-    QuoteNotFound,
-    #[error("REQUOTE_REQUIRED")]
-    RequoteRequired,
     #[error("ROUTER_NOT_CONFIGURED")]
     RouterNotConfigured,
     #[error("ROUTE_NOT_ALLOWLISTED")]
@@ -69,8 +49,6 @@ pub enum ErrorKind {
     RpcTimeout,
     #[error("SIMULATION_REVERTED")]
     SimulationReverted,
-    #[error("TAKER_MISMATCH")]
-    TakerMismatch,
     #[error("UNEXPECTED_1INCH_CONTRACT")]
     Unexpected1inchContract,
     #[error("UNEXPECTED_TRANSACTION_VALUE")]

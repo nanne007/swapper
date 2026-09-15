@@ -15,7 +15,7 @@ alloy-rpc-types-eth = { version = "2.4", default-features = false, features = ["
 alloy-sol-types = "1.7"
 async-trait = "0.1"
 axum = "0.8"
-axum-extra = { version = "0.12", default-features = false, features = ["typed-header", "with-rejection"] }
+axum-extra = { version = "0.12", default-features = false, features = ["with-rejection"] }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dotenvy = "0.15.7"
@@ -27,7 +27,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_path_to_error = "0.1"
 sha2 = "0.10"
-subtle = "2"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -36,6 +35,7 @@ url = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 

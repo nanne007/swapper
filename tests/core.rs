@@ -8,8 +8,8 @@ use metamatch_backend::{
     competitions::{Competitions, Services},
     config::load_config,
     domain::{
-        Input, NATIVE, PREVIEW_TAKER, Route, Rule, Simulation, Tx, minimum, now_ms, parse_address,
-        parse_positive, parse_uint, validate_input,
+        Input, NATIVE, PREVIEW_TAKER, Route, Rule, Tx, minimum, parse_address, parse_positive,
+        parse_uint, validate_input,
     },
     execution::{swap_transaction, validate_route},
     http::{HttpClient, HttpRequest, HttpResponse, json_request, url_with_params},
@@ -49,7 +49,8 @@ fn input_rejects_unknown_fields_and_reserved_takers() {
         "chainId": 1,
         "sellToken": format!("{NATIVE:#x}"),
         "buyToken": "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48",
-        "sellAmount": "1"
+        "sellAmount": "1",
+        "taker": format!("{PREVIEW_TAKER:#x}")
     });
     assert!(parse_input(base.clone()).is_ok());
     assert!(parse_input(json!({"x": 1})).is_err());
@@ -271,7 +272,7 @@ fn execution_input() -> Input {
         buy_token: parse_address("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48").unwrap(),
         sell_amount: "1000000000000000000".into(),
         slippage_bps: 30,
-        taker: None,
+        taker: PREVIEW_TAKER,
     }
 }
 
@@ -287,7 +288,7 @@ fn execution_route() -> Route {
             data: "0x12345678".into(),
             value: "1000000000000000000".into(),
         },
-        expires_at: now_ms() + 20_000,
+        deadline: None,
     }
 }
 
@@ -330,6 +331,44 @@ fn route_target_and_value_are_checked() {
     );
 }
 
+#[test]
+fn route_allowlist_requires_exact_tuple_and_guards_transaction_encoding() {
+    let mut chain = configured_chain(&config(), 1);
+    chain.router = Some(alloy_primitives::Address::repeat_byte(0x22));
+    let route = execution_route();
+    let input = execution_input();
+    let matching = support::fixture_rule(route.tx.to);
+    validate_route(
+        &input,
+        &chain,
+        &route,
+        std::slice::from_ref(&matching),
+        true,
+    )
+    .unwrap();
+    for field in 0..4 {
+        let mut rule = matching.clone();
+        match field {
+            0 => rule.target = alloy_primitives::Address::repeat_byte(0x44),
+            1 => rule.spender = alloy_primitives::Address::repeat_byte(0x44),
+            2 => rule.selector = "0x87654321".into(),
+            _ => {}
+        }
+        let rules = if field == 3 { vec![] } else { vec![rule] };
+        for error in [
+            validate_route(&input, &chain, &route, &rules, true).unwrap_err(),
+            swap_transaction(&input, &chain, &route, &rules, None).unwrap_err(),
+        ] {
+            assert_eq!(
+                metamatch_backend::error::kind(&error),
+                ErrorKind::RouteNotAllowlisted
+            );
+            let public = metamatch_backend::api_error::ApiError::from(&error);
+            assert_eq!(public.code, "ROUTE_NOT_ALLOWLISTED");
+        }
+    }
+}
+
 #[tokio::test]
 async fn typed_rpc_provider_supplies_block_context() {
     let server = FixtureRpc::default().start().await;
@@ -346,19 +385,9 @@ async fn typed_rpc_provider_supplies_block_context() {
 #[tokio::test]
 async fn derives_balance_delta_and_gas_from_sequential_calls() {
     let result = run_simulation(false, false, false).await.unwrap();
-    match result.simulation {
-        Simulation::Success {
-            bought_amount,
-            gas_used,
-            funding,
-            ..
-        } => {
-            assert_eq!(bought_amount, "100");
-            assert_eq!(gas_used, "21000");
-            assert_eq!(funding, "overridden");
-        }
-        other => panic!("expected success: {other:?}"),
-    }
+    assert_eq!(result.simulation.bought_amount, "100");
+    assert_eq!(result.simulation.gas_used, "21000");
+    assert_eq!(result.simulation.funding, "overridden");
 }
 
 #[tokio::test]
@@ -368,8 +397,8 @@ async fn reorg_is_not_success() {
         .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
         .unwrap();
     assert!(matches!(
-        Simulation::from(failure),
-        Simulation::Error { .. }
+        failure,
+        metamatch_backend::simulation::SimulationFailure::Error(_)
     ));
 }
 
@@ -380,8 +409,8 @@ async fn unsupported_simulation_method_is_not_reported_as_transport_failure() {
         .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
         .unwrap();
     assert!(matches!(
-        Simulation::from(failure),
-        Simulation::Unsupported { .. }
+        failure,
+        metamatch_backend::simulation::SimulationFailure::Unsupported(_)
     ));
     assert_eq!(
         metamatch_backend::error::kind(&error).to_string(),
@@ -407,7 +436,6 @@ async fn create_rejects_a_chain_not_supported_by_current_providers() {
         "INVALID_INPUT"
     );
     assert!(service.chains().is_empty());
-    service.close().await;
 }
 
 #[tokio::test]
@@ -425,14 +453,14 @@ async fn provider_failure_isolated_from_available_provider() {
             buy_token: PREVIEW_TAKER,
             sell_amount: "1".into(),
             slippage_bps: 30,
-            taker: None,
+            taker: PREVIEW_TAKER,
         })
         .await
         .unwrap();
-    let state = support::wait_complete(&service, &created).await;
+    let state = created;
     assert_eq!(state.quotes.len(), 1);
-    assert!(state.quotes[0].simulation.as_ref().unwrap().is_success());
-    service.close().await;
+    assert!(state.failures.is_empty());
+    assert_eq!(state.quotes[0].simulation.bought_amount, "200");
 }
 
 #[tokio::test]
@@ -445,7 +473,7 @@ async fn create_rejects_chain_outside_current_provider_union() {
             buy_token: PREVIEW_TAKER,
             sell_amount: "1".into(),
             slippage_bps: 30,
-            taker: None,
+            taker: PREVIEW_TAKER,
         })
         .await
         .unwrap_err();
@@ -453,11 +481,10 @@ async fn create_rejects_chain_outside_current_provider_union() {
         metamatch_backend::error::kind(&error).to_string(),
         "INVALID_INPUT"
     );
-    service.close().await;
 }
 
 #[tokio::test]
-async fn polling_lifecycle_requires_authentication() {
+async fn capabilities_list_only_eligible_providers() {
     let config = config();
     let capability_app = create_app(config.clone());
     let (status, _, body) = request(
@@ -481,5 +508,54 @@ async fn polling_lifecycle_requires_authentication() {
         ethereum["providers"],
         json!(["kyber", "bebop", "odos", "openOcean", "velora"])
     );
-    capability_app.close().await;
+}
+
+#[test]
+fn execution_preserves_upstream_deadline_without_inventing_a_ttl() {
+    use alloy_primitives::{Bytes, U256};
+    use alloy_sol_types::{SolCall, sol};
+    sol! {
+        function exec(address operator, address token, uint256 amount, address target, bytes data) payable returns (bytes);
+        function execute(address sellToken, address buyToken, uint256 sellAmount, uint256 minBuyAmount, address target, address spender, uint256 value, bytes data, uint256 deadline) payable returns (uint256);
+    }
+    let mut chain = configured_chain(&config(), 1);
+    chain.router = Some(alloy_primitives::Address::repeat_byte(0x22));
+    let mut route = execution_route();
+    let rules = [support::fixture_rule(route.tx.to)];
+    let upstream_deadline = metamatch_backend::domain::now_ms() / 1000 + 120;
+    for deadline in [None, Some(upstream_deadline)] {
+        route.deadline = deadline;
+        let tx = swap_transaction(&execution_input(), &chain, &route, &rules, None).unwrap();
+        let outer = execCall::abi_decode(&hex::decode(&tx.data[2..]).unwrap()).unwrap();
+        let inner = executeCall::abi_decode(&outer.data).unwrap();
+        assert_eq!(
+            inner.deadline,
+            deadline.map(U256::from).unwrap_or(U256::MAX)
+        );
+        assert_eq!(inner.minBuyAmount, U256::from(9970));
+        assert_eq!(inner.sellAmount, parse_uint(&route.sell_amount).unwrap());
+        assert_eq!(
+            inner.data,
+            Bytes::from(hex::decode(&route.tx.data[2..]).unwrap())
+        );
+    }
+}
+
+#[test]
+fn competition_timeout_configuration_is_bounded() {
+    assert_eq!(config().timeout_ms, 6000);
+    for (value, valid) in [
+        ("99", false),
+        ("100", true),
+        ("30000", true),
+        ("30001", false),
+        ("abc", false),
+    ] {
+        let env = HashMap::from([("COMPETITION_TIMEOUT_MS".into(), value.into())]);
+        let result = load_config(&env);
+        assert_eq!(result.is_ok(), valid);
+        if valid {
+            assert_eq!(result.unwrap().timeout_ms.to_string(), value);
+        }
+    }
 }

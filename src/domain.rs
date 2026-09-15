@@ -23,7 +23,7 @@ pub struct Input {
     pub buy_token: Address,
     pub sell_amount: String,
     pub slippage_bps: u64,
-    pub taker: Option<Address>,
+    pub taker: Address,
 }
 
 #[derive(Debug, Deserialize)]
@@ -36,19 +36,11 @@ pub struct CreateCompetitionRequest {
     pub sell_amount: String,
     #[serde(default = "default_slippage")]
     pub slippage_bps: u64,
-    pub taker: Option<String>,
+    pub taker: String,
 }
 
 fn default_slippage() -> u64 {
     30
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-#[serde(rename_all = "camelCase")]
-pub struct BuildRequest {
-    pub taker: String,
-    pub accepted_min_buy_amount: String,
 }
 
 pub fn validate_input(request: CreateCompetitionRequest) -> anyhow::Result<Input> {
@@ -61,14 +53,9 @@ pub fn validate_input(request: CreateCompetitionRequest) -> anyhow::Result<Input
         anyhow::bail!(ErrorKind::InvalidInput);
     }
     let sell_amount = parse_positive(&request.sell_amount)?.to_string();
-    let taker = request
-        .taker
-        .map(|value| parse_address(&value))
-        .transpose()?;
-    if taker.is_some_and(|taker| {
-        is_reserved_address(taker)
-            || U256::from_be_slice(taker.as_slice()) <= U256::from(0xffff_u64)
-    }) {
+    let taker = parse_address(&request.taker)?;
+    if is_reserved_address(taker) || U256::from_be_slice(taker.as_slice()) <= U256::from(0xffff_u64)
+    {
         anyhow::bail!(ErrorKind::InvalidTaker);
     }
     Ok(Input {
@@ -79,16 +66,6 @@ pub fn validate_input(request: CreateCompetitionRequest) -> anyhow::Result<Input
         slippage_bps: request.slippage_bps,
         taker,
     })
-}
-
-pub fn validate_build_request(request: BuildRequest) -> anyhow::Result<(Address, String)> {
-    let taker = parse_address(&request.taker)?;
-    if U256::from_be_slice(taker.as_slice()) <= U256::from(0xffff_u64) || is_reserved_address(taker)
-    {
-        anyhow::bail!(ErrorKind::InvalidTaker);
-    }
-    let accepted = parse_positive(&request.accepted_min_buy_amount)?.to_string();
-    Ok((taker, accepted))
 }
 
 pub fn parse_address(value: &str) -> anyhow::Result<Address> {
@@ -149,7 +126,6 @@ pub struct Chain {
     pub name: String,
     pub rpc_url: Option<String>,
     pub router: Option<Address>,
-    pub balance_slots: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -168,7 +144,8 @@ pub struct Tx {
     pub value: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Route {
     pub provider: &'static str,
     pub buy_amount: String,
@@ -176,61 +153,47 @@ pub struct Route {
     pub sell_amount: String,
     pub spender: Address,
     pub tx: Tx,
-    pub expires_at: u64,
+    /// Upstream execution deadline in Unix seconds, when supplied by the provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-#[serde(
-    tag = "status",
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum Simulation {
-    Success {
-        bought_amount: String,
-        gas_used: String,
-        gas_fee_wei: Option<String>,
-        funding: String,
-        block_hash: String,
-    },
-    Reverted {
-        reason: String,
-    },
-    Unsupported {
-        reason: String,
-    },
-    Error {
-        reason: String,
-    },
+#[serde(rename_all = "camelCase")]
+pub struct SimulationSuccess {
+    pub bought_amount: String,
+    pub gas_used: String,
+    pub gas_fee_wei: Option<String>,
+    pub funding: String,
+    pub block_context: BlockContext,
+    pub simulated_timestamp: u64,
 }
 
-impl Simulation {
-    pub fn is_success(&self) -> bool {
-        matches!(self, Self::Success { .. })
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BlockContext {
+    pub number: String,
+    pub hash: String,
+    pub timestamp: u64,
+}
 
-    pub fn is_actual_success(&self) -> bool {
-        matches!(self, Self::Success { funding, .. } if funding == "actual")
+impl Context {
+    pub fn block_context(&self) -> BlockContext {
+        BlockContext {
+            number: self.block_number.clone(),
+            hash: self.block_hash.clone(),
+            timestamp: self.timestamp,
+        }
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Quote {
-    pub id: String,
-    pub provider: &'static str,
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub quoted_amount: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub min_buy_amount: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub simulation: Option<Simulation>,
+    pub route: Route,
+    pub simulation: SimulationSuccess,
+    pub approvals: Vec<Tx>,
+    pub transaction: Tx,
     pub latency_ms: u64,
-    pub expires_at: u64,
-    pub execution: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
 }
 
 pub fn minimum(amount: &str, bps: u64) -> anyhow::Result<String> {
@@ -245,42 +208,18 @@ pub fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-pub fn rank(quotes: &[Quote]) -> Vec<Quote> {
-    let now = now_ms();
-    let mut ranked = quotes.to_vec();
-    ranked.sort_by(|left, right| {
-        let left_verified = left.expires_at > now
-            && left.simulation.as_ref().is_some_and(Simulation::is_success)
-            && left.quoted_amount.is_some();
-        let right_verified = right.expires_at > now
-            && right
-                .simulation
-                .as_ref()
-                .is_some_and(Simulation::is_success)
-            && right.quoted_amount.is_some();
-        match right_verified.cmp(&left_verified) {
-            std::cmp::Ordering::Equal if left_verified => {
-                let left_value = parse_uint(
-                    left.quoted_amount
-                        .as_ref()
-                        .expect("verified quote has quoted amount"),
-                );
-                let right_value = parse_uint(
-                    right
-                        .quoted_amount
-                        .as_ref()
-                        .expect("verified quote has quoted amount"),
-                );
-                match (right_value, left_value) {
-                    (Ok(right_value), Ok(left_value)) => right_value
-                        .cmp(&left_value)
-                        .then(left.provider.cmp(right.provider)),
-                    _ => left.provider.cmp(right.provider),
-                }
-            }
-            std::cmp::Ordering::Equal => left.provider.cmp(right.provider),
-            order => order,
-        }
+pub fn rank(quotes: Vec<Quote>) -> anyhow::Result<Vec<Quote>> {
+    let mut scored = quotes
+        .into_iter()
+        .map(|quote| {
+            let amount = parse_positive(&quote.simulation.bought_amount)?;
+            Ok((quote, amount))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    scored.sort_by(|(left, left_amount), (right, right_amount)| {
+        right_amount
+            .cmp(left_amount)
+            .then(left.route.provider.cmp(right.route.provider))
     });
-    ranked
+    Ok(scored.into_iter().map(|(quote, _)| quote).collect())
 }

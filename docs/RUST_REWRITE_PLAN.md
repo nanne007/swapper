@@ -2,6 +2,8 @@
 
 日期：2026-09-13。Rust 重写与 Slice 5 至 Slice 10 已完成；13 家官方接入复核和代码纠偏已纳入当前最小多链 v1。
 
+历史计划：下文的 polling/build 和 TTL 描述保留当时的设计记录。当前单请求协议及 2026-09-15 恢复路由白名单并保留 recover/ownership 的实现，以 [TECHNICAL.md](TECHNICAL.md) 和 [合约说明](../contracts/README.md) 为准。
+
 ## 已确认基线
 
 - 根目录 Cargo crate 是唯一 runtime 和质量门入口。

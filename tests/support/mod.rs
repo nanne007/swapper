@@ -10,11 +10,11 @@ use async_trait::async_trait;
 use metamatch_backend::{
     app::App,
     chains::configured_chain,
-    competitions::{Competitions, Services},
+    competitions::Services,
     config::{Config, load_config},
     domain::{
         Address as DomainAddress, Chain, Context, Input, NATIVE, PREVIEW_TAKER, Route, Rule,
-        Simulation, Tx, now_ms, parse_address,
+        SimulationSuccess, Tx, parse_address,
     },
     execution::swap_transaction,
     http::{HttpClient, HttpRequest, HttpResponse},
@@ -87,7 +87,7 @@ pub fn input(chain_id: u64, sell_token: Address) -> Input {
         buy_token: PREVIEW_TAKER,
         sell_amount: "1000000000000000000".into(),
         slippage_bps: 30,
-        taker: None,
+        taker: PREVIEW_TAKER,
     }
 }
 
@@ -140,7 +140,7 @@ impl FixtureRpc {
         }
     }
 
-    fn response(&self, request: &Value) -> Value {
+    pub(crate) fn response(&self, request: &Value) -> Value {
         use serde_json::json;
         let result = match request["method"].as_str().unwrap() {
             "eth_chainId" => json!("0x1"),
@@ -166,6 +166,10 @@ impl FixtureRpc {
                 } else {
                     U256::ZERO
                 }))
+            }
+            "eth_createAccessList" => {
+                return json!({"jsonrpc":"2.0", "id":request["id"],
+                    "error":{"code":-32601,"message":"access-list generation unsupported"}});
             }
             "eth_simulateV1" if self.unsupported_simulation => {
                 return json!({
@@ -262,7 +266,7 @@ pub fn fixture_route(input: &Input) -> Route {
             data: "0x12345678".into(),
             value: input.sell_amount.clone(),
         },
-        expires_at: now_ms() + 20_000,
+        deadline: None,
     }
 }
 
@@ -284,18 +288,22 @@ pub async fn run_simulation(
     chain.rpc_url = Some(server.url.clone());
     let input = input(1, NATIVE);
     let route = fixture_route(&input);
-    metamatch_backend::simulation::Simulator::new(Arc::new(RpcClients::new(Duration::from_secs(1))))
-        .run(SimulationRequest {
-            input: &input,
-            chain: &chain,
-            route: &route,
-            context: &fixture_context(),
-            rules: &[],
-            taker: PREVIEW_TAKER,
-            actual: false,
-            min: None,
-        })
-        .await
+    metamatch_backend::simulation::Simulator::new(
+        Arc::new(RpcClients::new(Duration::from_secs(1))),
+        std::sync::Arc::new(metamatch_backend::balance_slots::BalanceSlots::new(
+            Default::default(),
+        )),
+    )
+    .run(SimulationRequest {
+        input: &input,
+        chain: &chain,
+        route: &route,
+        context: &fixture_context(),
+        rules: &[],
+        taker: PREVIEW_TAKER,
+        min: None,
+    })
+    .await
 }
 
 pub struct MockContext;
@@ -313,16 +321,13 @@ pub struct MockSimulation;
 impl SimulationProvider for MockSimulation {
     async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         Ok(SimResult {
-            simulation: Simulation::Success {
+            simulation: SimulationSuccess {
                 bought_amount: request.route.buy_amount.clone(),
                 gas_used: "1".into(),
                 gas_fee_wei: Some("1".into()),
-                funding: if request.actual {
-                    "actual".into()
-                } else {
-                    "overridden".into()
-                },
-                block_hash: request.context.block_hash.clone(),
+                funding: "overridden".into(),
+                block_context: request.context.block_context(),
+                simulated_timestamp: request.context.timestamp.saturating_add(1),
             },
             approvals: Vec::new(),
             transaction: swap_transaction(
@@ -378,7 +383,7 @@ impl Provider for MockProvider {
                     "0".into()
                 },
             },
-            expires_at: now_ms() + 20_000,
+            deadline: None,
         })
     }
 }
@@ -400,20 +405,6 @@ pub fn competition_services_for(config: &Config, configured_router: Option<Addre
         Arc::new(MockContext),
         Arc::new(MockSimulation),
     )
-}
-
-pub async fn wait_complete(
-    service: &Competitions,
-    id: &metamatch_backend::competitions::CreateResponse,
-) -> metamatch_backend::competitions::Snapshot {
-    for _ in 0..100 {
-        let state = service.get(id.id, Some(&id.access_token)).await.unwrap();
-        if state.status == "complete" {
-            return state;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    panic!("competition did not complete")
 }
 
 pub async fn request(

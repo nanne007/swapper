@@ -176,7 +176,7 @@ impl Provider for OkxProvider {
                     value: data.tx.value,
                     from: data.tx.from,
                 },
-                expires_at: crate::domain::now_ms().saturating_add(20_000),
+                deadline: None,
             },
         )
     }

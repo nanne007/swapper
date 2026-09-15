@@ -9,11 +9,11 @@ Read `AGENTS.md`, `docs/PRODUCT.md`, `docs/TECHNICAL.md`, `docs/VERIFICATION.md`
 
 ## Verification layers
 
-- Rust unit tests cover domain arithmetic, ranking, provider isolation, HTTP, authentication, TTL/capacity, RPC errors, build invariants, and public envelopes.
+- Rust unit tests cover domain arithmetic, ranking, provider isolation, HTTP, total timeout/capacity/cancellation, RPC errors, executable transaction invariants, and public envelopes.
 - Provider fixtures verify URL, headers, request fields, normalization, malformed/oversized responses, timeout, rate limit, and unexpected execution addresses. They are not live supplier evidence.
-- RPC fixtures verify chain ID, block context, call ordering, `eth_simulateV1` parsing, reorg, revert, unsupported method, override validation, and fee behavior.
-- Foundry tests cover caller authorization, route tuple allowlists, exact amount/value, token return values, approval cleanup, minimum output, historical balances, refunds, nested Holder behavior, and reentrancy. Add fuzzing for numeric balance/refund/minimum invariants.
-- Local Anvil E2E covers the HTTP → simulation → approval → rebuild → local swap path. It does not prove formal Holder bytecode, provider behavior, deployed Router safety, or production fee data.
+- RPC fixtures verify chain ID, block context, call ordering, typed `eth_createAccessList` mapping discovery, `eth_simulateV1` parsing, reorg, revert, unsupported method, direct sell/native funding overrides, absence of real-balance reads, and fee behavior.
+- Foundry tests cover caller authorization, route allowlist registration/revocation and tuple matching, invalid/direct ERC20 targets, exact amount/value, token return values, approval cleanup, minimum output, historical balances, refunds, nested Holder behavior, ERC20/native recovery, two-step ownership, and swap/recovery reentrancy. Add fuzzing for numeric balance/refund/minimum/recovery invariants.
+- Local Anvil E2E covers the HTTP → simulation → approval → same returned local swap path. It does not prove formal Holder bytecode, provider behavior, deployed Router safety, or production fee data.
 
 ## Workflow
 

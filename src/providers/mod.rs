@@ -226,7 +226,7 @@ struct RouteCandidate {
     min_buy_amount: String,
     spender: Address,
     tx: RawTransaction,
-    expires_at: u64,
+    deadline: Option<u64>,
 }
 
 fn normalize_route(
@@ -245,7 +245,7 @@ fn normalize_route(
         anyhow::bail!(ErrorKind::UpstreamMinimumExceedsQuote);
     }
     let transaction = candidate.tx.into_tx(sender)?;
-    crate::execution::validate_transaction(input, &transaction, candidate.expires_at)?;
+    crate::execution::validate_transaction(input, &transaction, candidate.deadline)?;
     if transaction.to == Address::ZERO
         || (input.sell_token != NATIVE && candidate.spender == Address::ZERO)
     {
@@ -258,7 +258,7 @@ fn normalize_route(
         sell_amount,
         spender: candidate.spender,
         tx: transaction,
-        expires_at: candidate.expires_at,
+        deadline: candidate.deadline,
     })
 }
 

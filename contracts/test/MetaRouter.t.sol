@@ -79,6 +79,10 @@ contract MockAllowanceHolder {
 }
 
 contract MockProvider {
+    function recoverDuringSwap(MetaRouter router, address token) external {
+        router.recoverToken(token, payable(address(this)), 1);
+    }
+
     function swap(address sell, address buy, uint256 spend, uint256 output, address recipient, uint256 refund)
         external
         payable
@@ -93,6 +97,13 @@ contract MockProvider {
 
     function reenter(MockAllowanceHolder holder, MetaRouter router, bytes calldata execution) external {
         holder.exec(address(router), address(0), 0, payable(address(router)), execution);
+    }
+}
+
+/// @dev A non-token route entry may expose balanceOf; allowlist review decides eligibility.
+contract MockBalanceReportingProvider is MockProvider {
+    function balanceOf(address) external pure returns (uint256) {
+        return 0;
     }
 }
 
@@ -299,6 +310,68 @@ contract MetaRouterTest {
         _run(100, 1, 100, 50);
     }
 
+    function testNewTargetRequiresRegistrationAndCanBeRevoked() public {
+        MockProvider fresh = new MockProvider();
+        bytes32 key = keccak256(abi.encode(address(fresh), address(fresh), MockProvider.swap.selector));
+        bytes memory execution = abi.encodeCall(
+            MetaRouter.execute,
+            (
+                address(sell),
+                address(buy),
+                100,
+                50,
+                address(fresh),
+                address(fresh),
+                0,
+                _data(100, 60, address(router), 0),
+                block.timestamp + 60
+            )
+        );
+        require(!router.allowed(key));
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.RouteNotAllowed.selector);
+        holder.exec(address(router), address(sell), 100, payable(address(router)), execution);
+        router.setAllowed(address(fresh), address(fresh), MockProvider.swap.selector, true);
+        require(router.allowed(key));
+        vm.prank(TAKER);
+        holder.exec(address(router), address(sell), 100, payable(address(router)), execution);
+        require(buy.balanceOf(TAKER) == 60);
+        require(sell.allowance(address(router), address(fresh)) == 0);
+        router.setAllowed(address(fresh), address(fresh), MockProvider.swap.selector, false);
+        require(!router.allowed(key));
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.RouteNotAllowed.selector);
+        holder.exec(address(router), address(sell), 100, payable(address(router)), execution);
+        require(buy.balanceOf(TAKER) == 60);
+    }
+
+    function testAllowlistedProviderWithBalanceOfCanExecute() public {
+        MockBalanceReportingProvider reviewed = new MockBalanceReportingProvider();
+        bytes memory execution = abi.encodeCall(
+            MetaRouter.execute,
+            (
+                address(sell),
+                address(buy),
+                100,
+                50,
+                address(reviewed),
+                address(reviewed),
+                0,
+                _data(100, 60, address(router), 0),
+                block.timestamp + 60
+            )
+        );
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.RouteNotAllowed.selector);
+        holder.exec(address(router), address(sell), 100, payable(address(router)), execution);
+        router.setAllowed(address(reviewed), address(reviewed), MockProvider.swap.selector, true);
+        vm.prank(TAKER);
+        holder.exec(address(router), address(sell), 100, payable(address(router)), execution);
+        require(buy.balanceOf(TAKER) == 60);
+        require(sell.balanceOf(TAKER) == 1000 ether - 100);
+        require(sell.allowance(address(router), address(reviewed)) == 0);
+    }
+
     function testUnlistedSelectorRejected() public {
         bytes memory execution = _execution(address(sell), 100, 1, 0, hex"12345678", block.timestamp + 60);
         vm.prank(TAKER);
@@ -458,6 +531,24 @@ contract MetaRouterTest {
     }
 
     function testHolderNonExecSelectorAndMixedTupleForbidden() public {
+        _rejectedRoute(
+            address(holder),
+            address(holder),
+            abi.encodePacked(MockAllowanceHolder.transferFrom.selector),
+            MetaRouter.RouteNotAllowed.selector
+        );
+        _rejectedRoute(
+            address(holder),
+            address(provider),
+            abi.encodePacked(MockAllowanceHolder.exec.selector),
+            MetaRouter.RouteNotAllowed.selector
+        );
+        _rejectedRoute(
+            address(provider), address(holder), _data(100, 10, address(router), 0), MetaRouter.RouteNotAllowed.selector
+        );
+    }
+
+    function testAllowlistRejectsInvalidTargetsAndHolderShapes() public {
         vm.expectRevert(MetaRouter.InvalidInput.selector);
         router.setAllowed(address(holder), address(holder), MockAllowanceHolder.transferFrom.selector, true);
         vm.expectRevert(MetaRouter.InvalidInput.selector);
@@ -465,6 +556,302 @@ contract MetaRouterTest {
         vm.expectRevert(MetaRouter.InvalidInput.selector);
         router.setAllowed(address(provider), address(holder), MockProvider.swap.selector, true);
         vm.expectRevert(MetaRouter.InvalidInput.selector);
-        router.setAllowed(address(router), address(provider), MetaRouter.execute.selector, true);
+        router.setAllowed(address(router), address(provider), MockProvider.swap.selector, true);
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.setAllowed(address(provider), address(router), MockProvider.swap.selector, true);
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.setAllowed(address(0), address(provider), MockProvider.swap.selector, true);
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.setAllowed(address(provider), TAKER, MockProvider.swap.selector, true);
+        // Revocation must remain possible even if an address no longer has code.
+        router.setAllowed(address(0), TAKER, MockProvider.swap.selector, false);
+    }
+
+    function testInvalidTargetsAndSpendersRejected() public {
+        bytes memory data = _data(100, 10, address(router), 0);
+        _rejectedRoute(address(router), address(provider), data, MetaRouter.InvalidInput.selector);
+        _rejectedRoute(address(provider), address(router), data, MetaRouter.InvalidInput.selector);
+        _rejectedRoute(address(sell), address(provider), data, MetaRouter.InvalidInput.selector);
+        _rejectedRoute(address(buy), address(provider), data, MetaRouter.InvalidInput.selector);
+        _rejectedRoute(address(0), address(provider), data, MetaRouter.InvalidInput.selector);
+        _rejectedRoute(TAKER, address(provider), data, MetaRouter.InvalidInput.selector);
+        _rejectedRoute(address(provider), address(0), data, MetaRouter.InvalidInput.selector);
+        _rejectedRoute(address(provider), TAKER, data, MetaRouter.InvalidInput.selector);
+        _rejectedRoute(address(provider), address(provider), hex"123456", MetaRouter.InvalidInput.selector);
+    }
+
+    function _rejectedRoute(address target, address spender, bytes memory data, bytes4 reason) private {
+        bytes memory execution = abi.encodeCall(
+            MetaRouter.execute, (address(sell), address(buy), 100, 1, target, spender, 0, data, block.timestamp + 60)
+        );
+        vm.prank(TAKER);
+        vm.expectRevert(reason);
+        holder.exec(address(router), address(sell), 100, payable(address(router)), execution);
+    }
+
+    function testRecoverERC20AndNativeWhilePaused() public {
+        sell.mint(address(router), 100);
+        vm.deal(address(router), 1 ether);
+        router.setPaused(true);
+        router.recoverToken(address(sell), payable(TAKER), 40);
+        router.recoverToken(router.NATIVE(), payable(TAKER), 0.4 ether);
+        require(sell.balanceOf(address(router)) == 60);
+        require(sell.balanceOf(TAKER) == 1000 ether + 40);
+        require(address(router).balance == 0.6 ether);
+        require(TAKER.balance == 1000.4 ether);
+        require(router.paused());
+    }
+
+    function testUnlistedRouteCannotTransferOrApproveUnrelatedStoredToken() public {
+        MockToken stored = new MockToken();
+        stored.mint(address(router), 1000);
+        RecoveryCallback taker = new RecoveryCallback();
+        taker.configure(address(buy), abi.encodeCall(MockToken.mint, (address(taker), 1)));
+        vm.deal(address(taker), 1 ether);
+        address native = router.NATIVE();
+        // Minimum output cannot protect third-token balances; unreviewed routes
+        // must be rejected by the allowlist before any transfer or approval.
+        for (uint256 i; i < 2; ++i) {
+            bytes memory data = i == 0
+                ? abi.encodeCall(MockToken.transfer, (address(taker), 1000))
+                : abi.encodeCall(MockToken.approve, (address(taker), 1000));
+            bytes memory execution = abi.encodeCall(
+                MetaRouter.execute,
+                (native, address(buy), 1 ether, 1, address(stored), address(provider), 0, data, block.timestamp + 60)
+            );
+            vm.prank(address(taker));
+            vm.expectRevert(MetaRouter.RouteNotAllowed.selector);
+            holder.exec{value: 1 ether}(address(router), native, 1 ether, payable(address(router)), execution);
+        }
+        require(stored.balanceOf(address(router)) == 1000);
+        require(stored.balanceOf(address(taker)) == 0);
+        require(stored.allowance(address(router), address(taker)) == 0);
+    }
+
+    function testFuzzRecoverERC20(uint96 balance, uint96 rawAmount) public {
+        uint256 amount = uint256(rawAmount) % (uint256(balance) + 1) + 1;
+        sell.mint(address(router), uint256(balance) + 1);
+        router.recoverToken(address(sell), payable(TAKER), amount);
+        require(sell.balanceOf(address(router)) == uint256(balance) + 1 - amount);
+        require(sell.balanceOf(TAKER) == 1000 ether + amount);
+    }
+
+    function testFuzzRecoverNative(uint96 balance, uint96 rawAmount) public {
+        uint256 amount = uint256(rawAmount) % (uint256(balance) + 1) + 1;
+        vm.deal(address(router), uint256(balance) + 1);
+        router.recoverToken(router.NATIVE(), payable(TAKER), amount);
+        require(address(router).balance == uint256(balance) + 1 - amount);
+        require(TAKER.balance == 1000 ether + amount);
+    }
+
+    function testRecoverRequiresOwner() public {
+        sell.mint(address(router), 100);
+        vm.deal(address(router), 1 ether);
+        address native = router.NATIVE();
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.recoverToken(address(sell), payable(TAKER), 1);
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.recoverToken(native, payable(TAKER), 1);
+        require(sell.balanceOf(address(router)) == 100);
+        require(address(router).balance == 1 ether);
+    }
+
+    function testRecoverRejectsInvalidInputs() public {
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.recoverToken(address(sell), payable(address(0)), 1);
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.recoverToken(address(sell), payable(address(router)), 1);
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.recoverToken(address(sell), payable(TAKER), 0);
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.recoverToken(address(0), payable(TAKER), 1);
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.recoverToken(TAKER, payable(TAKER), 1);
+    }
+
+    function testRecoverFalseTransferAndInsufficientBalanceRevert() public {
+        sell.mint(address(router), 10);
+        sell.setFailures(false, true);
+        vm.expectRevert(MetaRouter.TokenCallFailed.selector);
+        router.recoverToken(address(sell), payable(TAKER), 1);
+        sell.setFailures(false, false);
+        vm.expectRevert(MetaRouter.TokenCallFailed.selector);
+        router.recoverToken(address(sell), payable(TAKER), 11);
+        address native = router.NATIVE();
+        vm.deal(address(router), 10);
+        vm.expectRevert(MetaRouter.NativeTransferFailed.selector);
+        router.recoverToken(native, payable(TAKER), 11);
+        require(sell.balanceOf(address(router)) == 10);
+        require(address(router).balance == 10);
+    }
+
+    function testRecoverSupportsNoReturnToken() public {
+        NoReturnToken token = new NoReturnToken();
+        token.mint(address(router), 10);
+        router.recoverToken(address(token), payable(TAKER), 4);
+        require(token.balanceOf(TAKER) == 4);
+        require(token.balanceOf(address(router)) == 6);
+    }
+
+    function testRecoverRejectingNativeRecipientRollsBack() public {
+        RejectNative recipient = new RejectNative();
+        vm.deal(address(router), 10);
+        address native = router.NATIVE();
+        vm.expectRevert(MetaRouter.NativeTransferFailed.selector);
+        router.recoverToken(native, payable(address(recipient)), 4);
+        require(address(router).balance == 10);
+    }
+
+    function testOwnershipTransferRequiresAcceptanceAndRevokesOldOwner() public {
+        bytes32 key = keccak256(abi.encode(address(provider), address(provider), MockProvider.swap.selector));
+        router.transferOwnership(TAKER);
+        require(router.owner() == address(this));
+        require(router.pendingOwner() == TAKER);
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.setAllowed(address(provider), address(provider), MockProvider.swap.selector, false);
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.setPaused(true);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.acceptOwnership();
+        vm.prank(TAKER);
+        router.acceptOwnership();
+        require(router.owner() == TAKER);
+        require(router.pendingOwner() == address(0));
+        require(router.allowed(key));
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.setAllowed(address(provider), address(provider), MockProvider.swap.selector, false);
+        vm.prank(TAKER);
+        router.setAllowed(address(provider), address(provider), MockProvider.swap.selector, false);
+        require(!router.allowed(key));
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.setPaused(true);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.recoverToken(address(sell), payable(TAKER), 1);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.transferOwnership(address(this));
+        vm.prank(TAKER);
+        router.setPaused(true);
+        sell.mint(address(router), 10);
+        vm.prank(TAKER);
+        router.recoverToken(address(sell), payable(TAKER), 10);
+        require(sell.balanceOf(address(router)) == 0);
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.acceptOwnership();
+    }
+
+    function testOwnerCanReplacePendingNominee() public {
+        router.transferOwnership(TAKER);
+        router.transferOwnership(address(0xCAFE));
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.acceptOwnership();
+        vm.prank(address(0xCAFE));
+        router.acceptOwnership();
+        require(router.owner() == address(0xCAFE));
+    }
+
+    function testOwnershipTransferRejectsInvalidNomineesAndUnauthorizedCaller() public {
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.Unauthorized.selector);
+        router.transferOwnership(TAKER);
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.transferOwnership(address(0));
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.transferOwnership(address(router));
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.transferOwnership(address(holder));
+        address native = router.NATIVE();
+        vm.expectRevert(MetaRouter.InvalidInput.selector);
+        router.transferOwnership(native);
+    }
+
+    function testOwnerCannotRecoverDuringSwapCallback() public {
+        router.setAllowed(address(provider), address(provider), MockProvider.recoverDuringSwap.selector, true);
+        router.transferOwnership(address(provider));
+        vm.prank(address(provider));
+        router.acceptOwnership();
+        sell.mint(address(router), 1000);
+        bytes memory execution = _execution(
+            address(sell),
+            100,
+            1,
+            0,
+            abi.encodeCall(MockProvider.recoverDuringSwap, (router, address(sell))),
+            block.timestamp + 60
+        );
+        vm.prank(TAKER);
+        vm.expectRevert(MetaRouter.Reentrant.selector);
+        holder.exec(address(router), address(sell), 100, payable(address(router)), execution);
+        require(sell.balanceOf(address(router)) == 1000);
+        require(sell.balanceOf(TAKER) == 1000 ether);
+    }
+
+    function testRecoveryCallbackCannotReenterRecoveryOrSwap() public {
+        RecoveryCallback recipient = new RecoveryCallback();
+        router.transferOwnership(address(recipient));
+        vm.prank(address(recipient));
+        router.acceptOwnership();
+        vm.deal(address(router), 10);
+        address native = router.NATIVE();
+        recipient.configure(address(router), abi.encodeCall(MetaRouter.recoverToken, (native, payable(TAKER), 1)));
+        vm.prank(address(recipient));
+        router.recoverToken(native, payable(address(recipient)), 1);
+        require(!recipient.succeeded());
+        require(keccak256(recipient.result()) == keccak256(abi.encodePacked(MetaRouter.Reentrant.selector)));
+
+        bytes memory execution =
+            _execution(address(sell), 100, 1, 0, _data(100, 10, address(router), 0), block.timestamp + 60);
+        recipient.configure(
+            address(holder),
+            abi.encodeCall(
+                MockAllowanceHolder.exec, (address(router), address(sell), 100, payable(address(router)), execution)
+            )
+        );
+        vm.prank(address(recipient));
+        router.recoverToken(native, payable(address(recipient)), 1);
+        require(!recipient.succeeded());
+        require(keccak256(recipient.result()) == keccak256(abi.encodePacked(MetaRouter.Reentrant.selector)));
+        require(address(router).balance == 8);
+        require(sell.balanceOf(TAKER) == 1000 ether);
+    }
+}
+
+contract NoReturnToken {
+    mapping(address => uint256) public balanceOf;
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function transfer(address to, uint256 amount) external {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+    }
+}
+
+contract RejectNative {
+    receive() external payable {
+        revert();
+    }
+}
+
+contract RecoveryCallback {
+    address private target;
+    bytes private data;
+    bool public succeeded;
+    bytes public result;
+
+    function configure(address target_, bytes calldata data_) external {
+        target = target_;
+        data = data_;
+    }
+
+    receive() external payable {
+        (succeeded, result) = target.call(data);
     }
 }

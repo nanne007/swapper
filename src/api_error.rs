@@ -1,11 +1,10 @@
 use crate::error::{ErrorKind, kind};
-use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::rejection::JsonRejection;
 use axum::{
     Json,
-    http::{HeaderValue, StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
-use axum_extra::typed_header::TypedHeaderRejection;
 use serde::Serialize;
 
 /// Public contract: a closed mapping of safe codes; no internal cause, URL or backtrace.
@@ -22,23 +21,12 @@ impl From<&anyhow::Error> for ApiError {
         let (code, status) = match kind(error) {
             ErrorKind::InvalidInput => ("INVALID_INPUT", 400),
             ErrorKind::InvalidTaker => ("INVALID_TAKER", 400),
-            ErrorKind::InvalidAccessToken => ("INVALID_ACCESS_TOKEN", 401),
-            ErrorKind::TakerMismatch => ("TAKER_MISMATCH", 403),
             ErrorKind::NotFound => ("NOT_FOUND", 404),
-            ErrorKind::QuoteNotFound => ("QUOTE_NOT_FOUND", 404),
-            ErrorKind::CompetitionNotFoundOrExpired => ("COMPETITION_NOT_FOUND_OR_EXPIRED", 404),
             ErrorKind::MethodNotAllowed => ("METHOD_NOT_ALLOWED", 405),
             ErrorKind::QuoteExpired => ("QUOTE_EXPIRED", 409),
-            ErrorKind::MinimumDowngradeRejected => ("MINIMUM_DOWNGRADE_REJECTED", 409),
-            ErrorKind::PriceMovedBelowAcceptedMinimum => {
-                ("PRICE_MOVED_BELOW_ACCEPTED_MINIMUM", 409)
-            }
-            ErrorKind::RequoteRequired => ("REQUOTE_REQUIRED", 409),
+
             ErrorKind::PayloadTooLarge => ("PAYLOAD_TOO_LARGE", 413),
             ErrorKind::UnsupportedMediaType => ("UNSUPPORTED_MEDIA_TYPE", 415),
-            ErrorKind::BuildError => ("BUILD_ERROR", 422),
-            ErrorKind::BuildReverted => ("BUILD_REVERTED", 422),
-            ErrorKind::BuildUnsupported => ("BUILD_UNSUPPORTED", 422),
             ErrorKind::UnsupportedChain => ("UNSUPPORTED_CHAIN", 422),
             ErrorKind::NativeSellUnsupported => ("NATIVE_SELL_UNSUPPORTED", 422),
             ErrorKind::CrossChainRouteUnsupported => ("CROSS_CHAIN_ROUTE_UNSUPPORTED", 422),
@@ -47,7 +35,6 @@ impl From<&anyhow::Error> for ApiError {
             }
             ErrorKind::RouteNotAllowlisted => ("ROUTE_NOT_ALLOWLISTED", 422),
             ErrorKind::CapacityExceeded => ("CAPACITY_EXCEEDED", 429),
-            ErrorKind::BuildCapacityExceeded => ("BUILD_CAPACITY_EXCEEDED", 429),
             ErrorKind::ProviderUnconfigured => ("PROVIDER_UNCONFIGURED", 503),
             ErrorKind::RpcNotConfigured => ("RPC_NOT_CONFIGURED", 503),
             ErrorKind::RpcChainMismatch => ("RPC_CHAIN_MISMATCH", 503),
@@ -103,31 +90,8 @@ impl From<JsonRejection> for ApiError {
             .into()
     }
 }
-impl From<PathRejection> for ApiError {
-    fn from(error: PathRejection) -> Self {
-        anyhow::Error::new(error)
-            .context(ErrorKind::InvalidInput)
-            .context("API path extraction")
-            .into()
-    }
-}
-impl From<TypedHeaderRejection> for ApiError {
-    fn from(error: TypedHeaderRejection) -> Self {
-        anyhow::Error::new(error)
-            .context(ErrorKind::InvalidAccessToken)
-            .context("API bearer extraction")
-            .into()
-    }
-}
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let auth = self.code == "INVALID_ACCESS_TOKEN";
-        let mut response = (self.status, Json(self)).into_response();
-        if auth {
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
-        }
-        response
+        (self.status, Json(self)).into_response()
     }
 }

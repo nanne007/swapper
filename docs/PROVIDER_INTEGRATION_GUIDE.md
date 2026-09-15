@@ -9,7 +9,7 @@
 - v1 的 13 家 provider 名单来自 [Matcha Meta DEX aggregation](https://0x-docs.gitbook.io/matcha-meta/core-concepts/dex-aggregation)。Matcha 页面用于决定“收录谁”，不继续充当每家 API 参数和当前链支持的唯一依据。
 - 每家能力、认证、endpoint、chain、金额单位、native token 和响应字段优先采用该 provider 当前官方文档、官方 SDK 或官方 GitHub。运行时不维护第二份 chain catalog，而是直接聚合当前 adapter 实例的 `supported_chains()`。
 - provider 官网可能随时变更。`supported_chains()` 是代码快照，不是远端动态发现；上线前和每次升级 adapter 时必须重新核对本文链接并运行 live smoke。
-- “API 返回交易”不等于“可安全成交”。所有响应仍要经过金额、token、taker、spender、target、calldata、native value、expiry 和链上仿真检查。
+- “API 返回交易”不等于“可安全成交”。所有响应仍要经过金额、token、taker、spender、target、calldata、native value、上游原生 deadline 和链上仿真检查。
 - v1 只做同链、EVM、exact-input、自托管交易。跨链、intent/gasless、Solana、平台收费和 provider token registry 不进入核心实现。
 
 ## 2. 总览
@@ -34,7 +34,7 @@
 
 ## 3. 统一接入边界
 
-每家 adapter 最终只输出：provider 字符串 ID、sell/buy/min amount、spender、`to/data/value` 和短 expiry。共享层不猜 provider schema，也不引入通用 credential abstraction。
+每家 adapter 最终只输出：provider 字符串 ID、sell/buy/min amount、spender、`to/data/value` 和可选的上游原生 deadline（Unix 秒）。不再人为给 route 元数据附加短 TTL；provider 请求和 calldata 内的 deadline 仍按对应 API 契约保留。共享层不猜 provider schema，也不引入通用 credential abstraction。
 
 认证规则如下：
 
@@ -77,7 +77,7 @@
 - 前提：当前代码保留可匿名访问的 `aggregator-api.kyberswap.com/{chain}/api/v1`。`KYBER_CLIENT_ID` 是可选 client identity；缺失时仍参与，但公开网关配额更低。Kyber 新商业 gateway/API key 不在未确认完整 endpoint 契约前混入此 adapter。
 - 请求：native 为 `0xeeee…`；金额为 base units；build 的 `slippageTolerance` 是 bps，deadline 是 Unix 秒。
 - 响应：route 和 build 的 `routerAddress` 必须一致；交易 value 对 native 和 ERC-20 分别校验。
-- 注意：官方要求 route summary 短期使用，通常只应缓存 5–10 秒。adapter expiry 因而设为 10 秒，禁止跨请求复用 `routeSummary`。当前网关还会拒绝空 User-Agent；共享 Reqwest client 已设置 `metamatch-backend/<version>`，真实测试证明该 403 与 access key 无关。
+- 注意：官方要求 route summary 短期使用，通常只应缓存 5–10 秒。仍禁止跨请求复用 `routeSummary`；移除原来 route 元数据中的人工 10 秒 expiry。原有 build 请求的 60 秒 deadline 保留在 provider calldata 中，不是 API 结果的有效期。当前网关还会拒绝空 User-Agent；共享 Reqwest client 已设置 `metamatch-backend/<version>`，真实测试证明该 403 与 access key 无关。
 
 代码：[kyber.rs](../src/providers/kyber.rs)。
 
@@ -87,7 +87,7 @@
 
 - 能力：Ethereum/Base/Arbitrum 上先获取 route，再把 route 参数交给 `/swap` 生成交易。
 - 前提：配置 `BARTER_API_KEY`，使用 Bearer；每个 HTTP 调用都生成新的 UUID `X-Request-Id`。
-- 请求：`sellAmount` 是 base units；`deadline` 是未来 Unix 毫秒，不是秒；`recipient`/`origin` 绑定用户地址。
+- 请求：`sellAmount` 是 base units；`deadline` 是未来 Unix 毫秒，不是秒；`recipient`/`origin` 绑定执行 sender（统一路径为 Router）。原有请求的 20 秒 deadline 保留在 provider calldata 中；删除 route 元数据 TTL 不改变这一上游请求字段。
 - 响应：两阶段 input/output 必须一致；当前把 swap `to` 作为 execution target 和 spender。
 - 注意：官方要求 `minReturn` 不低于预期输出的 98%。产品允许最高 5% 滑点时，adapter 会收紧为最多 2%，不会向下放宽用户保护。公开文档没有形成稳定 native sell marker 契约，因此 v1 明确拒绝 native sell。
 
@@ -100,7 +100,7 @@
 - 能力：PMM/RFQ firm quote，self-execution 返回 approval target、交易和保证最小输出。
 - 前提：demo 可不带 key，但配额和市场覆盖受限；生产应申请 key 并配置 `BEBOP_API_KEY`，adapter 会用 Bearer 透传。
 - 请求：`/pmm/{chain}/v3/quote`，必须 `gasless=false`；sell/buy/taker/receiver 地址使用 EIP-55 checksum。
-- 响应：精确匹配 `chainId`、taker、sell/buy token 和 amount；`minimumAmount` 必须存在；`expiry` 是 Unix 秒，转换为毫秒。
+- 响应：精确匹配 `chainId`、taker、sell/buy token 和 amount；`minimumAmount` 必须存在；`expiry` 是 Unix 秒，以 `Route.deadline` 原样保存。
 - 注意：不再本地推导缺失的 minimum，因为那不是 provider 的 firm guarantee。
 
 代码：[bebop.rs](../src/providers/bebop.rs)。

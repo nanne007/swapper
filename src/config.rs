@@ -1,4 +1,4 @@
-use crate::error::ErrorKind;
+use crate::{balance_slots::BalanceSlotConfig, domain::is_reserved_address, error::ErrorKind};
 use anyhow::Context as _;
 use std::collections::HashMap;
 use url::Url;
@@ -7,10 +7,9 @@ use url::Url;
 pub struct Config {
     pub port: u16,
     pub host: String,
-    pub ttl_ms: u64,
     pub timeout_ms: u64,
-    pub max_competitions: usize,
     pub max_active: usize,
+    pub balance_slots: BalanceSlotConfig,
     pub provider_keys: HashMap<String, String>,
     pub okx_secret_key: Option<String>,
     pub okx_passphrase: Option<String>,
@@ -36,8 +35,7 @@ pub fn load_config_from_env() -> anyhow::Result<Config> {
 
 pub fn load_config(env: &HashMap<String, String>) -> anyhow::Result<Config> {
     let port = bounded_integer(env.get("PORT"), 3000, 1, 65_535)? as u16;
-    let ttl_ms = bounded_integer(env.get("QUOTE_TTL_MS"), 60_000, 10_000, 120_000)?;
-    let timeout_ms = bounded_integer(env.get("PROVIDER_TIMEOUT_MS"), 6_000, 100, 30_000)?;
+    let timeout_ms = bounded_integer(env.get("COMPETITION_TIMEOUT_MS"), 6_000, 100, 30_000)?;
     let host = env
         .get("HOST")
         .cloned()
@@ -68,13 +66,21 @@ pub fn load_config(env: &HashMap<String, String>) -> anyhow::Result<Config> {
     let rpc_urls = rpc_urls(env)?;
     let alchemy_api_key = env_value(env, "ALCHEMY_API_KEY");
 
+    let balance_slots: BalanceSlotConfig =
+        serde_json::from_str(env_value(env, "BALANCE_SLOTS").as_deref().unwrap_or("{}"))
+            .context(ErrorKind::InvalidConfig)?;
+    if balance_slots.iter().any(|(chain_id, slots)| {
+        *chain_id == 0 || slots.keys().any(|token| is_reserved_address(*token))
+    }) {
+        anyhow::bail!(ErrorKind::InvalidConfig);
+    }
+
     Ok(Config {
         port,
         host,
-        ttl_ms,
         timeout_ms,
-        max_competitions: 500,
         max_active: 20,
+        balance_slots,
         provider_keys,
         okx_secret_key,
         okx_passphrase,

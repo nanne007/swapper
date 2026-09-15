@@ -104,7 +104,7 @@ impl Provider for OdosProvider {
                 min_buy_amount: minimum(buy_amount, input.slippage_bps)?,
                 spender: tx_to,
                 tx: assemble.transaction,
-                expires_at: crate::domain::now_ms().saturating_add(20_000),
+                deadline: None,
             },
         )
     }

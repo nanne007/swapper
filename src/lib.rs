@@ -1,5 +1,6 @@
 pub mod api_error;
 pub mod app;
+pub mod balance_slots;
 pub mod chains;
 pub mod competitions;
 pub mod config;

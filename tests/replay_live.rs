@@ -2,7 +2,7 @@ mod support;
 
 use metamatch_backend::{app::create_app, config::load_config};
 use serde_json::{Value, json};
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 use support::request;
 
 /// Exact user request, real adapters and configured RPC. Opt-in; never signs or broadcasts.
@@ -28,48 +28,23 @@ async fn replay_eth_to_usdc() {
     };
     env.extend(std::env::vars());
     let app = create_app(load_config(&env).expect("invalid runtime config"));
-    let input = json!({"chainId":1,"sellToken":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","buyToken":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","sellAmount":"1000000000000000000","slippageBps":30});
+    let taker = std::env::var("METAMATCH_LIVE_TAKER").expect("set a real funded taker address");
+    let input = json!({"chainId":1,"sellToken":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","buyToken":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","sellAmount":"1000000000000000000","slippageBps":30,"taker":taker});
     let (status, _, body) =
         request(&app.router, "POST", "/v1/competitions", Some(input), None).await;
-    assert_eq!(status.as_u16(), 202);
-    let created: Value = serde_json::from_str(&body).unwrap();
-    let path = format!("/v1/competitions/{}", created["id"].as_str().unwrap());
-    let token = format!("Bearer {}", created["accessToken"].as_str().unwrap());
-    let snapshot = tokio::time::timeout(Duration::from_secs(100), async {
-        loop {
-            let (status, _, body) = request(&app.router, "GET", &path, None, Some(&token)).await;
-            assert_eq!(status.as_u16(), 200);
-            let snapshot: Value = serde_json::from_str(&body).unwrap();
-            if snapshot["status"] == "complete" {
-                break snapshot;
-            }
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
-    })
-    .await
-    .expect("competition did not finish");
+    assert_eq!(status.as_u16(), 200);
+    let snapshot: Value = serde_json::from_str(&body).unwrap();
     for quote in snapshot["quotes"].as_array().unwrap() {
         println!(
-            "provider={} status={} amount={} simulation={} error={}",
-            quote["provider"],
-            quote["status"],
-            quote["quotedAmount"],
-            quote["simulation"],
-            quote["error"]
+            "provider={} amount={} simulation={}",
+            quote["route"]["provider"], quote["route"]["buyAmount"], quote["simulation"]
         );
     }
-    println!(
-        "block={} recommended={}",
-        snapshot["context"]["blockNumber"], snapshot["recommendedQuoteId"]
-    );
-    app.close().await;
-    assert!(snapshot["context"].is_object(), "live RPC context failed");
+    for failure in snapshot["failures"].as_array().unwrap() {
+        println!("failure={failure}");
+    }
     assert!(
-        snapshot["quotes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|quote| quote["simulation"]["status"] == "success"),
+        !snapshot["quotes"].as_array().unwrap().is_empty(),
         "no quote passed live simulation"
     );
 }

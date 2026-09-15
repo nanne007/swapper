@@ -3,7 +3,7 @@
 //! Run with `forge build --root contracts` first, then:
 //! `cargo test --test e2e_local -- --ignored --nocapture`.
 
-use alloy_primitives::{Address, B256, Bytes, FixedBytes, U256, keccak256};
+use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider as AlloyProvider, ProviderBuilder};
 use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionInput, TransactionRequest};
 use alloy_sol_types::{SolCall, sol};
@@ -14,12 +14,12 @@ use metamatch_backend::{
     chains::configured_chain,
     competitions::Services,
     config::{Config, load_config},
-    domain::{Context, HOLDER, Input, Route, Rule, Tx, now_ms, parse_address},
+    domain::{Context, HOLDER, Input, Route, Rule, Tx, parse_address},
     providers::Provider,
     rpc::ContextProvider,
     simulation::Simulator,
 };
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -223,7 +223,7 @@ impl Provider for FixtureProvider {
             return Err(anyhow::anyhow!("FIXTURE_SENDER_MISMATCH"));
         }
         let mut route = self.route.clone();
-        route.expires_at = now_ms() + 20_000;
+        route.deadline = None;
         Ok(route)
     }
 }
@@ -252,10 +252,6 @@ fn address_word(address: Address) -> String {
     let mut word = [0_u8; 32];
     word[12..].copy_from_slice(address.as_slice());
     hex::encode(word)
-}
-
-fn function_selector(signature: &str) -> FixedBytes<4> {
-    FixedBytes::from_slice(&keccak256(signature.as_bytes())[..4])
 }
 
 async fn deploy(
@@ -391,7 +387,26 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         format!("{}{}", address_word(account), address_word(HOLDER)),
     )
     .await?;
-    let swap_selector = function_selector("swap(address,address,uint256,uint256,address,uint256)");
+    send_call(
+        rpc,
+        account,
+        router,
+        hex_bytes(
+            setAllowedCall {
+                target,
+                spender: target,
+                selector: swapCall::SELECTOR.into(),
+                enabled: true,
+            }
+            .abi_encode(),
+        ),
+    )
+    .await?;
+    let rules = vec![Rule {
+        target,
+        spender: target,
+        selector: hex_bytes(swapCall::SELECTOR),
+    }];
     let swap_data = hex_bytes(
         swapCall {
             sell,
@@ -416,21 +431,6 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         ),
     )
     .await?;
-    send_call(
-        rpc,
-        account,
-        router,
-        hex_bytes(
-            setAllowedCall {
-                target,
-                spender: target,
-                selector: swap_selector,
-                enabled: true,
-            }
-            .abi_encode(),
-        ),
-    )
-    .await?;
 
     let config: Config = load_config(&HashMap::from([(
         String::from("ETHEREUM_RPC_URL"),
@@ -445,7 +445,7 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         buy_token: buy,
         sell_amount: String::from("100"),
         slippage_bps: 30,
-        taker: Some(account),
+        taker: account,
     };
     let route = Route {
         provider: "kyber",
@@ -458,23 +458,82 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
             data: swap_data,
             value: String::from("0"),
         },
-        expires_at: now_ms() + 20_000,
+        deadline: None,
     };
+    // Resolve layout independently before either wallet enters simulation.
+    let slots = Arc::new(metamatch_backend::balance_slots::BalanceSlots::new(
+        Default::default(),
+    ));
+    let simulator = Simulator::new(
+        Arc::new(metamatch_backend::rpc::RpcClients::new(
+            Duration::from_secs(2),
+        )),
+        slots.clone(),
+    );
+    let mut preview_input = input.clone();
+    preview_input.taker = Address::repeat_byte(0x77);
+    let context = AnvilContext { rpc: rpc.clone() }
+        .get(&preview_input, &chain)
+        .await
+        .map_err(|error| error.to_string())?;
+    slots
+        .resolve(
+            &rpc.provider,
+            chain.id,
+            sell,
+            metamatch_backend::rpc::block_id(&context).map_err(|error| error.to_string())?,
+        )
+        .await
+        .map_err(|error| format!("standalone balance mapping detection: {error:#}"))?;
+    for owner in [Address::repeat_byte(0x77), Address::repeat_byte(0x88)] {
+        preview_input.taker = owner;
+        let result = simulator
+            .run(metamatch_backend::simulation::SimulationRequest {
+                input: &preview_input,
+                chain: &chain,
+                route: &route,
+                context: &context,
+                rules: &rules,
+                taker: preview_input.taker,
+                min: None,
+            })
+            .await
+            .map_err(|error| format!("preview discovery: {error:#}"))?;
+        if result.simulation.bought_amount != "200" || result.simulation.funding != "overridden" {
+            return Err("unexpected preview discovery simulation result".into());
+        }
+    }
+    for token in [sell, buy] {
+        let balance = rpc
+            .call_contract(
+                token,
+                balanceOfCall {
+                    owner: preview_input.taker,
+                }
+                .abi_encode()
+                .into(),
+            )
+            .await?;
+        if U256::from_be_slice(&balance) != U256::ZERO {
+            return Err("preview state override changed on-chain balance".into());
+        }
+    }
     let services = Services::new(
         vec![Arc::new(FixtureProvider {
             router,
             route,
-            rules: vec![Rule {
-                target,
-                spender: target,
-                selector: hex_bytes(swap_selector.as_slice()),
-            }],
+            rules,
         })],
         &[chain],
         Arc::new(AnvilContext { rpc: rpc.clone() }),
-        Arc::new(Simulator::new(Arc::new(
-            metamatch_backend::rpc::RpcClients::new(Duration::from_secs(2)),
-        ))),
+        Arc::new(Simulator::new(
+            Arc::new(metamatch_backend::rpc::RpcClients::new(
+                Duration::from_secs(2),
+            )),
+            Arc::new(metamatch_backend::balance_slots::BalanceSlots::new(
+                Default::default(),
+            )),
+        )),
     );
     let app = create_app_with_services(config, Some(services));
     let listener = TcpListener::bind(("127.0.0.1", 0))
@@ -500,79 +559,28 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
             .send()
             .await
             .map_err(|error| error.to_string())?;
-        if response.status() != reqwest::StatusCode::ACCEPTED {
-            return Err(format!("create status {}", response.status()));
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(format!("competition status {}", response.status()));
         }
-        let created: Value = response.json().await.map_err(|error| error.to_string())?;
-        let id = created["id"]
-            .as_str()
-            .ok_or_else(|| String::from("missing competition id"))?;
-        let token = created["accessToken"]
-            .as_str()
-            .ok_or_else(|| String::from("missing access token"))?;
-        let path = format!("{base}/v1/competitions/{id}");
-        let mut snapshot = Value::Null;
-        for _ in 0..100 {
-            snapshot = http
-                .get(&path)
-                .header("authorization", format!("Bearer {token}"))
-                .send()
-                .await
-                .map_err(|error| error.to_string())?
-                .json()
-                .await
-                .map_err(|error| error.to_string())?;
-            if snapshot["status"] == "complete" {
-                break;
-            }
-            sleep(Duration::from_millis(30)).await;
-        }
-        if snapshot["status"] != "complete" {
-            return Err(format!("competition did not complete: {snapshot}"));
-        }
-        if snapshot["quotes"][0]["simulation"]["status"] != "success"
-            || snapshot["quotes"][0]["simulation"]["boughtAmount"] != "200"
+        let result: Value = response.json().await.map_err(|error| error.to_string())?;
+        let quote = &result["quotes"][0];
+        if quote["simulation"]["boughtAmount"] != "200"
+            || !result["failures"].as_array().is_some_and(Vec::is_empty)
+            || quote["simulation"]["funding"] != "overridden"
+            || !quote["simulation"]["blockContext"]["number"].is_string()
+            || !quote["simulation"]["blockContext"]["timestamp"].is_u64()
         {
-            return Err(format!("unexpected quote: {snapshot}"));
+            return Err(format!("unexpected quote: {result}"));
         }
-        let quote_id = snapshot["quotes"][0]["id"]
-            .as_str()
-            .ok_or_else(|| String::from("missing quote id"))?;
-        let build_url = format!("{path}/quotes/{quote_id}/build");
-        let build_body =
-            json!({"taker":format!("{account:#x}"),"acceptedMinBuyAmount":"199"}).to_string();
-        let first = http
-            .post(&build_url)
-            .header("authorization", format!("Bearer {token}"))
-            .header("content-type", "application/json")
-            .body(build_body.clone())
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        if !first.status().is_success() {
-            return Err(format!("first build status {}", first.status()));
+        if result.to_string().contains("expiresAt") || result.to_string().contains("accessToken") {
+            return Err("retired response fields present".into());
         }
-        let first: Value = first.json().await.map_err(|error| error.to_string())?;
-        if first["approvals"].as_array().map_or(0, Vec::len) != 1 {
-            return Err(format!("expected one approval: {first}"));
+        if quote["approvals"].as_array().map_or(0, Vec::len) != 1 {
+            return Err(format!("expected one approval: {quote}"));
         }
-        send_tx(rpc, account, &first["approvals"][0]).await?;
-        let second = http
-            .post(&build_url)
-            .header("authorization", format!("Bearer {token}"))
-            .header("content-type", "application/json")
-            .body(build_body)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
-        if !second.status().is_success() {
-            return Err(format!("second build status {}", second.status()));
-        }
-        let second: Value = second.json().await.map_err(|error| error.to_string())?;
-        if second["approvals"].as_array().map_or(usize::MAX, Vec::len) != 0 {
-            return Err(format!("approval was not consumed: {second}"));
-        }
-        send_tx(rpc, account, &second["transaction"]).await?;
+        // Execute exactly the payload returned by the first request. No rebuild.
+        send_tx(rpc, account, &quote["approvals"][0]).await?;
+        send_tx(rpc, account, &quote["transaction"]).await?;
         let balance = rpc
             .call_contract(
                 buy,
@@ -606,7 +614,7 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         Ok::<(), String>(())
     }
     .await;
-    app.close().await;
+
     let _ = shutdown_tx.send(());
     server
         .await

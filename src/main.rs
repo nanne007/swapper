@@ -35,12 +35,11 @@ async fn run() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(address).await?;
     println!("MetaMatch Rust backend listening on http://{address}");
     axum::serve(listener, app.router.clone())
-        .with_graceful_shutdown(shutdown_signal(app))
+        .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
 }
 
-async fn shutdown_signal(app: metamatch_backend::app::App) {
+async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
-    app.close().await;
 }

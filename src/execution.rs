@@ -25,7 +25,7 @@ pub fn validate_route(
     {
         anyhow::bail!(ErrorKind::InvalidRoute);
     }
-    let data = validate_transaction(input, &route.tx, route.expires_at)?;
+    let data = validate_transaction(input, &route.tx, route.deadline)?;
     if require_unified && chain.router.is_none() {
         anyhow::bail!(ErrorKind::RouterNotConfigured);
     }
@@ -45,9 +45,9 @@ pub fn validate_route(
 pub(crate) fn validate_transaction(
     input: &Input,
     tx: &Tx,
-    expires_at: u64,
+    deadline: Option<u64>,
 ) -> anyhow::Result<String> {
-    if expires_at <= crate::domain::now_ms() {
+    if deadline.is_some_and(|deadline| deadline <= crate::domain::now_ms() / 1000) {
         anyhow::bail!(ErrorKind::QuoteExpired);
     }
     let route_value = parse_uint(&tx.value)?;
@@ -88,7 +88,7 @@ pub fn swap_transaction(
         spender: route.spender,
         value: parse_uint(&route.tx.value)?,
         data: provider_data,
-        deadline: U256::from(route.expires_at / 1000),
+        deadline: route.deadline.map(U256::from).unwrap_or(U256::MAX),
     }
     .abi_encode();
     let outer = execCall {

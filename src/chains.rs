@@ -1,6 +1,5 @@
 use crate::{config::Config, domain::Chain};
 use alloy_chains::{Chain as AlloyChain, NamedChain};
-use std::collections::HashMap;
 use url::Url;
 
 /// Builds runtime chain state from the current providers' supported chain IDs.
@@ -18,7 +17,6 @@ pub fn configured_chain(config: &Config, chain_id: u64) -> Chain {
         name: AlloyChain::from_id(chain_id).to_string(),
         rpc_url: rpc_url(config, chain_id),
         router: None,
-        balance_slots: HashMap::new(),
     }
 }
 

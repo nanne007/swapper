@@ -1,25 +1,20 @@
 use crate::error::ErrorKind;
 use crate::{
     api_error::ApiError,
-    competitions::{BuildResponse, Competitions, CreateResponse, Services, Snapshot},
+    competitions::{CompetitionResponse, Competitions, Services},
     config::Config,
-    domain::{BuildRequest, CreateCompetitionRequest, validate_build_request, validate_input},
+    domain::{CreateCompetitionRequest, validate_input},
 };
 use axum::{
     Json, Router,
-    extract::{Path, State},
-    http::{HeaderValue, StatusCode, header},
+    extract::State,
+    http::{HeaderValue, header},
     middleware::map_response,
     response::Response,
     routing::{get, post},
 };
-use axum_extra::{
-    TypedHeader,
-    extract::WithRejection,
-    headers::{Authorization, authorization::Bearer},
-};
+use axum_extra::extract::WithRejection;
 use serde::Serialize;
-use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -28,13 +23,6 @@ pub struct AppState {
 
 pub struct App {
     pub router: Router,
-    pub state: AppState,
-}
-
-impl App {
-    pub async fn close(&self) {
-        self.state.competitions.close().await;
-    }
 }
 
 pub fn create_app(config: Config) -> App {
@@ -49,14 +37,12 @@ pub fn create_app_with_services(config: Config, services: Option<Services>) -> A
         .route("/health", get(health))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/competitions", post(create_competition))
-        .route("/v1/competitions/{id}", get(get_competition))
-        .route("/v1/competitions/{id}/quotes/{quote_id}/build", post(build))
         .fallback(not_found)
         .method_not_allowed_fallback(method_not_allowed)
         .layer(axum::extract::DefaultBodyLimit::max(16_384))
         .layer(map_response(no_store))
-        .with_state(state.clone());
-    App { router, state }
+        .with_state(state);
+    App { router }
 }
 
 #[derive(Debug, Serialize)]
@@ -85,7 +71,7 @@ struct ChainCapabilities {
 async fn health(State(_state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok",
-        storage: "ephemeral-memory",
+        storage: "none",
     })
 }
 
@@ -107,11 +93,11 @@ async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRespons
                 rpc_configured: chain.rpc_url.is_some(),
                 router_configured: chain.router.is_some(),
                 execution: if chain.router.is_some() {
-                    "requires-successful-build"
+                    "requires-successful-simulation"
                 } else {
-                    "direct-preview-only"
+                    "unavailable"
                 },
-                net_fee_comparison: "requires-simulation-and-prices",
+                net_fee_comparison: "not-included",
             }
         })
         .collect::<Vec<_>>();
@@ -121,37 +107,9 @@ async fn capabilities(State(state): State<AppState>) -> Json<CapabilitiesRespons
 async fn create_competition(
     State(state): State<AppState>,
     WithRejection(Json(body), _): WithRejection<Json<CreateCompetitionRequest>, ApiError>,
-) -> Result<(StatusCode, Json<CreateResponse>), ApiError> {
+) -> Result<Json<CompetitionResponse>, ApiError> {
     let input = validate_input(body)?;
-    let created = state.competitions.create(input).await?;
-    Ok((StatusCode::ACCEPTED, Json(created)))
-}
-
-async fn get_competition(
-    State(state): State<AppState>,
-    WithRejection(Path(id), _): WithRejection<Path<Uuid>, ApiError>,
-    auth: WithRejection<TypedHeader<Authorization<Bearer>>, ApiError>,
-) -> Result<Json<Snapshot>, ApiError> {
-    let TypedHeader(Authorization(bearer)) = auth.into_inner();
-    Ok(Json(
-        state.competitions.get(id, Some(bearer.token())).await?,
-    ))
-}
-
-async fn build(
-    State(state): State<AppState>,
-    WithRejection(Path((id, quote_id)), _): WithRejection<Path<(Uuid, Uuid)>, ApiError>,
-    auth: WithRejection<TypedHeader<Authorization<Bearer>>, ApiError>,
-    WithRejection(Json(body), _): WithRejection<Json<BuildRequest>, ApiError>,
-) -> Result<Json<BuildResponse>, ApiError> {
-    let TypedHeader(Authorization(bearer)) = auth.into_inner();
-    let (taker, accepted) = validate_build_request(body)?;
-    Ok(Json(
-        state
-            .competitions
-            .build(id, quote_id, Some(bearer.token()), taker, &accepted)
-            .await?,
-    ))
+    Ok(Json(state.competitions.create(input).await?))
 }
 
 async fn not_found() -> ApiError {

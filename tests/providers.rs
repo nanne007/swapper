@@ -132,7 +132,7 @@ async fn bebop_maps_token_amounts_and_expiry() {
         .await
         .unwrap();
     assert_eq!(route.min_buy_amount, "199");
-    assert!(route.expires_at > metamatch_backend::domain::now_ms());
+    assert!(route.deadline.unwrap() > metamatch_backend::domain::now_ms() / 1000);
     let request = &client.requests.lock().unwrap()[0];
     assert!(request.url.contains("gasless=false"));
     assert!(request.url.contains(&format!(

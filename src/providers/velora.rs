@@ -94,7 +94,7 @@ impl Provider for VeloraProvider {
                     value: response.tx_params.value,
                     from: response.tx_params.from,
                 },
-                expires_at: crate::domain::now_ms().saturating_add(20_000),
+                deadline: None,
             },
         )
     }

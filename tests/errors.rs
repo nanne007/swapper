@@ -31,24 +31,24 @@ async fn internal_causes_survive_context_but_never_enter_api_errors() {
     assert!(format!("{error:?}").contains("fixture-secret"));
     let outer = error
         .context("fixture-context-secret")
-        .context(ErrorKind::BuildError)
+        .context(ErrorKind::UpstreamTimeout)
         .context("build");
     assert_eq!(
         metamatch_backend::error::kind(&outer),
-        ErrorKind::BuildError
+        ErrorKind::UpstreamTimeout
     );
     assert!(outer.downcast_ref::<std::io::Error>().is_some());
     assert!(format!("{outer:?}").contains("eth_simulateV1"));
     assert!(outer.chain().any(|source| source.is::<std::io::Error>()));
     let report = format!("{outer:?}");
-    assert!(report.contains("BUILD_ERROR"));
+    assert!(report.contains("UPSTREAM_TIMEOUT"));
     assert!(report.contains("fixture-secret"));
     assert!(report.contains("fixture-context-secret"));
     let response = ApiError::from(outer).into_response();
-    assert_eq!(response.status().as_u16(), 422);
+    assert_eq!(response.status().as_u16(), 504);
     assert_eq!(
         response.into_body().collect().await.unwrap().to_bytes(),
-        r#"{"error":"BUILD_ERROR"}"#
+        r#"{"error":"UPSTREAM_TIMEOUT"}"#
     );
 
     let unknown = anyhow::anyhow!("unrecognized-private-detail").context("INVALID_INPUT");
@@ -166,7 +166,7 @@ async fn alloy_rpc_error_keeps_method_code_and_original_cause() {
 #[tokio::test]
 async fn simulation_preserves_per_call_revert_details_internally() {
     use metamatch_backend::{
-        domain::{NATIVE, PREVIEW_TAKER, Simulation},
+        domain::{NATIVE, PREVIEW_TAKER},
         simulation::{SimulationCallError, SimulationRequest, Simulator},
     };
     let mut chain = support::chain(&support::config(), 1);
@@ -178,7 +178,12 @@ async fn simulation_preserves_per_call_revert_details_internally() {
     .await;
     chain.rpc_url = Some(server.url.clone());
     let input = support::input(1, NATIVE);
-    let simulator = Simulator::new(std::sync::Arc::new(RpcClients::new(Duration::from_secs(1))));
+    let simulator = Simulator::new(
+        std::sync::Arc::new(RpcClients::new(Duration::from_secs(1))),
+        std::sync::Arc::new(metamatch_backend::balance_slots::BalanceSlots::new(
+            Default::default(),
+        )),
+    );
     let error = simulator
         .run(SimulationRequest {
             input: &input,
@@ -187,19 +192,17 @@ async fn simulation_preserves_per_call_revert_details_internally() {
             context: &support::fixture_context(),
             rules: &[],
             taker: PREVIEW_TAKER,
-            actual: false,
             min: None,
         })
         .await
         .unwrap_err();
-    let simulation = Simulation::from(
-        *error
-            .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
-            .unwrap(),
-    );
-    assert!(
-        matches!(simulation, Simulation::Reverted { ref reason } if reason == "SIMULATION_REVERTED")
-    );
+    let simulation = *error
+        .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
+        .unwrap();
+    assert!(matches!(
+        simulation,
+        metamatch_backend::simulation::SimulationFailure::Reverted("SIMULATION_REVERTED")
+    ));
     let source = error.downcast_ref::<SimulationCallError>().unwrap();
     assert_eq!(source.index, 1);
     assert_eq!(source.result.error.as_ref().unwrap().code, 3);
@@ -249,10 +252,12 @@ impl metamatch_backend::providers::Provider for SlowProvider {
 async fn provider_deadline_still_produces_a_quote_failure() {
     use metamatch_backend::competitions::{Competitions, Services};
     use std::sync::Arc;
-    let config = support::config_with(&[("PROVIDER_TIMEOUT_MS", "100")]);
+    let config = support::config_with(&[("COMPETITION_TIMEOUT_MS", "100")]);
+    let mut chain = support::chain(&config, 1);
+    chain.router = Some(alloy_primitives::Address::repeat_byte(0x22));
     let services = Services::new(
         vec![Arc::new(SlowProvider)],
-        &[support::chain(&config, 1)],
+        &[chain],
         Arc::new(support::MockContext),
         Arc::new(support::MockSimulation),
     );
@@ -261,10 +266,10 @@ async fn provider_deadline_still_produces_a_quote_failure() {
         .create(support::input(1, metamatch_backend::domain::NATIVE))
         .await
         .unwrap();
-    let result = support::wait_complete(&competitions, &created).await;
-    competitions.close().await;
-    assert_eq!(result.quotes.len(), 1);
-    assert_eq!(result.quotes[0].provider, "slow");
-    assert_eq!(result.quotes[0].error.as_deref(), Some("UPSTREAM_TIMEOUT"));
-    assert!(result.recommended_quote_id.is_none());
+    let result = created;
+
+    assert!(result.quotes.is_empty());
+    assert_eq!(result.failures.len(), 1);
+    assert_eq!(result.failures[0].provider, "slow");
+    assert_eq!(result.failures[0].error, "UPSTREAM_TIMEOUT");
 }

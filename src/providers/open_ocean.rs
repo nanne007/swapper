@@ -141,7 +141,7 @@ impl Provider for OpenOceanProvider {
                 min_buy_amount: positive_string(&response.data.min_out_amount)?,
                 spender,
                 tx,
-                expires_at: crate::domain::now_ms().saturating_add(20_000),
+                deadline: None,
             },
         )
     }

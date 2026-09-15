@@ -3,9 +3,8 @@ mod support;
 use alloy_primitives::Address;
 use alloy_provider::Provider;
 use metamatch_backend::{
-    api_error::ApiError,
     competitions::Competitions,
-    domain::{NATIVE, PREVIEW_TAKER, Simulation},
+    domain::{NATIVE, PREVIEW_TAKER},
     rpc::RpcClients,
     simulation::{SimResult, SimulationFailure, SimulationProvider, SimulationRequest, Simulator},
 };
@@ -24,46 +23,38 @@ fn rpc_clients_reuse_the_alloy_provider_for_each_endpoint() {
 }
 
 #[tokio::test]
-async fn alloy_simulation_keeps_fixed_block_probes_and_funding_boundaries() {
+async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding() {
     let server = support::FixtureRpc::default().start().await;
     let mut chain = support::chain(&support::config(), 1);
     chain.rpc_url = Some(server.url.clone());
     let input = support::input(1, NATIVE);
     let route = support::fixture_route(&input);
     let context = support::fixture_context();
-    let simulator = Simulator::new(Arc::new(RpcClients::new(Duration::from_secs(1))));
-    for actual in [false, true] {
-        let result = simulator
-            .run(SimulationRequest {
-                input: &input,
-                chain: &chain,
-                route: &route,
-                context: &context,
-                rules: &[],
-                taker: PREVIEW_TAKER,
-                actual,
-                min: None,
-            })
-            .await;
-        if actual {
-            let failure = result.unwrap_err();
-            assert_eq!(
-                serde_json::to_value(Simulation::from(
-                    *failure.downcast_ref::<SimulationFailure>().unwrap()
-                ))
-                .unwrap(),
-                json!({"status": "reverted", "reason": "INSUFFICIENT_NATIVE_BALANCE_FOR_GAS"})
-            );
-        } else {
-            assert!(result.unwrap().simulation.is_success());
-        }
-    }
+    let simulator = Simulator::new(
+        Arc::new(RpcClients::new(Duration::from_secs(1))),
+        std::sync::Arc::new(metamatch_backend::balance_slots::BalanceSlots::new(
+            Default::default(),
+        )),
+    );
+    let result = simulator
+        .run(SimulationRequest {
+            input: &input,
+            chain: &chain,
+            route: &route,
+            context: &context,
+            rules: &[],
+            taker: PREVIEW_TAKER,
+            min: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.simulation.bought_amount, "100");
+    assert_eq!(result.simulation.funding, "overridden");
     let requests = server.requests.lock().unwrap();
     for request in requests.iter() {
         let params = &request["params"];
         match request["method"].as_str().unwrap() {
             "eth_getBlockByNumber" => assert_eq!(params[0], "0x10"),
-            "eth_getBalance" => assert_eq!(params[1], "0x10"),
             "eth_simulateV1" => {
                 assert_eq!(params[1], "0x10");
                 let block = &params[0]["blockStateCalls"][0];
@@ -89,56 +80,52 @@ async fn alloy_simulation_keeps_fixed_block_probes_and_funding_boundaries() {
             .iter()
             .filter(|r| r["method"] == "eth_getBlockByNumber")
             .count(),
-        3
+        2
     );
+    assert!(!requests.iter().any(|r| r["method"] == "eth_getBalance"));
 }
 
-struct FailedBuild(SimulationFailure);
+struct FailedSimulation(SimulationFailure);
 
 #[tokio::test]
-async fn erc20_funding_and_approval_failures_still_reject_simulation() {
+async fn erc20_slot_resolution_and_approval_failures_still_reject_simulation() {
     let server = support::FixtureRpc {
         false_approval: true,
         ..Default::default()
     }
     .start()
     .await;
-    let simulator = Simulator::new(Arc::new(RpcClients::new(Duration::from_secs(1))));
-    for (amount, actual, slot, expected) in [
+    for (slot, expected) in [
         (
-            "1000",
-            false,
             None,
-            json!({"status": "unsupported", "reason": "BALANCE_OVERRIDE_SLOT_UNCONFIGURED"}),
+            json!({"status": "unsupported", "reason": "RPC_METHOD_UNSUPPORTED"}),
         ),
         (
-            "1000",
-            false,
-            Some(0),
-            json!({"status": "unsupported", "reason": "BALANCE_OVERRIDE_VALIDATION_FAILED"}),
-        ),
-        (
-            "1000",
-            true,
-            None,
-            json!({"status": "reverted", "reason": "INSUFFICIENT_SELL_BALANCE"}),
-        ),
-        (
-            "100",
-            false,
-            None,
+            Some(0_u64),
             json!({"status": "reverted", "reason": "APPROVAL_RETURNED_FALSE"}),
         ),
     ] {
         let mut chain = support::chain(&support::config(), 1);
         chain.rpc_url = Some(server.url.clone());
         let mut input = support::input(1, Address::repeat_byte(0x55));
-        input.sell_amount = amount.into();
-        if let Some(slot) = slot {
-            chain
-                .balance_slots
-                .insert(format!("{:#x}", input.sell_token), slot);
-        }
+        input.sell_amount = "1000".into();
+        let configured = slot
+            .map(|slot| {
+                std::collections::HashMap::from([(
+                    1,
+                    std::collections::HashMap::from([(
+                        input.sell_token,
+                        alloy_primitives::U256::from(slot),
+                    )]),
+                )])
+            })
+            .unwrap_or_default();
+        let simulator = Simulator::new(
+            Arc::new(RpcClients::new(Duration::from_secs(1))),
+            Arc::new(metamatch_backend::balance_slots::BalanceSlots::new(
+                configured,
+            )),
+        );
         let mut route = support::fixture_route(&input);
         route.tx.value = "0".into();
         let error = simulator
@@ -149,16 +136,12 @@ async fn erc20_funding_and_approval_failures_still_reject_simulation() {
                 context: &support::fixture_context(),
                 rules: &[],
                 taker: PREVIEW_TAKER,
-                actual,
                 min: None,
             })
             .await
             .unwrap_err();
         assert_eq!(
-            serde_json::to_value(Simulation::from(
-                *error.downcast_ref::<SimulationFailure>().unwrap()
-            ))
-            .unwrap(),
+            serde_json::to_value(error.downcast_ref::<SimulationFailure>().unwrap()).unwrap(),
             expected
         );
     }
@@ -200,7 +183,7 @@ async fn shared_transaction_validation_keeps_provider_and_execution_guards() {
         assert_eq!(kind(&error), expected);
     }
     let mut route = support::fixture_route(&input);
-    route.expires_at = 0;
+    route.deadline = Some(0);
     assert_eq!(
         kind(&validate_route(&input, &chain, &route, &[], false).unwrap_err()),
         ErrorKind::QuoteExpired
@@ -208,147 +191,45 @@ async fn shared_transaction_validation_keeps_provider_and_execution_guards() {
 }
 
 #[async_trait::async_trait]
-impl SimulationProvider for FailedBuild {
-    async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
-        if request.actual {
-            Err(anyhow::anyhow!("original simulation cause").context(self.0))
-        } else {
-            support::MockSimulation.run(request).await
-        }
+impl SimulationProvider for FailedSimulation {
+    async fn run(&self, _request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
+        Err(anyhow::anyhow!("original simulation cause").context(self.0))
     }
 }
 
 #[tokio::test]
-async fn build_failures_keep_public_categories_and_sources_and_release_capacity() {
-    for (failure, expected) in [
+async fn simulation_failures_keep_categories_and_release_capacity() {
+    for (failure, status) in [
         (
             SimulationFailure::Reverted("SIMULATION_REVERTED"),
-            "BUILD_REVERTED",
+            "reverted",
         ),
         (
             SimulationFailure::Unsupported("RPC_METHOD_UNSUPPORTED"),
-            "BUILD_UNSUPPORTED",
+            "unsupported",
         ),
-        (SimulationFailure::Error("RPC_CALL_FAILED"), "BUILD_ERROR"),
+        (SimulationFailure::Error("RPC_CALL_FAILED"), "error"),
     ] {
         let mut config = support::config();
         config.max_active = 1;
         let mut services =
             support::competition_services_for(&config, Some(Address::repeat_byte(0x22)));
-        services.simulator = Arc::new(FailedBuild(failure));
+        services.simulator = Arc::new(FailedSimulation(failure));
         let service = Competitions::new(config, Some(services));
-        let created = service.create(support::input(1, NATIVE)).await.unwrap();
-        let snapshot = support::wait_complete(&service, &created).await;
         for _ in 0..2 {
-            let error = service
-                .build(
-                    created.id,
-                    snapshot.quotes[0].id.parse().unwrap(),
-                    Some(&created.access_token),
-                    PREVIEW_TAKER,
-                    "199",
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(ApiError::from(&error).code, expected);
-            assert_eq!(error.root_cause().to_string(), "original simulation cause");
-            assert!(error.downcast_ref::<SimulationFailure>().is_some());
+            let response = service.create(support::input(1, NATIVE)).await.unwrap();
+            assert!(response.quotes.is_empty());
+            let quote = &response.failures[0];
+            assert_eq!(quote.error, failure.to_string());
+            assert_eq!(
+                serde_json::to_value(quote.simulation).unwrap()["status"],
+                status
+            );
+            assert!(
+                !serde_json::to_string(quote)
+                    .unwrap()
+                    .contains("original simulation cause")
+            );
         }
-        service.close().await;
     }
-}
-
-#[tokio::test]
-async fn response_wire_names_and_optional_fields_are_unchanged() {
-    let config = support::config();
-    let services = support::competition_services_for(&config, Some(Address::repeat_byte(0x22)));
-    let service = Competitions::new(config, Some(services));
-    let input = support::input(1, NATIVE);
-    let created = service.create(input.clone()).await.unwrap();
-    let snapshot = support::wait_complete(&service, &created).await;
-    let build = service
-        .build(
-            created.id,
-            snapshot.quotes[0].id.parse().unwrap(),
-            Some(&created.access_token),
-            PREVIEW_TAKER,
-            "199",
-        )
-        .await
-        .unwrap();
-    fn assert_keys(value: serde_json::Value, expected: &[&str]) {
-        let actual: std::collections::BTreeSet<_> = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(actual, expected.iter().copied().collect());
-    }
-    assert_keys(
-        serde_json::to_value(&created).unwrap(),
-        &["id", "accessToken", "expiresAt"],
-    );
-    assert_keys(
-        serde_json::to_value(&snapshot).unwrap(),
-        &[
-            "id",
-            "input",
-            "status",
-            "expiresAt",
-            "context",
-            "quotes",
-            "recommendedQuoteId",
-        ],
-    );
-    assert_keys(
-        serde_json::to_value(&snapshot.quotes[0]).unwrap(),
-        &[
-            "id",
-            "provider",
-            "status",
-            "quotedAmount",
-            "minBuyAmount",
-            "simulation",
-            "latencyMs",
-            "expiresAt",
-            "execution",
-        ],
-    );
-    assert_keys(
-        serde_json::to_value(&build).unwrap(),
-        &[
-            "chainId",
-            "taker",
-            "recipient",
-            "provider",
-            "expiresAt",
-            "minBuyAmount",
-            "approvals",
-            "transaction",
-            "simulation",
-            "context",
-            "warning",
-        ],
-    );
-    assert_keys(
-        serde_json::to_value(&build.simulation).unwrap(),
-        &[
-            "status",
-            "boughtAmount",
-            "gasUsed",
-            "gasFeeWei",
-            "funding",
-            "blockHash",
-        ],
-    );
-    assert_eq!(
-        serde_json::to_value(input).unwrap()["taker"],
-        serde_json::Value::Null
-    );
-    assert_eq!(
-        serde_json::to_value(build.simulation).unwrap()["status"],
-        "success"
-    );
-    service.close().await;
 }

@@ -154,7 +154,7 @@ fn live_input(chain_id: u64) -> Option<Input> {
         buy_token,
         sell_amount,
         slippage_bps: 100,
-        taker: Some(address(LIVE_TAKER)),
+        taker: address(LIVE_TAKER),
     })
 }
 
@@ -229,7 +229,11 @@ async fn exercise(spec: ProviderSpec) {
     assert_eq!(route.sell_amount, input.sell_amount);
     assert!(parse_positive(&route.buy_amount).is_ok());
     assert!(parse_positive(&route.min_buy_amount).is_ok());
-    assert!(route.expires_at > metamatch_backend::domain::now_ms());
+    assert!(
+        route
+            .deadline
+            .is_none_or(|deadline| deadline > metamatch_backend::domain::now_ms() / 1000)
+    );
     eprintln!(
         "PASS {} on chain {}: upstream statuses {statuses:?}, quote {} -> {}, minimum {}",
         spec.id, chain_id, route.sell_amount, route.buy_amount, route.min_buy_amount
