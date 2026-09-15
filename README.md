@@ -32,13 +32,13 @@ curl -s http://127.0.0.1:3000/v1/competitions \
   -d '{"chainId":1,"sellToken":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","buyToken":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","sellAmount":"1000000000000000000","slippageBps":30,"taker":"0x你的真实钱包地址"}'
 ```
 
-`POST /v1/competitions` 在竞赛总超时内直接返回 HTTP `200` 和最终结果，不需要轮询、Bearer competition token 或第二次 build。`taker` 必填，且同时是收款人。服务先并发获取并校验该链全部 provider route；route 阶段结算后才读取一次公共 block context，再基于这一个 context 并发完整仿真所有有效 route。整个批次共用一个绝对截止时间，任一阶段都不会重置预算。
+`POST /v1/competitions` 在竞赛总超时内直接返回 HTTP `200` 和最终结果，不需要轮询、Bearer competition token 或第二次 build。`taker` 必填，且同时是收款人。每个 provider 都独立执行 `route → validate → simulate`，某家 route 一完成即可在 `latest` 上开始完整仿真，无需等待其他 provider。所有 provider pipeline 共用本次竞赛的一个绝对截止时间；单家失败或慢 route 不阻塞其他家的 simulation。
 
 响应包含 `quotes` 和 `failures` 两个数组。`Quote` 只包含必填的 `route`、`simulation: SimulationSuccess`、`approvals[]`、`transaction` 和 `latencyMs`，按 `simulation.boughtAmount`（完整交易序列在模拟中的钱包买入 token 余额增量）降序排列。provider 和原始报价分别在 `route.provider`、`route.buyAmount`，最低到账在 `route.minBuyAmount`。Quote 和成功 simulation 不再携带 status/error；第一条 quote 即最高模拟到账量。失败 provider 的状态、错误码及仿真失败分类只在 `failures` 中；全部失败时 `quotes: []`。Gas 单独报告，不参与金额排序。
 
 `route.tx` 是归一化的 provider 路由交易；钱包应执行 `quote.approvals` 和 `quote.transaction`，后者才是完成统一 Holder/Router 仿真的最终交易。
 
-用户选择一条结果，按顺序执行必要的 approvals 并等待确认，再执行返回的同一笔 swap。simulation 总是把 taker 的卖出资产和 native gas 资金覆盖到本次请求所需数额，`funding` 固定为 `overridden`；成功结果证明这组交易在该假定资金和固定区块上下文中可执行，不证明钱包当前余额充足。API 不返回 `expiresAt`，也不设置人工报价 TTL。`simulation.blockContext` 包含基础区块 `number`（十六进制字符串）、`hash`、`timestamp`（Unix 秒）；`simulatedTimestamp` 是实际用于模拟执行的时间。调用方发送前应确认钱包余额，并自行决定是否重新仿真；重新竞赛会重新获取 provider 报价，最低到账变化需要调用方重新确认。provider 原生签名期限和 calldata 内的 deadline 仍按链上规则生效。
+用户选择一条结果，按顺序执行 approvals 并等待确认，再执行返回的同一笔 swap。ERC20 卖出总是返回一笔 `approve(Holder, sellAmount)`，native 卖出没有 token approval；服务不预读钱包当前 allowance。simulation 总是覆盖 taker 的卖出资产，并把 native 余额设为仅供仿真的最大值，`funding` 固定为 `overridden`；成功结果证明这组交易在该假定资金和该 provider 的 latest 模拟区块中可执行，不证明钱包当前余额充足。simulation 不预先查询 block context 或 gas price，调用 `eth_simulateV1` 时也不发送 `gasPrice`；因此 `gasFeeWei` 固定为 `null`。`simulation.blockContext` 直接来自模拟响应，包含 `number`（JSON u64）、`hash`、`timestamp`（Unix 秒），`simulatedTimestamp` 与该模拟区块时间一致。API 不返回 `expiresAt`，也不设置人工报价 TTL；调用方发送前应确认钱包余额并自行决定是否重新竞赛。
 
 竞赛总预算用 `competitionTimeoutMs` 配置（默认 6000，允许 100–30000）。旧 `PROVIDER_TIMEOUT_MS` 和 `QUOTE_TTL_MS` 已移除；请迁移为 JSON 配置字段。金额使用十进制字符串，不能用小数或 JS Number。API 从不代签或广播。
 
@@ -58,7 +58,7 @@ Rust 已匹配当前 `execute(sellToken, buyToken, receiver, sellAmount, minBuyA
 
 Rust 与合约均采用 permissionless 路由策略：不维护 target/spender/selector 白名单，也不再返回 `ROUTE_NOT_ALLOWLISTED`。adapter 原生约束、金额/value/calldata 校验和完整 Holder/Router 仿真仍为必要条件；API 不接受任意 calldata。真实 provider/RPC、正式部署和主网执行仍需独立验收。
 
-同一轮竞赛共享 parent hash、Router code、Holder allowance 和卖出 token mapping base 的准备结果；各 route 的仿真状态和模拟后 hash 检查仍独立。内部 calldata 使用 Bytes，公开交易仍为 hex data 字符串。性能回归与边界见 [验证记录](docs/VERIFICATION.md)。
+Router/Holder code 只在启动 bootstrap 验证，请求阶段不重复读取 code 或 Holder allowance。每个 provider 独立解析/复用 ERC20 卖出 token mapping base 并构造自己的 simulation；同一 token 的自动探测仍由 `BalanceSlots` 缓存合并。已配置 mapping base 时，每家只需一次 `eth_simulateV1` RPC。内部 calldata 使用 Bytes，公开交易仍为 hex data 字符串。性能回归与边界见 [验证记录](docs/VERIFICATION.md)。
 
 ## 真实 provider smoke test
 

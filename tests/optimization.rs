@@ -9,7 +9,7 @@ use metamatch_backend::{
     competitions::{Competitions, Services},
     domain::{Chain, Input, NATIVE, Route},
     providers::Provider,
-    rpc::{ContextSource, RpcClients},
+    rpc::RpcClients,
     simulation::Simulator,
 };
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -61,14 +61,13 @@ fn competition(server: &support::RpcServer, configured_slot: bool) -> (Competiti
             .map(|(i, id)| Arc::new(Competitor(id, 0x60 + i as u8)) as Arc<dyn Provider>)
             .collect(),
         &[chain],
-        Arc::new(ContextSource::new(clients.clone())),
         Arc::new(Simulator::new(clients, Arc::new(BalanceSlots::new(slots)))),
     );
     (Competitions::new(config, services), input)
 }
 
 #[tokio::test]
-async fn five_permissionless_routes_share_preparation_but_not_simulation() {
+async fn five_permissionless_routes_each_simulate_latest_without_context_calls() {
     use alloy_sol_types::SolCall;
     use metamatch_backend::execution::{execCall, executeCall};
     let server = support::FixtureRpc::default().start().await;
@@ -80,17 +79,17 @@ async fn five_permissionless_routes_share_preparation_but_not_simulation() {
     let count = |method| requests.iter().filter(|r| r["method"] == method).count();
     assert_eq!(
         requests.len(),
-        16,
-        "warm ERC20 competition: 6 shared + 2 per route"
+        5,
+        "configured ERC20 slot needs only one simulation RPC per provider"
     );
-    assert_eq!(count("eth_chainId"), 1);
-    assert_eq!(count("eth_gasPrice"), 1);
-    assert_eq!(count("eth_getCode"), 1);
-    assert_eq!(count("eth_call"), 1, "Holder allowance is shared");
+    assert_eq!(count("eth_chainId"), 0);
+    assert_eq!(count("eth_gasPrice"), 0);
+    assert_eq!(count("eth_getCode"), 0);
+    assert_eq!(count("eth_call"), 0, "Holder allowance is not queried");
     assert_eq!(
         count("eth_getBlockByNumber"),
-        7,
-        "context + pre-check + five independent post-checks"
+        0,
+        "simulation response supplies its own block context"
     );
     assert_eq!(count("eth_simulateV1"), 5);
     let simulations: Vec<_> = requests
@@ -98,7 +97,7 @@ async fn five_permissionless_routes_share_preparation_but_not_simulation() {
         .filter(|r| r["method"] == "eth_simulateV1")
         .collect();
     for request in &simulations {
-        assert_eq!(request["params"][1], "0x10");
+        assert_eq!(request["params"][1], "latest");
         let block = &request["params"][0]["blockStateCalls"][0];
         assert_eq!(
             block["stateOverrides"],
@@ -107,6 +106,7 @@ async fn five_permissionless_routes_share_preparation_but_not_simulation() {
         let calls = block["calls"].as_array().unwrap();
         assert_eq!(calls.len(), 4);
         for call in calls {
+            assert!(call.get("gasPrice").is_none());
             assert!(call["input"].is_string());
             assert!(
                 call.get("data").is_none(),
@@ -134,12 +134,12 @@ async fn five_permissionless_routes_share_preparation_but_not_simulation() {
     let previous = serde_json::to_vec(&old).unwrap().len();
     assert!(previous > current);
     println!(
-        "5 routes: 28 -> 16 logical RPC calls; fixture simulation body: {previous} -> {current} bytes"
+        "5 routes: 14 -> 5 logical RPC calls; fixture simulation body: {previous} -> {current} bytes"
     );
 }
 
 #[tokio::test]
-async fn shared_slot_failure_is_not_retried_per_route_or_cached_across_competitions() {
+async fn slot_failure_remains_provider_local_and_is_not_cached() {
     let server = support::FixtureRpc::default().start().await;
     let (service, input) = competition(&server, false);
     let mut previous = 0;
@@ -159,8 +159,8 @@ async fn shared_slot_failure_is_not_retried_per_route_or_cached_across_competiti
             .filter(|r| r["method"] == "eth_createAccessList")
             .count();
         assert!(
-            (1..=2).contains(&(probes - previous)),
-            "one shared probe attempt per competition"
+            (5..=10).contains(&(probes - previous)),
+            "each provider may perform one bounded two-call probe attempt"
         );
         assert!(!requests.iter().any(|r| r["method"] == "eth_simulateV1"));
         previous = probes;
@@ -185,21 +185,11 @@ fn calldata_round_trips_as_hex_and_rejects_invalid_provider_strings() {
 }
 
 #[tokio::test]
-async fn shared_preparation_preserves_native_and_all_allowance_sequences() {
+async fn each_provider_simulation_always_approves_erc20_without_an_allowance_probe() {
     use alloy_sol_types::SolCall;
     use metamatch_backend::execution::approveCall;
-    for (native, allowance, expected_approvals) in [
-        (true, U256::ZERO, 0),
-        (false, U256::ZERO, 1),
-        (false, U256::ONE, 2),
-        (false, U256::MAX, 0),
-    ] {
-        let server = support::FixtureRpc {
-            allowance,
-            ..Default::default()
-        }
-        .start()
-        .await;
+    for (native, expected_approvals) in [(true, 0), (false, 1)] {
+        let server = support::FixtureRpc::default().start().await;
         let (service, mut input) = competition(&server, true);
         if native {
             input.sell_token = NATIVE;
@@ -209,17 +199,10 @@ async fn shared_preparation_preserves_native_and_all_allowance_sequences() {
         assert_eq!(result.quotes.len(), 5);
         for quote in &result.quotes {
             assert_eq!(quote.approvals.len(), expected_approvals);
-            for (i, tx) in quote.approvals.iter().enumerate() {
+            for tx in &quote.approvals {
                 let approval = approveCall::abi_decode(&tx.data).unwrap();
                 assert_eq!(approval.spender, support::FIXTURE_HOLDER);
-                assert_eq!(
-                    approval.amount,
-                    if expected_approvals == 2 && i == 0 {
-                        U256::ZERO
-                    } else {
-                        parse_uint(&input.sell_amount).unwrap()
-                    }
-                );
+                assert_eq!(approval.amount, parse_uint(&input.sell_amount).unwrap());
             }
         }
         let requests = server.requests.lock().unwrap();
@@ -228,7 +211,8 @@ async fn shared_preparation_preserves_native_and_all_allowance_sequences() {
                 .iter()
                 .filter(|r| r["method"] == "eth_call")
                 .count(),
-            usize::from(!native)
+            0,
+            "simulation must not query the current Holder allowance"
         );
         assert!(!requests.iter().any(|r| r["method"] == "eth_getBalance"));
         for request in requests.iter().filter(|r| r["method"] == "eth_simulateV1") {
@@ -241,34 +225,6 @@ async fn shared_preparation_preserves_native_and_all_allowance_sequences() {
             );
         }
     }
-}
-
-#[tokio::test]
-async fn reorg_after_shared_preparation_still_rejects_each_simulated_route() {
-    let server = support::FixtureRpc {
-        reorg_after_simulation: true,
-        ..Default::default()
-    }
-    .start()
-    .await;
-    let (service, input) = competition(&server, true);
-    let result = service.create(input).await.unwrap();
-    assert!(result.quotes.is_empty());
-    assert_eq!(result.failures.len(), 5);
-    assert!(
-        result
-            .failures
-            .iter()
-            .all(|failure| failure.error == "CHAIN_REORG_REQUOTE")
-    );
-    let requests = server.requests.lock().unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r["method"] == "eth_simulateV1")
-            .count(),
-        5
-    );
 }
 
 #[test]

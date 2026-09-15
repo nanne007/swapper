@@ -3,8 +3,6 @@
 pub enum ErrorKind {
     #[error("CAPACITY_EXCEEDED")]
     CapacityExceeded,
-    #[error("CHAIN_REORG_REQUOTE")]
-    ChainReorgRequote,
     #[error("CROSS_CHAIN_ROUTE_UNSUPPORTED")]
     CrossChainRouteUnsupported,
     #[error("INTERNAL_ERROR")]

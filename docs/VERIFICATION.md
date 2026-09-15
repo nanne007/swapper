@@ -24,7 +24,21 @@
 
 相对本轮开始的暂存基线，生产 Rust 为 **4,334 → 4,294 行，净减少 40 行**（含注释/空行）；维护收益主要是减少字段同步、空包装和过时入口，不声称生产吞吐或延迟提升。执行期间检测到部分 Rust 修改被外部暂存，保留该状态；本 agent 没有 stage/commit，也未读取或修改开发者配置、访问生产 provider/RPC、部署或广播真实网络交易。GitHub 托管 Ubuntu CI、Docker、正式 Holder/provider fork 和生产执行仍未重新验证。
 
+## Simulation prepare 去除重复 code/allowance 读取（2026-09-15）
+
+按当前运行时边界，Router 与 Holder code 仍在监听前由 bootstrap 在同一区块验证；`SimulationProvider::prepare` 不再为每轮重复读取 Router code。prepare 也不再调用 sell token `allowance(taker, Holder)`：ERC20 固定生成一笔 `approve(Holder, sellAmount)`，native 不生成 token approval。删除未再使用的 allowance ABI helper 和 fixture allowance 分支。
+
+这笔固定 approval 与 swap 一起进入 `eth_simulateV1`，返回 false、revert 或不兼容的 nonzero-to-nonzero approve 仍使对应 route 失败。服务不会为了兼容这类 token 自动先发 `approve(0)`；因此每个 ERC20 quote 固定一笔而不是两笔 approval。已有足额或永久 allowance 不再省略 approval，执行后可能被替换为本次 sellAmount，这是本次明确的 API 行为变化。
+
+确定性 fixture 中，5 条有效、已配置 balance slot 的 ERC20 routes 从 **16 次降为 14 次逻辑 RPC**：1 chainId、1 gasPrice、7 block 查询（context、一次 prepare pre-check、5 次独立 post-check）和 5 simulation；prepare 阶段 `eth_getCode=0`、allowance `eth_call=0`。冷 mapping base 仍可能增加至多 2 次 `eth_createAccessList`。每个 simulation 调用序列固定为 buy balance → approval → swap → buy balance。
+
+回归 `five_permissionless_routes_share_preparation_but_not_simulation` 和 `shared_preparation_always_approves_erc20_without_an_allowance_probe` 先在旧实现上分别以 16≠14、allowance call 1≠0 失败，修改后通过；native/approval false、固定 block、funding override、call count 与独立 reorg 检查继续覆盖。
+
+`CARGO_NET_OFFLINE=true sh scripts/check.sh` 最终完整通过：Rust fmt、Clippy、**98 个默认测试**、release build，Foundry fmt/build/**50 个测试**，以及隔离本地 Anvil E2E **1/1**。默认 ignored 的 13 个 provider live 和 1 个生产 replay 未开启；没有访问生产 provider/RPC、部署、签名或广播。Foundry nightly 与 `--deny-warnings` 弃用提示仍存在，未降低门禁。GitHub 托管 CI、正式 Holder/provider fork、生产 token 的 nonzero-to-nonzero approve 兼容性仍未验证。
+
 ## Rust 精简、共享准备与 permissionless 路由（2026-09-15）
+
+本节记录上述 prepare 精简之前的性能基线；其中 Router code、Holder allowance 和 16 次 RPC 的描述已由上一节替代。
 
 用户确认采用 permissionless 后，删除 Rust `Rule`、`Provider::rules()`、三元组白名单预检及 `ROUTE_NOT_ALLOWLISTED` 分类/映射。没有新增路由登记配置，也未修改 Solidity。完整 Holder/Router 仿真、provider 原生地址/状态覆盖限制、最低到账、固定区块、真实 taker 和单个总 deadline 保留。
 
@@ -454,6 +468,25 @@ RPC transport/method 错误继续通过 `map_rpc_error("eth_createAccessList", .
 - `cargo test --test e2e_local --offline -- --ignored --nocapture`：未通过，报 `preview discovery: ROUTER_NOT_DEPLOYED`。当前 `MetaRouter` 构造函数为一个 `allowanceHolder` 参数且无 `setAllowed`，而并行的 E2E fixture 仍按两个构造参数部署并调用 `setAllowed`；失败发生在进入 HTTP competition 前，不是本轮 route/context 调度路径的回归证据。
 
 本轮没有调用生产 provider/RPC，没有签名、部署或广播真实网络交易。
+
+## Provider 独立 Route + Latest Simulation（2026-09-15）
+
+竞赛从“批量 routes → 公共 context/prepare → 批量 simulation”改为每个 provider 独立的 `route → validate → simulate` pipeline。某家 route 完成后立即在 `latest` 上开始 simulation，不等待其他 provider；所有 pipeline 仍共享竞赛创建时的同一个绝对 deadline。测试证明快 provider 会在慢 provider 的 route 尚未完成时进入 simulation，慢 route 或慢 simulation 的失败只影响自身。
+
+删除请求期 `Context`、`ContextProvider`、`ContextSource`、`SimulationPreparation` 以及固定区块前后 hash probe。Simulator 不再调用 `eth_chainId`、`eth_getBlockByNumber` 或 `eth_gasPrice` 获取 context，也不在 `eth_simulateV1` calls 中设置 `gasPrice` 或 block override。`blockContext` 直接从返回的 `SimulatedBlock` 生成；`number` 直接保留为 u64，不再格式化为十六进制字符串。不同 provider 可能观察到不同 latest 区块。`gasUsed` 仍统计 approval/swap，`gasFeeWei` 固定为 null。
+
+为避免未知 latest fee 触发节点按声明 gas limit 做 upfront balance 检查，taker 的 native state override 设为 `U256::MAX`；这仍只是 `funding: overridden` 的模拟假设，不表示真实钱包资金。ERC20 卖出余额 override、固定一笔 `approve(Holder, sellAmount)`、完整调用状态、approval 返回值、余额差和 minimum 检查保持不变。配置 mapping base 的 5-provider fixture 从本轮改造前的 14 次逻辑 RPC 降到 5 次 `eth_simulateV1`，并明确断言请求标签为 `latest`、没有 context RPC 和 call `gasPrice`。
+
+本轮验证：
+
+- `sh scripts/check.sh`：通过。
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features -- -D warnings`：通过。
+- `cargo test --all`：**94/94**；15 项生产 provider/replay 与单独 Anvil 测试默认 ignored。
+- `cargo build --release`：通过。
+- `forge fmt --root contracts --check`、`forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过，**50/50**；本轮没有修改合约。
+- `cargo test --test e2e_local -- --ignored --nocapture`：**1/1**，隔离 Anvil 上完成自动 balance-slot 探测、latest simulation、HTTP competition，以及返回 approval/swap 的本地执行。
+
+本轮没有调用生产 provider/RPC，没有签名、部署或广播真实网络交易。生产节点对 `eth_simulateV1(latest)`、省略 gas price、state override 和返回区块 header 的兼容性仍需逐链验收。
 
 ## 未验证边界
 

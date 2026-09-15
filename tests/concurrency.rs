@@ -23,23 +23,15 @@ struct PausedPreparation {
 
 #[async_trait::async_trait]
 impl SimulationProvider for PausedPreparation {
-    async fn prepare(
-        &self,
-        input: &metamatch_backend::domain::Input,
-        chain: &metamatch_backend::domain::Chain,
-        context: &metamatch_backend::domain::Context,
-    ) -> anyhow::Result<metamatch_backend::simulation::SimulationPreparation> {
+    async fn simulate(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         self.entered.notify_one();
         self.release.notified().await;
-        support::MockSimulation.prepare(input, chain, context).await
-    }
-    async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
-        support::MockSimulation.run(request).await
+        support::MockSimulation.simulate(request).await
     }
 }
 
 #[tokio::test]
-async fn cancelling_shared_preparation_releases_capacity_and_allows_retry() {
+async fn cancelling_provider_pipeline_releases_capacity_and_allows_retry() {
     let mut config = support::config();
     config.max_active = 1;
     let mut services = support::competition_services_for(
@@ -68,18 +60,10 @@ async fn cancelling_shared_preparation_releases_capacity_and_allows_retry() {
 
 #[async_trait::async_trait]
 impl SimulationProvider for PausedSimulation {
-    async fn prepare(
-        &self,
-        input: &metamatch_backend::domain::Input,
-        chain: &metamatch_backend::domain::Chain,
-        context: &metamatch_backend::domain::Context,
-    ) -> anyhow::Result<metamatch_backend::simulation::SimulationPreparation> {
-        support::MockSimulation.prepare(input, chain, context).await
-    }
-    async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
+    async fn simulate(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         self.entered.notify_one();
         self.release.notified().await;
-        support::MockSimulation.run(request).await
+        support::MockSimulation.simulate(request).await
     }
 }
 

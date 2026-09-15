@@ -413,14 +413,7 @@ async fn simulate(
     input.taker = owner;
     let mut route = support::fixture_route(&input);
     route.tx.value = "0".into();
-    support::simulate(
-        &simulator,
-        &input,
-        &chain,
-        &route,
-        &support::fixture_context(),
-    )
-    .await
+    support::simulate(&simulator, &input, &chain, &route).await
 }
 
 #[tokio::test]

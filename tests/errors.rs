@@ -219,15 +219,9 @@ async fn simulation_preserves_per_call_revert_details_internally() {
             Default::default(),
         )),
     );
-    let error = support::simulate(
-        &simulator,
-        &input,
-        &chain,
-        &support::fixture_route(&input),
-        &support::fixture_context(),
-    )
-    .await
-    .unwrap_err();
+    let error = support::simulate(&simulator, &input, &chain, &support::fixture_route(&input))
+        .await
+        .unwrap_err();
     let simulation = *error
         .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
         .unwrap();
@@ -292,7 +286,6 @@ async fn provider_deadline_still_produces_a_quote_failure() {
     let services = Services::new(
         vec![Arc::new(SlowProvider)],
         &[chain],
-        Arc::new(support::MockContext),
         Arc::new(support::MockSimulation),
     );
     let competitions = Competitions::new(config, services);

@@ -74,7 +74,7 @@ cargo run -- /absolute/path/config.json
 
 代码存在和 getter 正确不等于通过合约审计，也不验证 RPC 的完整 simulation 能力。配置方负责确认可信 Router/Holder 实现；代理升级或部署变更后应重新核验并重启。正式 RPC 仍需支持 `eth_simulateV1`、state override，以及按需 `eth_createAccessList`。
 
-Rust 使用发现的 Holder 做钱包 allowance 查询、approvals 和最外层 `exec` 交易入口；Router 作为 operator/inner target 和 provider quote sender。编码与当前 Solidity 一致：
+Rust 使用发现的 Holder 生成固定 ERC20 approval，并作为最外层 `exec` 交易入口；Router 作为 operator/inner target 和 provider quote sender。simulation prepare 不读取钱包当前 allowance。编码与当前 Solidity 一致：
 
 ```text
 execute(sellToken, buyToken, receiver, sellAmount, minBuyAmount,

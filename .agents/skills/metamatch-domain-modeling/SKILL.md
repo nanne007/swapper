@@ -9,9 +9,9 @@ Read `AGENTS.md`, `docs/PRODUCT.md`, `docs/TECHNICAL.md`, and `docs/VERIFICATION
 
 ## State and invariants
 
-- A competition is bounded by capacity and one total request deadline. Fetch and validate every provider route concurrently, then fetch one shared block context, then simulate valid routes concurrently against that context. A malformed route stays local to its provider and never becomes a fabricated fallback; a route that consumes the total deadline necessarily leaves no budget for the shared context.
+- A competition is bounded by capacity and one total request deadline. Each provider independently executes `route -> validate -> simulate(latest)` and starts simulation as soon as its own route is ready. A malformed or slow route stays local to its provider and never delays another provider's ready simulation or becomes a fabricated fallback.
 - `Quote` contains only required Route, SimulationSuccess, approvals, transaction and latency. Provider failures live in a separate failures array; never add error/status or optional success fields to Quote.
-- Rank successful simulated bought balance deltas as U256 integers, not raw provider buyAmount. Funding is always explicitly overridden and is not proof of wallet funds. Report gas separately; no API expiresAt or artificial TTL. The caller decides freshness from block context.
+- Rank successful simulated bought balance deltas as U256 integers, not raw provider buyAmount. Funding is always explicitly overridden and is not proof of wallet funds. Report gas used separately; gas fee is null when simulation does not query or set gas price. Block context number and timestamps are JSON u64; the hash remains a hex string. No API expiresAt or artificial TTL. The caller decides freshness from each simulation's returned block context.
 - Require the real taker at input. Simulate the full approval/swap sequence and return exactly those transactions. Preserve on-chain minimum output and upstream native deadlines.
 - Token quantities, gas, fees, prices, and ranking comparisons use decimal strings plus `U256`; never use floating point or silently assume USDC is worth one dollar.
 - `unavailable`, `unsupported`, `error`, and `reverted` retain distinct meanings in the wire response and handoff. Do not turn missing RPC, credentials, fee models, or Router deployment into success.

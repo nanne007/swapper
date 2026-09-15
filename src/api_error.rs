@@ -60,7 +60,6 @@ impl From<&anyhow::Error> for ApiError {
             ErrorKind::RpcCallFailed => ("RPC_CALL_FAILED", 502),
             ErrorKind::RpcInvalidResponse => ("RPC_INVALID_RESPONSE", 502),
             ErrorKind::RpcMethodUnsupported => ("RPC_METHOD_UNSUPPORTED", 502),
-            ErrorKind::ChainReorgRequote => ("CHAIN_REORG_REQUOTE", 502),
             _ => ("INTERNAL_ERROR", 500),
         };
         Self {

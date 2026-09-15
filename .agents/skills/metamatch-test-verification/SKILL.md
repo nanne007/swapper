@@ -11,7 +11,7 @@ Read `AGENTS.md`, `docs/PRODUCT.md`, `docs/TECHNICAL.md`, `docs/VERIFICATION.md`
 
 - Rust unit tests cover domain arithmetic, ranking, provider isolation, HTTP, total timeout/capacity/cancellation, RPC errors, executable transaction invariants, and public envelopes.
 - Provider fixtures verify URL, headers, request fields, normalization, malformed/oversized responses, timeout, rate limit, and unexpected execution addresses. They are not live supplier evidence.
-- RPC fixtures verify chain ID, block context, call ordering, typed `eth_createAccessList` mapping discovery, `eth_simulateV1` parsing, reorg, revert, unsupported method, direct sell/native funding overrides, absence of real-balance reads, and fee behavior.
+- RPC fixtures verify per-provider `eth_simulateV1(latest)`, block context from the simulation response, absence of context/gas-price RPCs and call `gasPrice`, call ordering, typed `eth_createAccessList` mapping discovery, revert/unsupported handling, direct sell/native funding overrides, fixed ERC20 approval without allowance pre-read, absence of real-balance reads, and null fee behavior.
 - Foundry tests cover the current permissionless Router: Holder caller/sender authentication, current target/spender structure, input amount/value, token returns and approval cleanup, receiver minimum, net sold/refunds, sell/buy balance isolation and reentrancy. Do not reintroduce retired allowlist/admin/pause/recovery behavior. Add fuzzing for numeric balance/refund/minimum invariants.
 - Local Anvil E2E covers the HTTP → simulation → approval → same returned local swap path. It does not prove formal Holder bytecode, provider behavior, deployed Router safety, or production fee data.
 

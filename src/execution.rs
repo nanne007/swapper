@@ -6,7 +6,6 @@ use alloy_sol_types::{SolCall, sol};
 sol! {
     function approve(address spender, uint256 amount) returns (bool);
     function balanceOf(address owner) view returns (uint256);
-    function allowance(address owner, address spender) view returns (uint256);
     function allowanceHolder() view returns (address);
     function execute(address sellToken, address buyToken, address receiver, uint256 sellAmount, uint256 minBuyAmount, uint256 deadline, address spender, address target, uint256 value, bytes data) payable returns (uint256);
     function exec(address operator, address token, uint256 amount, address target, bytes data) payable returns (bytes);
@@ -119,8 +118,4 @@ pub fn approval(token: Address, spender: Address, amount: U256) -> Tx {
 
 pub fn balance_data(owner: Address) -> Bytes {
     balanceOfCall { owner }.abi_encode().into()
-}
-
-pub fn allowance_data(owner: Address, spender: Address) -> Bytes {
-    allowanceCall { owner, spender }.abi_encode().into()
 }

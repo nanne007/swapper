@@ -10,13 +10,10 @@ use metamatch_backend::{
     domain::{Input, NATIVE, Route, Tx, minimum, parse_address, parse_positive, parse_uint},
     execution::{swap_transaction, validate_route},
     http::{HttpClient, HttpRequest, HttpResponse, json_request_as, url_with_params},
-    rpc::{ContextProvider, ContextSource, RpcClients},
 };
 use serde_json::{Value, json};
 use std::{collections::HashMap, sync::Arc, time::Duration};
-use support::{
-    FIXTURE_TAKER, FixtureRpc, chain, config, fixture_context, input, request, run_simulation,
-};
+use support::{FIXTURE_TAKER, config, input, request, run_simulation};
 
 fn parse_input(value: Value) -> anyhow::Result<Input> {
     let input: Input = serde_json::from_value(value)?;
@@ -368,41 +365,23 @@ fn permissionless_routes_preserve_arbitrary_target_spender_and_selector() {
 }
 
 #[tokio::test]
-async fn typed_rpc_provider_supplies_block_context() {
-    let server = FixtureRpc::default().start().await;
-    let source = ContextSource::new(Arc::new(RpcClients::new(Duration::from_secs(1))));
-    let config = config();
-    let mut chain = chain(&config, 1);
-    chain.rpc_url = Some(server.url.clone());
-    let context = source.get(&input(1, NATIVE), &chain).await.unwrap();
-    assert_eq!(context.block_number, fixture_context().block_number);
-    assert_eq!(context.block_hash, fixture_context().block_hash);
-    assert_eq!(context.gas_price, fixture_context().gas_price);
-}
-
-#[tokio::test]
 async fn derives_balance_delta_and_gas_from_sequential_calls() {
-    let result = run_simulation(false, false, false).await.unwrap();
+    let result = run_simulation(false, false).await.unwrap();
     assert_eq!(result.simulation.bought_amount, "100");
     assert_eq!(result.simulation.gas_used, "21000");
     assert_eq!(result.simulation.funding, "overridden");
-}
-
-#[tokio::test]
-async fn reorg_is_not_success() {
-    let error = run_simulation(true, false, false).await.unwrap_err();
-    let failure = *error
-        .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
-        .unwrap();
-    assert!(matches!(
-        failure,
-        metamatch_backend::simulation::SimulationFailure::Error(_)
-    ));
+    assert_eq!(result.simulation.block_context.number, 17);
+    assert_eq!(
+        result.simulation.block_context.hash,
+        format!("0x{}", "33".repeat(32))
+    );
+    assert_eq!(result.simulation.simulated_timestamp, 101);
+    assert_eq!(result.simulation.gas_fee_wei, None);
 }
 
 #[tokio::test]
 async fn unsupported_simulation_method_is_not_reported_as_transport_failure() {
-    let error = run_simulation(false, false, true).await.unwrap_err();
+    let error = run_simulation(false, true).await.unwrap_err();
     let failure = *error
         .downcast_ref::<metamatch_backend::simulation::SimulationFailure>()
         .unwrap();
@@ -424,7 +403,6 @@ async fn create_rejects_a_chain_not_supported_by_current_providers() {
         Services::new(
             Vec::new(),
             &[configured_chain(&config, 1)],
-            Arc::new(support::MockContext),
             Arc::new(support::MockSimulation),
         ),
     );

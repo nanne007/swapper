@@ -7,18 +7,17 @@ mod support;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
 use alloy_provider::{DynProvider, Provider as AlloyProvider, ProviderBuilder};
-use alloy_rpc_types_eth::{BlockNumberOrTag, TransactionInput, TransactionRequest};
+use alloy_rpc_types_eth::{BlockId, TransactionInput, TransactionRequest};
 use alloy_sol_types::{SolCall, sol};
 use async_trait::async_trait;
-use metamatch_backend::error::ErrorKind;
 use metamatch_backend::{
     app::create_app_with_services,
     chains::bootstrap_chains,
     competitions::Services,
     config::{Config, load_config},
-    domain::{Context, Input, Route, Tx, parse_address},
+    domain::{Input, Route, Tx, parse_address},
     providers::Provider,
-    rpc::{ContextProvider, RpcClients},
+    rpc::RpcClients,
     simulation::Simulator,
 };
 use serde_json::{Value, json};
@@ -65,21 +64,6 @@ impl AnvilRpc {
             .get_accounts()
             .await
             .map_err(|error| format!("rpc eth_accounts: {error}"))
-    }
-
-    async fn latest_block(&self) -> Result<alloy_rpc_types_eth::Block, String> {
-        self.provider
-            .get_block_by_number(BlockNumberOrTag::Latest)
-            .await
-            .map_err(|error| format!("rpc eth_getBlockByNumber: {error}"))?
-            .ok_or_else(|| String::from("rpc eth_getBlockByNumber: missing result"))
-    }
-
-    async fn gas_price(&self) -> Result<u128, String> {
-        self.provider
-            .get_gas_price()
-            .await
-            .map_err(|error| format!("rpc eth_gasPrice: {error}"))
     }
 
     async fn call_contract(&self, to: Address, data: Bytes) -> Result<Bytes, String> {
@@ -131,45 +115,6 @@ impl AnvilRpc {
             sleep(Duration::from_millis(20)).await;
         }
         Err(format!("transaction receipt timeout: {hash:#x}"))
-    }
-}
-
-struct AnvilContext {
-    rpc: Arc<AnvilRpc>,
-}
-
-#[async_trait]
-impl ContextProvider for AnvilContext {
-    async fn get(
-        &self,
-        _input: &Input,
-        chain: &metamatch_backend::domain::Chain,
-    ) -> anyhow::Result<Context> {
-        if self
-            .rpc
-            .chain_id()
-            .await
-            .map_err(|_| anyhow::Error::new(ErrorKind::RpcCallFailed))?
-            != chain.id
-        {
-            return Err(anyhow::Error::new(ErrorKind::RpcChainMismatch));
-        }
-        let block = self
-            .rpc
-            .latest_block()
-            .await
-            .map_err(|_| anyhow::Error::new(ErrorKind::RpcCallFailed))?;
-        let gas_price = self
-            .rpc
-            .gas_price()
-            .await
-            .map_err(|_| anyhow::Error::new(ErrorKind::RpcCallFailed))?;
-        Ok(Context {
-            block_number: format!("0x{:x}", block.header.inner.number),
-            block_hash: format!("{:#x}", block.header.hash),
-            timestamp: block.header.inner.timestamp,
-            gas_price: gas_price.to_string(),
-        })
     }
 }
 
@@ -438,22 +383,13 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
     );
     let mut preview_input = input.clone();
     preview_input.taker = Address::repeat_byte(0x77);
-    let context = AnvilContext { rpc: rpc.clone() }
-        .get(&preview_input, &chain)
-        .await
-        .map_err(|error| error.to_string())?;
     slots
-        .resolve(
-            &rpc.provider,
-            chain.id,
-            sell,
-            metamatch_backend::rpc::block_id(&context).map_err(|error| error.to_string())?,
-        )
+        .resolve(&rpc.provider, chain.id, sell, BlockId::latest())
         .await
         .map_err(|error| format!("standalone balance mapping detection: {error:#}"))?;
     for owner in [Address::repeat_byte(0x77), Address::repeat_byte(0x88)] {
         preview_input.taker = owner;
-        let result = support::simulate(&simulator, &preview_input, &chain, &route, &context)
+        let result = support::simulate(&simulator, &preview_input, &chain, &route)
             .await
             .map_err(|error| format!("preview discovery: {error:#}"))?;
         if result.simulation.bought_amount != "200" || result.simulation.funding != "overridden" {
@@ -478,7 +414,6 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
     let services = Services::new(
         vec![Arc::new(FixtureProvider { router, route })],
         &[chain],
-        Arc::new(AnvilContext { rpc: rpc.clone() }),
         Arc::new(Simulator::new(
             Arc::new(metamatch_backend::rpc::RpcClients::new(
                 Duration::from_secs(2),
@@ -519,7 +454,7 @@ async fn run_against_anvil(rpc: &Arc<AnvilRpc>, url: &str) -> Result<(), String>
         if quote["simulation"]["boughtAmount"] != "200"
             || !result["failures"].as_array().is_some_and(Vec::is_empty)
             || quote["simulation"]["funding"] != "overridden"
-            || !quote["simulation"]["blockContext"]["number"].is_string()
+            || !quote["simulation"]["blockContext"]["number"].is_u64()
             || !quote["simulation"]["blockContext"]["timestamp"].is_u64()
         {
             return Err(format!("unexpected quote: {result}"));

@@ -2,20 +2,17 @@
 use anyhow::Context as _;
 
 use alloy_primitives::{Address, B256, Bytes, U256};
-use alloy_rpc_types_eth::{
-    TransactionRequest,
-    simulate::{SimCallResult, SimulatePayload, SimulatedBlock},
-};
+use alloy_rpc_types_eth::simulate::{SimCallResult, SimulatePayload, SimulatedBlock};
 use async_trait::async_trait;
 use metamatch_backend::{
     chains::configured_chain,
     competitions::Services,
     config::{Config, load_config},
-    domain::{Chain, Context, Input, NATIVE, Route, SimulationSuccess, Tx},
+    domain::{BlockContext, Chain, Input, NATIVE, Route, SimulationSuccess, Tx},
     execution::swap_transaction,
     http::{HttpClient, HttpRequest, HttpResponse},
     providers::{Provider, create_providers},
-    rpc::{ContextProvider, RpcClients},
+    rpc::RpcClients,
     simulation::{SimResult, SimulationProvider, SimulationRequest},
 };
 use serde_json::Value;
@@ -102,9 +99,6 @@ pub fn provider(config: &Config, id: &str, client: Arc<dyn HttpClient>) -> Arc<d
 
 #[derive(Clone, Copy, Default)]
 pub struct FixtureRpc {
-    pub reorg: bool,
-    pub reorg_after_simulation: bool,
-    pub allowance: U256,
     pub false_approval: bool,
     pub unsupported_simulation: bool,
     pub revert: bool,
@@ -130,16 +124,10 @@ impl FixtureRpc {
         let router = Router::new().route(
             "/",
             post(move |Json(request): Json<Value>| {
-                let mut fixture = self;
                 {
-                    let mut requests = recorded.lock().unwrap();
-                    fixture.reorg |= self.reorg_after_simulation
-                        && requests
-                            .iter()
-                            .any(|request| request["method"] == "eth_simulateV1");
-                    requests.push(request.clone());
+                    recorded.lock().unwrap().push(request.clone());
                 }
-                async move { Json(fixture.response(&request)) }
+                async move { Json(self.response(&request)) }
             }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -160,25 +148,10 @@ impl FixtureRpc {
                 let mut block: alloy_rpc_types_eth::Block = Default::default();
                 block.header.inner.number = 16;
                 block.header.inner.timestamp = 100;
-                block.header.hash = B256::from([if self.reorg { 0x22 } else { 0x11 }; 32]);
+                block.header.hash = B256::repeat_byte(0x11);
                 json!(block)
             }
             "eth_gasPrice" => json!("0x3b9aca00"),
-            "eth_getCode" => json!("0x6000"),
-            "eth_getBalance" => json!("0x0"),
-            "eth_call" => {
-                let call: TransactionRequest =
-                    serde_json::from_value(request["params"][0].clone()).unwrap();
-                let is_balance = call
-                    .input
-                    .input()
-                    .is_some_and(|data| data.starts_with(&[0x70, 0xa0, 0x82, 0x31]));
-                json!(word_bytes(if is_balance {
-                    U256::from(100)
-                } else {
-                    self.allowance
-                }))
-            }
             "eth_createAccessList" => {
                 return json!({"jsonrpc":"2.0", "id":request["id"],
                     "error":{"code":-32601,"message":"access-list generation unsupported"}});
@@ -249,20 +222,12 @@ impl FixtureRpc {
                 }),
             })
             .collect();
-        let block: SimulatedBlock = SimulatedBlock {
-            inner: Default::default(),
-            calls,
-        };
+        let mut inner: alloy_rpc_types_eth::Block = Default::default();
+        inner.header.inner.number = 17;
+        inner.header.inner.timestamp = 101;
+        inner.header.hash = B256::repeat_byte(0x33);
+        let block: SimulatedBlock = SimulatedBlock { inner, calls };
         serde_json::json!([block])
-    }
-}
-
-pub fn fixture_context() -> Context {
-    Context {
-        block_number: "0x10".into(),
-        block_hash: format!("0x{}", "11".repeat(32)),
-        timestamp: 100,
-        gas_price: "1000000000".into(),
     }
 }
 
@@ -283,14 +248,12 @@ pub fn fixture_route(input: &Input) -> Route {
 }
 
 pub async fn run_simulation(
-    reorg: bool,
     false_approval: bool,
     unsupported_simulation: bool,
 ) -> anyhow::Result<SimResult> {
     let config = config();
     let mut chain = chain(&config, 1);
     let server = FixtureRpc {
-        reorg,
         false_approval,
         unsupported_simulation,
         ..Default::default()
@@ -307,7 +270,7 @@ pub async fn run_simulation(
             Default::default(),
         )),
     );
-    simulate(&simulator, &input, &chain, &route, &fixture_context()).await
+    simulate(&simulator, &input, &chain, &route).await
 }
 
 pub async fn simulate(
@@ -315,65 +278,41 @@ pub async fn simulate(
     input: &Input,
     chain: &Chain,
     route: &Route,
-    context: &Context,
 ) -> anyhow::Result<SimResult> {
     let route = metamatch_backend::execution::validate_route(input, route.clone())?;
-    let preparation = simulator.prepare(input, chain, context).await?;
     simulator
-        .run(SimulationRequest {
+        .simulate(SimulationRequest {
             input,
             chain,
             route: &route,
-            context,
-            preparation: &preparation,
         })
         .await
-}
-
-pub struct MockContext;
-
-#[async_trait]
-impl ContextProvider for MockContext {
-    async fn get(&self, _input: &Input, _chain: &Chain) -> anyhow::Result<Context> {
-        Ok(fixture_context())
-    }
 }
 
 pub struct MockSimulation;
 
 #[async_trait]
 impl SimulationProvider for MockSimulation {
-    async fn prepare(
-        &self,
-        input: &metamatch_backend::domain::Input,
-        chain: &metamatch_backend::domain::Chain,
-        context: &metamatch_backend::domain::Context,
-    ) -> anyhow::Result<metamatch_backend::simulation::SimulationPreparation> {
-        let _ = (input, context);
-        Ok(metamatch_backend::simulation::SimulationPreparation {
-            router: chain
-                .router
-                .context(metamatch_backend::error::ErrorKind::RouterNotConfigured)?,
-            approvals: Vec::new(),
-            sell_balance_slot: None,
-        })
-    }
-    async fn run(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
+    async fn simulate(&self, request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
+        let router = request
+            .chain
+            .router
+            .context(metamatch_backend::error::ErrorKind::RouterNotConfigured)?;
         Ok(SimResult {
             simulation: SimulationSuccess {
                 bought_amount: request.route.buy_amount.clone(),
                 gas_used: "1".into(),
-                gas_fee_wei: Some("1".into()),
+                gas_fee_wei: None,
                 funding: "overridden".into(),
-                block_context: request.context.block_context(),
-                simulated_timestamp: request.context.timestamp.saturating_add(1),
+                block_context: BlockContext {
+                    number: 17,
+                    hash: format!("0x{}", "33".repeat(32)),
+                    timestamp: 101,
+                },
+                simulated_timestamp: 101,
             },
             approvals: Vec::new(),
-            transaction: swap_transaction(
-                request.input,
-                request.preparation.router,
-                request.route,
-            )?,
+            transaction: swap_transaction(request.input, router, request.route)?,
         })
     }
 }
@@ -426,7 +365,6 @@ pub fn competition_services_for(config: &Config, configured_router: Option<Addre
     Services::new(
         vec![Arc::new(MockProvider)],
         &[chain],
-        Arc::new(MockContext),
         Arc::new(MockSimulation),
     )
 }

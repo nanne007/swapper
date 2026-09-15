@@ -27,9 +27,9 @@ competition(chain ID) -> only these providers
 | `src/config.rs` | typed JSON 服务参数、RPC/Router、provider 原生 key 和可选 balanceSlots；不解析业务 allowlist |
 | `src/providers/mod.rs` | `Provider` trait、provider registry、反向索引、共享 DTO/helper 和 route 归一化 |
 | `src/providers/*.rs` | 每家 provider 的独立 endpoint、认证、DTO 使用和 route 适配 |
-| `src/competitions.rs` | 由反向索引选 provider，总 deadline/capacity、批量 routes → 公共 context → 并发 simulation、返回结果 |
-| `src/rpc.rs` | 共享 Alloy 2.x `DynProvider`、原始 RPC 错误分类、parent block 和 gas context |
-| `src/simulation.rs` | 固定 block 顺序仿真、余额/授权/到账/gas/reorg 检查 |
+| `src/competitions.rs` | 由反向索引选 provider，总 deadline/capacity、每家独立 route → latest simulation、返回结果 |
+| `src/rpc.rs` | 共享 Alloy 2.x `DynProvider` 与原始 RPC 错误分类 |
+| `src/simulation.rs` | latest 顺序仿真、余额/授权/到账/gas-used 检查 |
 | `src/balance_slots.rs` | 配置优先的 mapping base 解析、假地址只读 trace 探测及有界进程缓存 |
 | `src/execution.rs` | route 边界、ABI、AllowanceHolder/MetaRouter transaction 编码 |
 | `src/app.rs` | Axum endpoints、typed request/response、请求体限制、错误 envelope、rejection/header 处理、capabilities |
@@ -74,10 +74,10 @@ HashMap<u64, Vec<&'static str>>
 ## 5. 单请求竞赛
 
 1. typed `Json<Input>` 解码；请求与响应复用同一份 Input 字段定义，不再维护 CreateCompetitionRequest 或逐字段转换。chainId 在反序列化时通过 NonZeroU64 校验后保存为 u64，地址必须为带 0x 前缀的字符串，sellAmount/slippage 在 Serde 解码时校验，slippage 默认 30。随后显式调用 `Input::validate()` 检查 token 组合和保留 taker，保持 `INVALID_INPUT` 与 `INVALID_TAKER` 分类独立；运行时 Router/Holder 地址在 competition 入口另行检查。收款人为同一 taker。直接在 Rust 中构造 Input 不会触发 Serde 校验，内部调用者须维持这些字段不变量。
-2. `Competitions::create` 取得 `Semaphore` permit，超额立即返回 429；使用单个 Tokio `Instant` 截止时间覆盖 provider quote、交易构建、context 和 simulation。
-3. 确认 Router 已配置，再对 registry 中各 provider 并发执行 quote，并校验 provider ID、金额、原生 deadline、value/calldata 和基本 target/spender 结构。`validate_route` 消费 Route 并返回不可变的 `ValidatedRoute`，随后编码与仿真不重复整套校验。每条 route future 使用同一个绝对 deadline；失败项立即归入该 provider 的 failure。
-4. 等全部 route future 成功、失败或超时结算后才获取一次公共 parent context。这样 context 的 block 不会早于本批次 route 的生成时点；公共准备失败时，已取得的 routes 分别返回明确失败，不构造虚假报价或交易。
-5. 在同一个 context 调用一次 `SimulationProvider::prepare`：检查 parent hash，再并行读取 Router code 与资金准备信息（ERC20 mapping base、taker 对 Holder 的 allowance）。产生本轮共享的 `SimulationPreparation {router, approvals, sell_balance_slot}`；native 无 token slot/approval。准备错误分发给有效 routes，不跨请求保存失败。随后并发 simulation 所有有效 route。每家互不继承其他 provider 的模拟状态；达到绝对 deadline 时丢弃未完成 future，已完成的 Quote 保留。deadline 不按阶段重置，因此 route 阶段耗尽预算时，context/simulation 也无法完成。
+2. `Competitions::create` 取得 `Semaphore` permit，超额立即返回 429；使用单个 Tokio `Instant` 截止时间覆盖所有 provider 的 quote、交易构建和 simulation。
+3. 确认 Router 已配置，再为 registry 中每个 provider 并发启动独立 pipeline。每条 pipeline 先 quote，再校验 provider ID、金额、原生 deadline、value/calldata 和基本 target/spender 结构；`validate_route` 消费 Route 并返回不可变的 `ValidatedRoute`。
+4. 同一条 pipeline 随即调用一次 `SimulationProvider::simulate`，不等待其他 provider 的 route。Simulator 在 `latest` 上解析或复用 ERC20 mapping base，静态生成一笔 `approve(Holder, sellAmount)`（native 无 approval），构造 state override 并执行完整顺序仿真。Router/Holder code 只在启动 bootstrap 验证，请求阶段不重复读取 code 或 taker allowance。
+5. 每条 pipeline 都使用竞赛创建时生成的同一个绝对 deadline，但互不等待、互不继承模拟状态。某家 route 很慢或失败不会阻止其他 provider 已经开始 simulation；达到 deadline 时只取消尚未完成的 pipeline，已完成 Quote 保留。
 6. 仅 route 和完整仿真成功且余额增量达到 route minimum 时构造成功专用 `Quote`，保存完整 route 和原始 `SimResult` 的 simulation、approvals、transaction。Quote 无 status/error/Option 成功字段，排序无需筛选错误状态。排序按模拟到账整数降序，平局按 provider ID；失败项单独存入 failures。无有效 output 的结果不能成为可执行候选。
 
 不再有 HashMap 竞赛存储、token 鉴权、polling、单独 build 或 TTL 清理。permit 随请求 future 完成、失败或取消释放；HTTP 连接结束是否立即 drop handler 取决于服务器行为，未取消的 handler 仍受总 deadline 限制。`id` 仅用于日志关联。
@@ -86,13 +86,15 @@ HashMap<u64, Vec<&'static str>>
 
 ## 6. 仿真与资金边界
 
-每次 public competition 从一开始绑定真实 taker，但 simulation 不读取 taker 的真实 native 或卖出 token 余额。native sell 时直接覆盖足以支付 transaction value 和声明 gas budget 的 native balance；ERC20 sell 时解析 mapping base，把 `storage_key(taker, base)` 直接覆盖为 `sellAmount`，并同时覆盖 native gas balance。allowance 在同一区块每轮读取一次，以决定共享的 reset/approve 列表。各 route 独立构造 payload/state overrides，模拟后的 block hash 检查仍逐 route 执行。随后顺序执行买入 token 余额查询、必要的 reset/approve、swap、余额查询。approval 返回 false、到账低于 minimum、RPC 不支持、完整交易 revert 或区块重组均明确失败，不返回 Quote。
+每次 public competition 从一开始绑定真实 taker，但 simulation 不读取 taker 的真实 native、卖出 token 余额或 Holder allowance。native sell 不需要 token slot；ERC20 sell 解析 mapping base，把 `storage_key(taker, base)` 直接覆盖为 `sellAmount`，并固定生成一笔精确 `approve(Holder, sellAmount)`。两种路径都把 taker 的 native balance 设为 `U256::MAX`，只作为模拟资金假设，以覆盖节点基于最新区块费用执行的 upfront gas-limit 检查。
+
+Simulator 不先获取公共 context，不调用 `eth_chainId`、`eth_getBlockByNumber` 或 `eth_gasPrice`；`eth_simulateV1` 使用显式 `latest` 标签，call 中不设置 `gasPrice`，也不传 block override。每家 provider 独立构造 payload/state overrides，顺序执行买入 token 余额查询、固定 approval、swap、余额查询。approval 返回 false、到账低于 minimum、RPC 不支持或完整交易 revert 均明确失败，不返回 Quote。
 
 每条成功 simulation 包含：
 
-- `blockContext: {number, hash, timestamp}`：基础区块，number 为十六进制 quantity 字符串，timestamp 为 Unix 秒。
-- `simulatedTimestamp`：传入 `eth_simulateV1` 的执行时间，目前为 parent timestamp + 1；不能把它误当作基础区块 timestamp。
-- `boughtAmount`：完整调用序列中真实收款地址的买入 token 模拟余额增量；`gasUsed` 为 approval/swap 合计，`gasFeeWei` 未支持时为 null；`funding: overridden`。该字段明确表示卖出资产和 gas 资金是 state override 假设，不证明钱包当前有足够余额。
+- `blockContext: {number, hash, timestamp}`：直接取自该次 `eth_simulateV1` 返回的模拟区块，number 和 timestamp 均为 JSON u64，hash 为十六进制字符串。不同 provider 可能观察到不同 latest 区块。
+- `simulatedTimestamp`：与返回模拟区块的 timestamp 一致；保留独立字段以维持 API 契约。
+- `boughtAmount`：完整调用序列中真实收款地址的买入 token 模拟余额增量；`gasUsed` 为 approval/swap 合计。由于 simulation 不查询或指定 gas price，`gasFeeWei` 固定为 null；`funding: overridden` 表示卖出资产和 native 资金是 state override 假设，不证明钱包当前有足够余额。
 
 API 不返回 expiresAt，不按区块年龄淘汰结果。重新 simulate 是对相同交易的状态复核；重新 competition 会重新获取报价。调用方自行选择，并自行确认新报价的 minimum。最低到账写入交易，后端不默默替换已经返回的交易。
 
@@ -104,13 +106,13 @@ API 不返回 expiresAt，不按区块年龄淘汰结果。重新 simulate 是�
 user wallet -> AllowanceHolder.exec -> MetaRouter.execute -> provider target
 ```
 
-缺少 Router 的 public competition 返回 unavailable。配置的 Holder 来自启动时的 `allowanceHolder()`，用于钱包 allowance 查询、approvals 和最外层交易入口；Router 地址作为 operator、内层 target 和 provider sender。
+缺少 Router 的 public competition 返回 unavailable。配置的 Holder 来自启动时的 `allowanceHolder()`，用于固定 approval 和最外层交易入口；Router 地址作为 operator、内层 target 和 provider sender。服务不读取当前钱包 allowance，因此 ERC20 结果总带一笔设置为 sellAmount 的 approval。
 
 Solidity 已无 admin/owner、pause、白名单、recover、其他 ERC20 target 探测和 Holder 固定嵌套形状检查。本次未修改合约行为。最新 ABI 为 `execute(sellToken, buyToken, receiver, sellAmount, minBuyAmount, deadline, spender, target, value, data)`（selector `0xf509c3a5`），Rust 同步编码，API taker 映射为 sender/receiver。精确授权与清零、最低实际到账、退款增量、同交易资产边界和重入保护继续执行。无关暂存资产不保证安全，详见 [合约说明](../contracts/README.md)。
 
 Rust 不再使用路由白名单；`ROUTE_NOT_ALLOWLISTED` 错误分类和映射也已删除。permissionless 不取消 provider 原生 target/spender 约束、交易不变量或完整仿真。配置成功只证明部署 getter/代码检查通过，不等于生产执行已验收。
 
-`Services::production` 为 context 与 simulator 注入同一个 `Arc<RpcClients>`，按配置 URL 复用 `DynProvider` 和 reqwest 连接池。业务代码直接调用 Alloy，不再维护 `RpcFactory`/`EvmRpc`/`AlloyRpc` 转发层或 `BlockInfo` 副本；保留 `ContextProvider`、`SimulationProvider` 业务测试边界。客户端复用不缓存报价或链状态，也不增加 RPC fallback。
+`Services::production` 为 bootstrap 与 simulator 注入同一个 `Arc<RpcClients>`，按配置 URL 复用 `DynProvider` 和 reqwest 连接池。业务代码直接调用 Alloy，不再维护独立 context service、`RpcFactory`/`EvmRpc`/`AlloyRpc` 转发层或 `BlockInfo` 副本；保留 `SimulationProvider` 业务测试边界。客户端复用不缓存报价或链状态，也不增加 RPC fallback。
 
 ### 6.1 独立 BalanceSlots
 
@@ -121,7 +123,7 @@ Rust 不再使用路由白名单；`ROUTE_NOT_ALLOWLISTED` 错误分类和映射
 1. `resolve(rpc, chainId, token, block) -> U256` 可独立调用，不接收真实 owner/amount，不构造 StateOverride，也不等待余额不足。配置命中直接返回 mapping base，不发 RPC，也不自动覆盖配置。
 2. 无配置则查询 `(chainId, token) -> U256` 进程缓存；命中直接返回 base，不依赖当前用户或金额，也不发 RPC。
 3. 缓存未命中：从固定标签派生两个假的 owner，用 `tokio::try_join!` 并发执行两次 Alloy typed `create_access_list(...).block_id(block)`，生成同一区块 `balanceOf(fakeOwner)` 的 access list，全程不使用 state override。一侧报错时返回错误并丢弃另一侧 future，不启动后台任务。对 base `0..1023` 本地计算 `keccak256(abi.encode(fakeOwner, base))`，匹配 token 地址对应的 `storageKeys`。取两个地址候选的交集，仅唯一 base 可缓存；找不到、歧义或 token storage key 超过上限时明确失败。每个 call gas limit 为 100000，最多接受 32 个 token storage key。任意 uint256/namespaced base 可通过配置提供，不承诺自动识别，也不逐槽发 RPC。
-4. `storage_key(owner, base)` 是纯 hash 计算。每轮竞赛只解析一次 base 并派生 taker 的 slot，各条 ERC20 simulation 消费同一个解析结果，以 `sellAmount` 构造 token stateDiff；每次 simulation 都把 taker 的 native balance 覆盖为 transaction value 与声明 gas budget 之和。不执行真实余额查询、反值探测、另一地址检查或 cache invalidation。配置错误或不兼容布局由后续完整调用序列的失败暴露；配置始终保留。RPC 错误继续保留原始 source chain。
+4. `storage_key(owner, base)` 是纯 hash 计算。每个 provider pipeline 调用 resolver；配置或缓存命中不发 RPC，并发缓存未命中会合并同一 chain/token 的成功探测。随后该 provider 以 `sellAmount` 构造 token stateDiff，并把 taker native balance 覆盖为 `U256::MAX`。不执行真实余额查询、反值探测、另一地址检查或 cache invalidation。探测失败不缓存，因而并发失败可能由不同 provider 各自重试；每次尝试仍受两次 access-list 调用上限约束。配置错误或不兼容布局由后续完整调用序列的失败暴露；配置始终保留。RPC 错误继续保留原始 source chain。
 
 缓存采用 `Mutex<HashMap<(u64, Address), SharedBase>>`，其中 `SharedBase = Arc<tokio::sync::Mutex<Option<U256>>>`。外层锁只保护索引，不跨 await；内层锁只合并同一 key 的探测。省去独立 CacheKey/CacheEntry 和 FIFO 队列，常规查找使用 HashMap。上限保持 1024 项，满时淘汰任意空闲项，不保证淘汰顺序；全部正在使用时返回明确 busy。其他 key 的 RPC 互不等待；取消后释放锁，失败不保存可复用结果，下次可重试。缓存不持久化、不跨副本共享、不设置报价 TTL。RPC 继续使用服务端客户端超时，调用者的整体 deadline 可以取消解析过程。
 

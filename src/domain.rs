@@ -146,15 +146,6 @@ pub struct RouterDeployment {
     pub holder: Address,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Context {
-    pub block_number: String,
-    pub block_hash: String,
-    pub timestamp: u64,
-    pub gas_price: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tx {
     pub to: Address,
@@ -189,19 +180,9 @@ pub struct SimulationSuccess {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BlockContext {
-    pub number: String,
+    pub number: u64,
     pub hash: String,
     pub timestamp: u64,
-}
-
-impl Context {
-    pub fn block_context(&self) -> BlockContext {
-        BlockContext {
-            number: self.block_number.clone(),
-            hash: self.block_hash.clone(),
-            timestamp: self.timestamp,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize)]

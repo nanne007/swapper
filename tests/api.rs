@@ -191,7 +191,7 @@ async fn one_request_returns_wallet_bound_transactions_and_simulation_context() 
     assert_eq!(quote["simulation"]["boughtAmount"], "200");
     assert_eq!(
         quote["simulation"]["blockContext"],
-        json!({"number": "0x10", "hash": support::fixture_context().block_hash, "timestamp": 100})
+        json!({"number": 17, "hash": format!("0x{}", "33".repeat(32)), "timestamp": 101})
     );
     assert_eq!(quote["simulation"]["simulatedTimestamp"], 101);
     for retired in [

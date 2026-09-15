@@ -42,10 +42,10 @@ provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hy
    }
    ```
 
-3. 服务在 `competitionTimeoutMs` 总预算内完成竞赛并返回 `200`。先并发获取并校验全部 provider route；route 阶段全部结算后获取一次公共 block context，再基于该 context 并发 simulation 所有有效 route。总预算不会按阶段重置；route 阶段若耗尽预算，本轮无法继续完成 context 或 simulation。
-4. 仿真先覆盖 taker 的卖出资产和 native gas 资金，再执行完整的「买入 token 余额查询 → 必要 approvals → swap → 余额查询」。仅 route 与完整仿真都成功的结果成为 `Quote`，按模拟余额增量 `simulation.boughtAmount` 降序排序；金额相同按 provider ID 排序。Gas 单独展示，未支持的费用保持 `null`，不做伪造价格换算。
+3. 服务在 `competitionTimeoutMs` 总预算内完成竞赛并返回 `200`。每个 provider 独立执行 `route → validate → simulate(latest)`；某家 route 完成即可开始自己的 simulation，不等待其他 provider。所有 pipeline 共用同一绝对 deadline，慢 provider 不消耗其他 provider 已经可用于 simulation 的时间。
+4. 仿真不预取公共 context，也不查询或发送 gas price；它覆盖 taker 的卖出资产和 native 资金，再执行完整的「买入 token 余额查询 → ERC20 固定 approval → swap → 余额查询」，native 卖出没有 token approval。Router/Holder code 已在启动 bootstrap 验证，请求阶段不重复读取 code 或钱包 allowance。仅 route 与完整仿真都成功的结果成为 `Quote`，按模拟余额增量 `simulation.boughtAmount` 降序排序；金额相同按 provider ID 排序。`gasUsed` 单独展示，`gasFeeWei` 为 `null`。
 5. 成功结果包含该次仿真对应的 `approvals[]` 和 `transaction`，`simulation.funding` 固定为 `overridden`。用户选择一条并依序执行；发送前自行确认真实余额足够。失败 provider 的诊断信息单独放入 `failures`，不能执行。
-6. API 不返回 `expiresAt`，不维护报价 TTL。每条成功 simulation 返回基础区块 `blockContext.number/hash/timestamp` 和 `simulatedTimestamp`。调用方决定是否重做 simulation 或重新竞赛；后者可能产生新的最低到账，需调用方重新确认，不会自动替换用户已接受的交易。
+6. API 不返回 `expiresAt`，不维护报价 TTL。每条成功 simulation 直接从模拟响应返回自己的 `blockContext.number/hash/timestamp` 和 `simulatedTimestamp`；`number` 与时间戳是 JSON u64，hash 是十六进制字符串。各 provider 可能落在不同 latest 区块。调用方决定是否重新竞赛；新报价可能产生新的最低到账，需调用方重新确认，不会自动替换用户已接受的交易。
 7. provider 返回的真实报价期限及 calldata/签名内的 deadline 仍生效。没有上游期限时，服务不额外增加人工时间限制。链上最低到账保护继续执行，仿真不保证未来成交。
 
 ## 5. 最小 API
@@ -80,7 +80,7 @@ provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hy
 
 Router 地址可按链配置，Holder 在启动时读取。Rust ABI 与当前 receiver/参数顺序同步，API 保持 taker 同时作为 sender/receiver。Rust 同样采用 permissionless 策略，删除 `Rule`、`Provider::rules()` 和 `ROUTE_NOT_ALLOWLISTED`，不增加路由登记配置。provider 原生协议约束、route 不变量与完整仿真仍必须通过，不开放客户端任意 calldata/target 输入。
 
-公共 context 取得后，每轮只准备一次 parent hash、Router code、Holder allowance 与卖出 token mapping base；准备失败分发给本轮有效 routes，不跨竞赛缓存失败。各 route 的模拟状态和模拟后 hash 检查独立，所有阶段仍受同一个总 deadline 约束。
+每个 provider 的 simulation 独立解析或复用 ERC20 卖出 token mapping base，并静态生成一笔 `approve(Holder, sellAmount)`；native 不生成 approval。`BalanceSlots` 仍按 chain/token 合并并缓存成功的自动探测，但失败保持 provider-local。完整顺序仿真会检查生成的 approval、swap 状态和到账 minimum；所有 provider pipeline 仍受同一个总 deadline 约束。
 
 ## 8. 明确不在 v1
 

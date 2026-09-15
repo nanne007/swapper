@@ -24,7 +24,7 @@ fn rpc_clients_reuse_the_alloy_provider_for_each_endpoint() {
 }
 
 #[tokio::test]
-async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding() {
+async fn alloy_simulation_uses_latest_without_context_or_gas_price() {
     let server = support::FixtureRpc::default().start().await;
     let mut chain = support::chain(&support::config(), 1);
     chain.rpc_url = Some(server.url.clone());
@@ -33,14 +33,13 @@ async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding(
     )));
     let input = support::input(1, NATIVE);
     let route = support::fixture_route(&input);
-    let context = support::fixture_context();
     let simulator = Simulator::new(
         Arc::new(RpcClients::new(Duration::from_secs(1))),
         std::sync::Arc::new(metamatch_backend::balance_slots::BalanceSlots::new(
             Default::default(),
         )),
     );
-    let result = support::simulate(&simulator, &input, &chain, &route, &context)
+    let result = support::simulate(&simulator, &input, &chain, &route)
         .await
         .unwrap();
     assert_eq!(result.simulation.bought_amount, "100");
@@ -49,16 +48,15 @@ async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding(
     for request in requests.iter() {
         let params = &request["params"];
         match request["method"].as_str().unwrap() {
-            "eth_getBlockByNumber" => assert_eq!(params[0], "0x10"),
-            "eth_getCode" => assert_eq!(params[1], "0x10"),
             "eth_simulateV1" => {
-                assert_eq!(params[1], "0x10");
+                assert_eq!(params[1], "latest");
                 let block = &params[0]["blockStateCalls"][0];
+                assert!(block.get("blockOverrides").is_none());
                 let calls = block["calls"].as_array().unwrap();
-                assert_eq!(calls.first().unwrap()["gasPrice"], "0x0");
-                assert_eq!(calls.last().unwrap()["gasPrice"], "0x0");
-                assert!(
-                    block["stateOverrides"][format!("{FIXTURE_TAKER:#x}")]["balance"].is_string()
+                assert!(calls.iter().all(|call| call.get("gasPrice").is_none()));
+                assert_eq!(
+                    block["stateOverrides"][format!("{FIXTURE_TAKER:#x}")]["balance"],
+                    format!("0x{}", "ff".repeat(32))
                 );
             }
             method => panic!("unexpected RPC method: {method}"),
@@ -71,13 +69,7 @@ async fn alloy_simulation_keeps_fixed_block_probes_and_always_overrides_funding(
             .count(),
         1
     );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|r| r["method"] == "eth_getBlockByNumber")
-            .count(),
-        2
-    );
+    assert_eq!(requests.len(), 1);
     assert!(!requests.iter().any(|r| r["method"] == "eth_getBalance"));
 }
 
@@ -127,15 +119,9 @@ async fn erc20_slot_resolution_and_approval_failures_still_reject_simulation() {
         );
         let mut route = support::fixture_route(&input);
         route.tx.value = "0".into();
-        let error = support::simulate(
-            &simulator,
-            &input,
-            &chain,
-            &route,
-            &support::fixture_context(),
-        )
-        .await
-        .unwrap_err();
+        let error = support::simulate(&simulator, &input, &chain, &route)
+            .await
+            .unwrap_err();
         assert_eq!(
             serde_json::to_value(error.downcast_ref::<SimulationFailure>().unwrap()).unwrap(),
             expected
@@ -185,15 +171,7 @@ async fn shared_transaction_validation_keeps_provider_and_execution_guards() {
 
 #[async_trait::async_trait]
 impl SimulationProvider for FailedSimulation {
-    async fn prepare(
-        &self,
-        input: &metamatch_backend::domain::Input,
-        chain: &metamatch_backend::domain::Chain,
-        context: &metamatch_backend::domain::Context,
-    ) -> anyhow::Result<metamatch_backend::simulation::SimulationPreparation> {
-        support::MockSimulation.prepare(input, chain, context).await
-    }
-    async fn run(&self, _request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
+    async fn simulate(&self, _request: SimulationRequest<'_>) -> anyhow::Result<SimResult> {
         Err(anyhow::anyhow!("original simulation cause").context(self.0))
     }
 }
