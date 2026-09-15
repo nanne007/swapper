@@ -9,7 +9,7 @@ Read `AGENTS.md`, `docs/PRODUCT.md`, `docs/TECHNICAL.md`, and `docs/VERIFICATION
 
 ## State and invariants
 
-- A competition is bounded by capacity and one total request deadline. Provider work is isolated; one timeout or malformed response must not cancel valid competitors or become a fabricated fallback.
+- A competition is bounded by capacity and one total request deadline. Fetch and validate every provider route concurrently, then fetch one shared block context, then simulate valid routes concurrently against that context. A malformed route stays local to its provider and never becomes a fabricated fallback; a route that consumes the total deadline necessarily leaves no budget for the shared context.
 - `Quote` contains only required Route, SimulationSuccess, approvals, transaction and latency. Provider failures live in a separate failures array; never add error/status or optional success fields to Quote.
 - Rank successful simulated bought balance deltas as U256 integers, not raw provider buyAmount. Funding is always explicitly overridden and is not proof of wallet funds. Report gas separately; no API expiresAt or artificial TTL. The caller decides freshness from block context.
 - Require the real taker at input. Simulate the full approval/swap sequence and return exactly those transactions. Preserve on-chain minimum output and upstream native deadlines.

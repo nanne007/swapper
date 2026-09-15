@@ -119,44 +119,74 @@ impl Competitions {
         let id = Uuid::new_v4();
         async {
             let providers = self.services.registry.for_chain(chain.id);
-            let context = timeout_at(deadline, async {
-                if chain.router.is_none() {
-                    anyhow::bail!(ErrorKind::RouterNotConfigured);
+            let mut quotes = Vec::new();
+            let mut failures = Vec::new();
+            let Some(sender) = chain.router else {
+                let error = anyhow::Error::new(ErrorKind::RouterNotConfigured);
+                let code = quote_error_code(&error);
+                failures.extend(providers.iter().map(|provider| {
+                    provider_failure(
+                        provider.id(),
+                        &error,
+                        code.clone(),
+                        started.elapsed().as_millis() as u64,
+                    )
+                }));
+                failures.sort_by_key(|failure| failure.provider);
+                return Ok(CompetitionResponse {
+                    id,
+                    input: input.clone(),
+                    quotes,
+                    failures,
+                });
+            };
+
+            // Routes must precede the shared context: an upstream route can be built
+            // from state newer than a context fetched before the provider requests.
+            let route_outcomes = join_all(providers.iter().map(|provider| {
+                self.fetch_route(provider.as_ref(), &input, chain, sender, deadline)
+                    .instrument(tracing::info_span!("provider", provider = provider.id()))
+            }))
+            .await;
+            let mut routes = Vec::new();
+            for outcome in route_outcomes {
+                match outcome {
+                    Ok(route) => routes.push(route),
+                    Err(failure) => failures.push(failure),
                 }
-                self.services.context.get(&input, chain).await
-            })
-            .await
-            .context(ErrorKind::UpstreamTimeout)
-            .and_then(|result| result);
-            let outcomes = match context {
-                Ok(context) => {
-                    join_all(providers.iter().map(|provider| {
-                        self.compete(provider.as_ref(), &input, chain, &context, deadline)
-                            .instrument(tracing::info_span!("provider", provider = provider.id()))
-                    }))
+            }
+
+            if !routes.is_empty() {
+                let context = timeout_at(deadline, self.services.context.get(&input, chain))
                     .await
-                }
-                Err(error) => {
-                    let code = quote_error_code(&error);
-                    providers
-                        .iter()
-                        .map(|provider| {
-                            Err(provider_failure(
-                                provider.id(),
+                    .context(ErrorKind::UpstreamTimeout)
+                    .and_then(|result| result);
+                match context {
+                    Ok(context) => {
+                        let outcomes = join_all(routes.into_iter().map(|route| {
+                            let provider = route.provider;
+                            self.simulate(route, &input, chain, &context, deadline)
+                                .instrument(tracing::info_span!("provider", provider))
+                        }))
+                        .await;
+                        for outcome in outcomes {
+                            match outcome {
+                                Ok(quote) => quotes.push(quote),
+                                Err(failure) => failures.push(failure),
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let code = quote_error_code(&error);
+                        failures.extend(routes.into_iter().map(|route| {
+                            provider_failure(
+                                route.provider,
                                 &error,
                                 code.clone(),
                                 started.elapsed().as_millis() as u64,
-                            ))
-                        })
-                        .collect()
-                }
-            };
-            let mut quotes = Vec::new();
-            let mut failures = Vec::new();
-            for outcome in outcomes {
-                match outcome {
-                    Ok(quote) => quotes.push(quote),
-                    Err(failure) => failures.push(failure),
+                            )
+                        }));
+                    }
                 }
             }
             failures.sort_by_key(|failure| failure.provider);
@@ -171,47 +201,72 @@ impl Competitions {
         .await
     }
 
-    async fn compete(
+    async fn fetch_route(
         &self,
         provider: &dyn Provider,
         input: &Input,
         chain: &Chain,
-        context: &Context,
+        sender: crate::domain::Address,
         deadline: Instant,
-    ) -> Result<Quote, ProviderFailure> {
+    ) -> Result<PreparedRoute, ProviderFailure> {
         let started = Instant::now();
-        // Every provider's entire quote -> transaction -> simulation pipeline shares
-        // the request deadline. Dropping a timed-out future cancels its remaining work.
         let result = timeout_at(deadline, async {
-            let sender = chain.router.context(ErrorKind::RouterNotConfigured)?;
             let route = provider.quote(input, chain, sender).await?;
             if route.provider != provider.id() {
                 anyhow::bail!(ErrorKind::InvalidRoute);
             }
             let rules = provider.rules(chain.id);
             validate_route(input, chain, &route, &rules, true)?;
+            Ok((route, rules))
+        })
+        .await
+        .context(ErrorKind::UpstreamTimeout)
+        .and_then(|result| result);
+        let latency_ms = started.elapsed().as_millis() as u64;
+        result
+            .map(|(route, rules)| PreparedRoute {
+                provider: provider.id(),
+                route,
+                rules,
+                quote_latency_ms: latency_ms,
+            })
+            .map_err(|error| {
+                provider_failure(provider.id(), &error, quote_error_code(&error), latency_ms)
+            })
+    }
+
+    async fn simulate(
+        &self,
+        prepared: PreparedRoute,
+        input: &Input,
+        chain: &Chain,
+        context: &Context,
+        deadline: Instant,
+    ) -> Result<Quote, ProviderFailure> {
+        let started = Instant::now();
+        let result = timeout_at(deadline, async {
             let result = self
                 .services
                 .simulator
                 .run(SimulationRequest {
                     input,
                     chain,
-                    route: &route,
+                    route: &prepared.route,
                     context,
-                    rules: &rules,
+                    rules: &prepared.rules,
                     taker: input.taker,
                     min: None,
                 })
                 .await?;
             if parse_positive(&result.simulation.bought_amount)?
-                < parse_uint(&route.min_buy_amount)?
+                < parse_uint(&prepared.route.min_buy_amount)?
             {
                 anyhow::bail!(SimulationFailure::Reverted(
                     "SIMULATED_OUTPUT_BELOW_MINIMUM"
                 ));
             }
             Ok(Quote {
-                route,
+                route: prepared.route,
                 simulation: result.simulation,
                 approvals: result.approvals,
                 transaction: result.transaction,
@@ -221,16 +276,28 @@ impl Competitions {
         .await
         .context(ErrorKind::UpstreamTimeout)
         .and_then(|result| result);
-        let latency_ms = started.elapsed().as_millis() as u64;
+        let latency_ms = prepared.quote_latency_ms + started.elapsed().as_millis() as u64;
         result
             .map(|mut quote| {
                 quote.latency_ms = latency_ms;
                 quote
             })
             .map_err(|error| {
-                provider_failure(provider.id(), &error, quote_error_code(&error), latency_ms)
+                provider_failure(
+                    prepared.provider,
+                    &error,
+                    quote_error_code(&error),
+                    latency_ms,
+                )
             })
     }
+}
+
+struct PreparedRoute {
+    provider: &'static str,
+    route: crate::domain::Route,
+    rules: Vec<crate::domain::Rule>,
+    quote_latency_ms: u64,
 }
 
 #[derive(Debug, Serialize)]

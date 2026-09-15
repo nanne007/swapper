@@ -27,7 +27,7 @@ competition(chain ID) -> only these providers
 | `src/config.rs` | 服务参数、RPC、provider 原生 key 和可选 BALANCE_SLOTS；不解析业务 allowlist |
 | `src/providers/mod.rs` | `Provider` trait、provider registry、反向索引、共享 DTO/helper 和 route 归一化 |
 | `src/providers/*.rs` | 每家 provider 的独立 endpoint、认证、DTO 使用和 route 适配 |
-| `src/competitions.rs` | 由反向索引选 provider，总 deadline/capacity、并发 quote → 构建 → simulation、返回结果 |
+| `src/competitions.rs` | 由反向索引选 provider，总 deadline/capacity、批量 routes → 公共 context → 并发 simulation、返回结果 |
 | `src/rpc.rs` | 共享 Alloy 2.x `DynProvider`、原始 RPC 错误分类、parent block 和 gas context |
 | `src/simulation.rs` | 固定 block 顺序仿真、余额/授权/到账/gas/reorg 检查 |
 | `src/balance_slots.rs` | 配置优先的 mapping base 解析、假地址只读 trace 探测及有界进程缓存 |
@@ -73,10 +73,10 @@ HashMap<u64, Vec<&'static str>>
 ## 5. 单请求竞赛
 
 1. typed `Json<CreateCompetitionRequest>` 解码，`validate_input` 验证金额、地址、滑点和必填真实 taker；收款人为同一 taker。拒绝保留地址和 Router 自身。
-2. `Competitions::create` 取得 `Semaphore` permit，超额立即返回 429；使用单个 Tokio `Instant` 截止时间覆盖 context、provider quote、交易构建和 simulation。
-3. 确认 Router 已配置并获取一次公共 parent context。公共准备失败时返回各 provider 的明确失败状态，不构造虚假报价或交易。
-4. 对 registry 中各 provider 并发运行完整流程：quote → 校验 provider ID、金额、原生 deadline、target/spender/selector 白名单、value/calldata → simulator。每家收到的是同一份区块基础状态，互不继承其他 provider 的模拟状态。
-5. 每家完整 future 使用同一 `timeout_at`。全部结束时提前返回；达到截止时间时保留完成项，超时项返回 `UPSTREAM_TIMEOUT`。未完成 future 被 drop，不继续后台 build/模拟。
+2. `Competitions::create` 取得 `Semaphore` permit，超额立即返回 429；使用单个 Tokio `Instant` 截止时间覆盖 provider quote、交易构建、context 和 simulation。
+3. 确认 Router 已配置，再对 registry 中各 provider 并发执行 quote，并校验 provider ID、金额、原生 deadline、target/spender/selector 白名单、value/calldata。每条 route future 使用同一个绝对 deadline；失败项立即归入该 provider 的 failure。
+4. 等全部 route future 成功、失败或超时结算后才获取一次公共 parent context。这样 context 的 block 不会早于本批次 route 的生成时点；公共准备失败时，已取得的 routes 分别返回明确失败，不构造虚假报价或交易。
+5. 基于同一个 context 并发 simulation 所有有效 route。每家互不继承其他 provider 的模拟状态；达到绝对 deadline 时丢弃未完成 future，已完成的 Quote 保留。deadline 不按阶段重置，因此 route 阶段耗尽预算时，context/simulation 也无法完成。
 6. 仅 route 和完整仿真成功且余额增量达到 route minimum 时构造成功专用 `Quote`，保存完整 route 和原始 `SimResult` 的 simulation、approvals、transaction。Quote 无 status/error/Option 成功字段，排序无需筛选错误状态。排序按模拟到账整数降序，平局按 provider ID；失败项单独存入 failures。无有效 output 的结果不能成为可执行候选。
 
 不再有 HashMap 竞赛存储、token 鉴权、polling、单独 build 或 TTL 清理。permit 随请求 future 完成、失败或取消释放；HTTP 连接结束是否立即 drop handler 取决于服务器行为，未取消的 handler 仍受总 deadline 限制。`id` 仅用于日志关联。

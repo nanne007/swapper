@@ -1,60 +1,44 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.25;
 
+import {IERC20} from "./IERC20.sol";
+
 interface IAllowanceHolder {
     function transferFrom(address token, address owner, address recipient, uint256 amount) external returns (bool);
-    function exec(address operator, address token, uint256 amount, address payable target, bytes calldata data)
-        external
-        payable
-        returns (bytes memory);
 }
 
 /// @notice Exact-input execution with AllowanceHolder's ERC-2771 sender forwarding.
-/// @dev The administrator must only allow audited provider target/spender/selector tuples.
-///      The owner can recover idle assets. Nonstandard taxed/rebasing tokens are not supported.
+/// @dev Permissionless routes; there is no administrator, pause, allowlist or asset recovery.
+///      Only the current swap's input allowance, refunds and final output are checked.
+///      Unrelated idle assets are not protected and must not be deposited here.
+///      Use a trusted AllowanceHolder. Nonstandard taxed/rebasing tokens are not supported.
 contract MetaRouter {
     address public constant NATIVE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
-    address public owner;
-    address public pendingOwner;
     address public immutable allowanceHolder;
-    bool public paused;
     bool private entered;
-    mapping(bytes32 => bool) public allowed;
 
     error Unauthorized();
-    error Paused();
     error Reentrant();
     error InvalidInput();
     error Expired();
-    error RouteNotAllowed();
     error TokenCallFailed();
     error BalanceInvariant();
     error InsufficientOutput();
     error NativeRefundFailed();
-    error NativeTransferFailed();
 
-    event RoutePermission(address indexed target, address indexed spender, bytes4 selector, bool enabled);
-    event OwnershipTransferStarted(address indexed previousOwner, address indexed newOwner);
-    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
-    event TokenRecovered(address indexed token, address indexed recipient, uint256 amount);
-    event PauseChanged(bool paused);
+    /// @dev sold deducts only this Router's sell-asset refund, floored at zero; direct provider refunds are excluded.
     event Executed(
-        address indexed taker, address indexed sellToken, address indexed buyToken, uint256 sold, uint256 bought
+        address indexed sender,
+        address receiver,
+        address indexed sellToken,
+        address indexed buyToken,
+        uint256 sold,
+        uint256 bought
     );
 
-    constructor(address owner_, address allowanceHolder_) {
-        if (
-            owner_ == address(0) || owner_ == address(this) || owner_ == allowanceHolder_ || owner_ == NATIVE
-                || allowanceHolder_.code.length == 0
-        ) revert InvalidInput();
-        owner = owner_;
+    constructor(address allowanceHolder_) {
+        if (allowanceHolder_.code.length == 0) revert InvalidInput();
         allowanceHolder = allowanceHolder_;
-        emit OwnershipTransferred(address(0), owner_);
-    }
-
-    modifier onlyOwner() {
-        if (msg.sender != owner) revert Unauthorized();
-        _;
     }
 
     modifier nonReentrant() {
@@ -64,93 +48,38 @@ contract MetaRouter {
         entered = false;
     }
 
-    function setPaused(bool value) external onlyOwner {
-        paused = value;
-        emit PauseChanged(value);
-    }
-
-    function setAllowed(address target, address spender, bytes4 selector, bool enabled) external onlyOwner {
-        if (
-            enabled
-                && (target.code.length == 0
-                    || spender.code.length == 0
-                    || target == address(this)
-                    || spender == address(this))
-        ) revert InvalidInput();
-        // Nested Holder calls use a separate (operator, Router, token) allowance.
-        // This validates only the outer tuple, not the inner target/operator.
-        if (
-            enabled && (target == allowanceHolder || spender == allowanceHolder)
-                && (target != allowanceHolder
-                    || spender != allowanceHolder
-                    || selector != IAllowanceHolder.exec.selector)
-        ) revert InvalidInput();
-        allowed[keccak256(abi.encode(target, spender, selector))] = enabled;
-        emit RoutePermission(target, spender, selector, enabled);
-    }
-
-    function transferOwnership(address newOwner) external onlyOwner {
-        if (newOwner == address(0) || newOwner == address(this) || newOwner == allowanceHolder || newOwner == NATIVE) {
-            revert InvalidInput();
-        }
-        pendingOwner = newOwner;
-        emit OwnershipTransferStarted(owner, newOwner);
-    }
-
-    function acceptOwnership() external {
-        if (msg.sender != pendingOwner) revert Unauthorized();
-        address previousOwner = owner;
-        owner = msg.sender;
-        pendingOwner = address(0);
-        emit OwnershipTransferred(previousOwner, msg.sender);
-    }
-
-    /// @notice Recover assets held by this contract, including while swaps are paused.
-    /// @dev Shares the swap lock so callbacks cannot recover funds during an active execution.
-    function recoverToken(address token, address payable recipient, uint256 amount) external onlyOwner nonReentrant {
-        if (recipient == address(0) || recipient == address(this) || amount == 0) revert InvalidInput();
-        if (token == NATIVE) {
-            (bool success,) = recipient.call{value: amount}("");
-            if (!success) revert NativeTransferFailed();
-        } else {
-            if (token.code.length == 0) revert InvalidInput();
-            _transfer(token, recipient, amount);
-        }
-        emit TokenRecovered(token, recipient, amount);
-    }
-
+    /// @notice Spend up to sellAmount and require a receiver buy-token increase of at least minBuyAmount.
+    /// @dev Called via the configured Holder; any unspent input is refunded to the forwarded sender.
     function execute(
         address sellToken,
         address buyToken,
+        address receiver,
         uint256 sellAmount,
         uint256 minBuyAmount,
-        address target,
+        uint256 deadline,
         address spender,
+        address target,
         uint256 value,
-        bytes calldata data,
-        uint256 deadline
+        bytes calldata data
     ) external payable nonReentrant returns (uint256 boughtAmount) {
         if (msg.sender != allowanceHolder) revert Unauthorized();
-        if (paused) revert Paused();
         if (block.timestamp > deadline) revert Expired();
-        // Canonical ABI head (9 words), bytes length and padded bytes, then the forwarded sender.
+        // Canonical ABI head (10 words), bytes length and padded bytes, then the forwarded sender.
         // This also prevents reading the final bytes of ordinary calldata as a sender.
         uint256 paddedDataLength = data.length;
         uint256 remainder = paddedDataLength % 32;
         if (remainder != 0) paddedDataLength += 32 - remainder;
-        uint256 canonicalLength = 4 + 9 * 32 + 32 + paddedDataLength;
+        uint256 canonicalLength = 4 + 10 * 32 + 32 + paddedDataLength;
         if (msg.data.length != canonicalLength + 20) revert InvalidInput();
-        address taker;
-        assembly ("memory-safe") { taker := shr(96, calldataload(sub(calldatasize(), 20))) }
+        address sender;
+        assembly ("memory-safe") { sender := shr(96, calldataload(sub(calldatasize(), 20))) }
         if (
-            taker == address(0) || taker == address(this) || taker == allowanceHolder || sellAmount == 0
-                || minBuyAmount == 0 || buyToken.code.length == 0 || buyToken == sellToken || data.length < 4
-                || target == sellToken || target == buyToken || target == address(this) || spender == address(this)
-                || target.code.length == 0 || spender.code.length == 0
+            sender == address(0) || sender == address(this) || sender == allowanceHolder || sellAmount == 0
+                || receiver == address(0) || receiver == address(this) || receiver == allowanceHolder
+                || receiver == NATIVE || minBuyAmount == 0 || buyToken.code.length == 0 || buyToken == sellToken
+                || data.length < 4 || target == sellToken || target == buyToken || target == address(this)
+                || spender == address(this) || target.code.length == 0 || spender.code.length == 0
         ) revert InvalidInput();
-        // Route safety relies on administrator review; balance deltas do not protect unrelated assets.
-        // setAllowed already enforces the Holder call shape when enabling a tuple.
-        if (!allowed[keccak256(abi.encode(target, spender, bytes4(data[:4])))]) revert RouteNotAllowed();
 
         bool nativeSell = sellToken == NATIVE;
         if (nativeSell) {
@@ -162,49 +91,54 @@ contract MetaRouter {
         uint256 nativeBefore = address(this).balance - msg.value;
         uint256 sellBefore = nativeSell ? 0 : _balance(sellToken, address(this));
         uint256 buyBefore = _balance(buyToken, address(this));
-        uint256 takerBuyBefore = _balance(buyToken, taker);
+        uint256 receiverBuyBefore = _balance(buyToken, receiver);
         if (!nativeSell) {
-            if (!IAllowanceHolder(allowanceHolder).transferFrom(sellToken, taker, address(this), sellAmount)) {
+            if (!IAllowanceHolder(allowanceHolder).transferFrom(sellToken, sender, address(this), sellAmount)) {
                 revert TokenCallFailed();
             }
             if (_balance(sellToken, address(this)) != sellBefore + sellAmount) revert BalanceInvariant();
-            _tokenCall(sellToken, abi.encodeWithSignature("approve(address,uint256)", spender, 0));
-            _tokenCall(sellToken, abi.encodeWithSignature("approve(address,uint256)", spender, sellAmount));
+            _tokenCall(sellToken, abi.encodeCall(IERC20.approve, (spender, 0)));
+            _tokenCall(sellToken, abi.encodeCall(IERC20.approve, (spender, sellAmount)));
         }
 
         (bool success, bytes memory result) = target.call{value: value}(data);
         if (!success) assembly ("memory-safe") { revert(add(result, 32), mload(result)) }
+        uint256 sellRefund;
         if (!nativeSell) {
-            _tokenCall(sellToken, abi.encodeWithSignature("approve(address,uint256)", spender, 0));
+            _tokenCall(sellToken, abi.encodeCall(IERC20.approve, (spender, 0)));
             uint256 sellAfter = _balance(sellToken, address(this));
             if (sellAfter < sellBefore) revert BalanceInvariant();
-            if (sellAfter > sellBefore) _transfer(sellToken, taker, sellAfter - sellBefore);
+            sellRefund = sellAfter - sellBefore;
+            if (sellRefund != 0) _transfer(sellToken, sender, sellRefund);
         }
         uint256 buyAfter = _balance(buyToken, address(this));
         if (buyAfter < buyBefore) revert BalanceInvariant();
-        if (buyAfter > buyBefore) _transfer(buyToken, taker, buyAfter - buyBefore);
+        if (buyAfter > buyBefore) _transfer(buyToken, receiver, buyAfter - buyBefore);
 
         if (address(this).balance < nativeBefore) revert BalanceInvariant();
         uint256 nativeRefund = address(this).balance - nativeBefore;
+        if (nativeSell) sellRefund = nativeRefund;
         if (nativeRefund != 0) {
-            (bool refunded,) = taker.call{value: nativeRefund}("");
+            (bool refunded,) = sender.call{value: nativeRefund}("");
             if (!refunded) revert NativeRefundFailed();
         }
         // Checked last, including any callbacks caused by token transfers and native refunds.
-        uint256 finalBuy = _balance(buyToken, taker);
-        if (finalBuy < takerBuyBefore || finalBuy - takerBuyBefore < minBuyAmount) revert InsufficientOutput();
-        boughtAmount = finalBuy - takerBuyBefore;
-        emit Executed(taker, sellToken, buyToken, sellAmount, boughtAmount);
+        uint256 finalBuy = _balance(buyToken, receiver);
+        if (finalBuy < receiverBuyBefore || finalBuy - receiverBuyBefore < minBuyAmount) revert InsufficientOutput();
+        boughtAmount = finalBuy - receiverBuyBefore;
+        // Extra sell-asset receipts must not make event accounting revert an otherwise valid swap.
+        uint256 soldAmount = sellRefund >= sellAmount ? 0 : sellAmount - sellRefund;
+        emit Executed(sender, receiver, sellToken, buyToken, soldAmount, boughtAmount);
     }
 
     function _balance(address token, address account) private view returns (uint256) {
-        (bool ok, bytes memory result) = token.staticcall(abi.encodeWithSignature("balanceOf(address)", account));
+        (bool ok, bytes memory result) = token.staticcall(abi.encodeCall(IERC20.balanceOf, (account)));
         if (!ok || result.length != 32) revert TokenCallFailed();
         return abi.decode(result, (uint256));
     }
 
     function _transfer(address token, address to, uint256 amount) private {
-        _tokenCall(token, abi.encodeWithSignature("transfer(address,uint256)", to, amount));
+        _tokenCall(token, abi.encodeCall(IERC20.transfer, (to, amount)));
     }
 
     function _tokenCall(address token, bytes memory data) private {

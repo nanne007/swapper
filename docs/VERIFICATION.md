@@ -355,6 +355,23 @@ RPC transport/method 错误继续通过 `map_rpc_error("eth_createAccessList", .
 
 尚未把生产 RPC 支持视为已验证：托管节点可能关闭或未实现 `eth_createAccessList`，部署前需逐链测试。配置错误或非标准余额布局仍可能让完整仿真失败，不会自动纠正配置或淘汰已缓存 base。
 
+## Routes 先于统一 Block Context（2026-09-15）
+
+竞赛调度改为批次两阶段：先并发获取并校验当前链全部 provider routes；所有 route future 成功、失败或超时结算后，读取一次公共 parent block context；随后基于该 context 并发 simulation 所有有效 routes。这样不会再用 provider 请求之前取得的 context 模拟后来生成的 route。route 错误仍只进入对应 `ProviderFailure`，公共 context 错误会使已取得的 routes 分别失败，Quote 仍只包含 route 与 simulation 均成功的数据。
+
+三阶段继续共用同一个 `COMPETITION_TIMEOUT_MS` 绝对 deadline，不增加阶段配置或隐式续期。由此带来的明确边界是：若某个 route 请求一直运行到总 deadline，其他已取得的 routes 也没有剩余预算完成公共 context 和 simulation。本轮测试固定了该行为，避免把总预算悄悄变成每阶段预算。
+
+本轮验证：
+
+- `cargo fmt --all -- --check`、`cargo clippy --all-targets --all-features --offline -- -D warnings`：通过。
+- `RUST_LIB_BACKTRACE=1 cargo test --all --offline`：**76/76**；15 项 live/Anvil 测试默认 ignored。`tests/competitions.rs` 为 **7/7**，在 context provider 内断言全部 route future 已结算，检查整轮只读取一次 context、所有有效 route 共享它、context 超时不启动 simulation、simulation 阶段保留 deadline 前完成的结果，以及 route 耗尽总预算时不产生 Quote。
+- `cargo build --release --offline`：通过。
+- `forge build --root contracts --deny-warnings`、`forge test --root contracts`：通过，当前并行合约工作区 **33/33**；本轮未修改合约。
+- `forge fmt --root contracts --check`：未通过；当前未提交的 `contracts/test/MetaRouter.t.sol` 存在既有格式差异，本轮没有改写该并行文件。
+- `cargo test --test e2e_local --offline -- --ignored --nocapture`：未通过，报 `preview discovery: ROUTER_NOT_DEPLOYED`。当前 `MetaRouter` 构造函数为一个 `allowanceHolder` 参数且无 `setAllowed`，而并行的 E2E fixture 仍按两个构造参数部署并调用 `setAllowed`；失败发生在进入 HTTP competition 前，不是本轮 route/context 调度路径的回归证据。
+
+本轮没有调用生产 provider/RPC，没有签名、部署或广播真实网络交易。
+
 ## 未验证边界
 
 本节之前的 live 记录是历史运行快照，不因后续结构重构自动成为新的 live 验证。

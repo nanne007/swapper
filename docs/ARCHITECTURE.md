@@ -6,7 +6,7 @@
 
 ## 1. 一句话概览
 
-MetaMatch 是一个单进程、有总超时、非托管的多链 EVM exact-input 报价竞赛服务：当前 provider 实例的能力矩阵直接生成链集合和 `chain -> provider` 反向索引，收到请求后只调度对应链的 provider，首次请求绑定真实 taker → 并发询价/构建/固定 parent block 仿真 → 按模拟到账量排序 → 返回 unsigned transactions。
+MetaMatch 是一个单进程、有总超时、非托管的多链 EVM exact-input 报价竞赛服务：当前 provider 实例的能力矩阵直接生成链集合和 `chain -> provider` 反向索引，收到请求后只调度对应链的 provider，首次请求绑定真实 taker → 并发获取并校验 routes → 获取公共 parent block → 并发仿真 → 按模拟到账量排序 → 返回 unsigned transactions。
 
 服务端不持有私钥，不签名、不广播；交易由用户钱包执行。
 
@@ -99,7 +99,7 @@ by_chain[8453] = [0x, 1inch, barter, bebop, enso, kyber, odos, ...]
 
 ## 6. HTTP 和竞赛
 
-`POST /v1/competitions` 要求真实 taker，取得并发名额后在一次 HTTP 请求中获取公共 context，并发运行每家 provider 的 quote → route 校验 → 构建 → simulation。每个流程共用同一绝对截止时间。先完成的 provider 不等待其他报价才开始模拟；超时仅取消未完成流程，全部完成可提前返回。
+`POST /v1/competitions` 要求真实 taker，取得并发名额后在一次 HTTP 请求中分两阶段执行：先并发获取并校验该链全部 provider route；全部 route 请求成功、失败或超时结算后，再获取一次公共 parent context，并基于它并发 simulation 所有有效 route。route 不会使用在其产生之前取得的旧 context。两个阶段共用同一绝对截止时间，不会在阶段切换时重置预算；若 route 阶段耗尽预算，context 和 simulation 也会超时。
 
 返回 200 和 `{id, input, quotes, failures}`；成功项按 `simulation.boughtAmount` 的 U256 数值降序排列，平局按 provider ID。Quote 只包含完整 route、成功专用 SimulationSuccess、同轮仿真的 approvals/transaction 和 latencyMs，均为必填；没有 status/error。失败 ProviderFailure 单独放入 failures 数组，没有 route 或交易。全失败时 quotes 为空。没有存储、轮询、token 或独立 build，旧路由返回 404。取消请求 future 自动释放 permit，不留下后台竞赛任务。
 

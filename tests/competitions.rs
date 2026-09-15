@@ -76,11 +76,22 @@ impl Provider for Competitor {
     }
 }
 
-struct DelayedContext(u64);
+struct DelayedContext {
+    delay_ms: u64,
+    completed_routes: Arc<AtomicUsize>,
+    expected_routes: usize,
+    calls: Arc<AtomicUsize>,
+}
 #[async_trait]
 impl ContextProvider for DelayedContext {
     async fn get(&self, _: &Input, _: &Chain) -> anyhow::Result<Context> {
-        sleep(Duration::from_millis(self.0)).await;
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(
+            self.completed_routes.load(Ordering::SeqCst),
+            self.expected_routes,
+            "block context was fetched before every provider route settled"
+        );
+        sleep(Duration::from_millis(self.delay_ms)).await;
         Ok(support::fixture_context())
     }
 }
@@ -130,12 +141,18 @@ impl SimulationProvider for SimulationFixture {
 fn service(
     specs: &[(&'static str, u64, bool)],
     context_delay: u64,
-) -> (Competitions, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+) -> (
+    Competitions,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
     let config = support::config_with(&[("COMPETITION_TIMEOUT_MS", "100")]);
     let mut chain = support::chain(&config, 1);
     chain.router = Some(Address::repeat_byte(0x22));
     let quote_drops = Arc::new(AtomicUsize::new(0));
     let simulation_drops = Arc::new(AtomicUsize::new(0));
+    let context_calls = Arc::new(AtomicUsize::new(0));
     let providers = specs
         .iter()
         .map(|&(id, delay_ms, error)| {
@@ -150,7 +167,12 @@ fn service(
     let services = Services::new(
         providers,
         &[chain],
-        Arc::new(DelayedContext(context_delay)),
+        Arc::new(DelayedContext {
+            delay_ms: context_delay,
+            completed_routes: quote_drops.clone(),
+            expected_routes: specs.len(),
+            calls: context_calls.clone(),
+        }),
         Arc::new(SimulationFixture {
             dropped: simulation_drops.clone(),
             below_minimum: false,
@@ -160,12 +182,14 @@ fn service(
         Competitions::new(config, Some(services)),
         quote_drops,
         simulation_drops,
+        context_calls,
     )
 }
 
 #[tokio::test(start_paused = true)]
 async fn ranks_simulated_balance_delta_as_integers_and_finishes_early() {
-    let (service, _, _) = service(&[("a", 0, false), ("c", 5, false), ("b", 10, false)], 0);
+    let (service, _, _, context_calls) =
+        service(&[("a", 0, false), ("c", 5, false), ("b", 10, false)], 0);
     let started = Instant::now();
     let result = service.create(support::input(1, NATIVE)).await.unwrap();
     assert!(started.elapsed() < Duration::from_millis(100));
@@ -188,14 +212,14 @@ async fn ranks_simulated_balance_delta_as_integers_and_finishes_early() {
         serde_json::to_value(&result.quotes[0].simulation).unwrap()["blockContext"]["timestamp"],
         100
     );
+    assert_eq!(context_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]
 async fn one_deadline_covers_context_quote_and_simulation_and_keeps_completed_results() {
-    let (service, quotes_dropped, simulations_dropped) = service(
+    let (service, quotes_dropped, simulations_dropped, context_calls) = service(
         &[
             ("fast", 10, false),
-            ("slow-quote", 200, false),
             ("slow-simulation", 30, false),
             ("failed", 1, true),
         ],
@@ -205,12 +229,14 @@ async fn one_deadline_covers_context_quote_and_simulation_and_keeps_completed_re
     let result = service.create(support::input(1, NATIVE)).await.unwrap();
     assert_eq!(started.elapsed(), Duration::from_millis(100));
     assert_eq!(result.quotes.len(), 1);
-    assert_eq!(result.failures.len(), 3);
+    assert_eq!(result.failures.len(), 2);
     assert_eq!(result.quotes[0].route.provider, "fast");
-    for id in ["slow-quote", "slow-simulation"] {
-        let failure = result.failures.iter().find(|q| q.provider == id).unwrap();
-        assert_eq!(failure.error, "UPSTREAM_TIMEOUT");
-    }
+    let failure = result
+        .failures
+        .iter()
+        .find(|q| q.provider == "slow-simulation")
+        .unwrap();
+    assert_eq!(failure.error, "UPSTREAM_TIMEOUT");
     assert_eq!(
         result
             .failures
@@ -229,13 +255,15 @@ async fn one_deadline_covers_context_quote_and_simulation_and_keeps_completed_re
         assert!(failure.get("transaction").is_none());
         assert!(failure.get("approvals").is_none());
     }
-    assert_eq!(quotes_dropped.load(Ordering::SeqCst), 4);
+    assert_eq!(quotes_dropped.load(Ordering::SeqCst), 3);
     assert_eq!(simulations_dropped.load(Ordering::SeqCst), 2);
+    assert_eq!(context_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]
-async fn context_timeout_reports_all_providers_without_starting_more_work() {
-    let (service, quote_drops, _) = service(&[("a", 0, false), ("b", 0, false)], 200);
+async fn context_is_fetched_after_routes_and_timeout_skips_simulation() {
+    let (service, quote_drops, _, context_calls) =
+        service(&[("a", 0, false), ("b", 0, false)], 200);
     let started = Instant::now();
     let result = service.create(support::input(1, NATIVE)).await.unwrap();
     assert_eq!(started.elapsed(), Duration::from_millis(100));
@@ -247,7 +275,28 @@ async fn context_timeout_reports_all_providers_without_starting_more_work() {
             .iter()
             .all(|q| q.error == "UPSTREAM_TIMEOUT")
     );
-    assert_eq!(quote_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(quote_drops.load(Ordering::SeqCst), 2);
+    assert_eq!(context_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn route_that_consumes_the_total_deadline_leaves_no_time_to_complete_context() {
+    let (service, quote_drops, simulation_drops, context_calls) =
+        service(&[("fast", 10, false), ("slow-route", 200, false)], 1);
+    let started = Instant::now();
+    let result = service.create(support::input(1, NATIVE)).await.unwrap();
+    assert_eq!(started.elapsed(), Duration::from_millis(100));
+    assert!(result.quotes.is_empty());
+    assert_eq!(result.failures.len(), 2);
+    assert!(
+        result
+            .failures
+            .iter()
+            .all(|failure| failure.error == "UPSTREAM_TIMEOUT")
+    );
+    assert_eq!(quote_drops.load(Ordering::SeqCst), 2);
+    assert_eq!(simulation_drops.load(Ordering::SeqCst), 0);
+    assert_eq!(context_calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

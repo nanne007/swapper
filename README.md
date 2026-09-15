@@ -30,7 +30,7 @@ curl -s http://127.0.0.1:3000/v1/competitions \
   -d '{"chainId":1,"sellToken":"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","buyToken":"0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48","sellAmount":"1000000000000000000","slippageBps":30,"taker":"0x你的真实钱包地址"}'
 ```
 
-`POST /v1/competitions` 在竞赛总超时内直接返回 HTTP `200` 和最终结果，不需要轮询、Bearer competition token 或第二次 build。`taker` 必填，且同时是收款人。每个 provider 独立执行 quote → route 校验 → 构建交易 → 完整仿真；所有流程共用一个截止时间，超时只影响未完成的结果。
+`POST /v1/competitions` 在竞赛总超时内直接返回 HTTP `200` 和最终结果，不需要轮询、Bearer competition token 或第二次 build。`taker` 必填，且同时是收款人。服务先并发获取并校验该链全部 provider route；route 阶段结算后才读取一次公共 block context，再基于这一个 context 并发完整仿真所有有效 route。整个批次共用一个绝对截止时间，任一阶段都不会重置预算。
 
 响应包含 `quotes` 和 `failures` 两个数组。`Quote` 只包含必填的 `route`、`simulation: SimulationSuccess`、`approvals[]`、`transaction` 和 `latencyMs`，按 `simulation.boughtAmount`（完整交易序列在模拟中的钱包买入 token 余额增量）降序排列。provider 和原始报价分别在 `route.provider`、`route.buyAmount`，最低到账在 `route.minBuyAmount`。Quote 和成功 simulation 不再携带 status/error；第一条 quote 即最高模拟到账量。失败 provider 的状态、错误码及仿真失败分类只在 `failures` 中；全部失败时 `quotes: []`。Gas 单独报告，不参与金额排序。
 

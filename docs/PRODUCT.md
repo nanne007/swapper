@@ -42,7 +42,7 @@ provider ID（共 13 个）：`0x`、`1inch`、`barter`、`bebop`、`enso`、`hy
    }
    ```
 
-3. 服务在 `COMPETITION_TIMEOUT_MS` 总预算内完成竞赛并返回 `200`；全部 provider 提前完成时立即返回。每家 provider 的 quote、构建与 simulation 独立串联并发运行，超时取消尚未完成的流程，保留已完成结果。
+3. 服务在 `COMPETITION_TIMEOUT_MS` 总预算内完成竞赛并返回 `200`。先并发获取并校验全部 provider route；route 阶段全部结算后获取一次公共 block context，再基于该 context 并发 simulation 所有有效 route。总预算不会按阶段重置；route 阶段若耗尽预算，本轮无法继续完成 context 或 simulation。
 4. 仿真先覆盖 taker 的卖出资产和 native gas 资金，再执行完整的「买入 token 余额查询 → 必要 approvals → swap → 余额查询」。仅 route 与完整仿真都成功的结果成为 `Quote`，按模拟余额增量 `simulation.boughtAmount` 降序排序；金额相同按 provider ID 排序。Gas 单独展示，未支持的费用保持 `null`，不做伪造价格换算。
 5. 成功结果包含该次仿真对应的 `approvals[]` 和 `transaction`，`simulation.funding` 固定为 `overridden`。用户选择一条并依序执行；发送前自行确认真实余额足够。失败 provider 的诊断信息单独放入 `failures`，不能执行。
 6. API 不返回 `expiresAt`，不维护报价 TTL。每条成功 simulation 返回基础区块 `blockContext.number/hash/timestamp` 和 `simulatedTimestamp`。调用方决定是否重做 simulation 或重新竞赛；后者可能产生新的最低到账，需调用方重新确认，不会自动替换用户已接受的交易。
